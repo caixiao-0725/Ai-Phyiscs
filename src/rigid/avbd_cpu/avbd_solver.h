@@ -6,6 +6,8 @@
 
 #include "avbd_maths.h"
 
+#include <vector>
+
 namespace chysx {
 namespace avbd {
 
@@ -18,6 +20,20 @@ struct Rigid;
 struct Force;
 struct Manifold;
 struct Solver;
+class BroadphaseGPU;
+
+struct SoaData {
+    int count = 0;
+    std::vector<Rigid*> body_ptrs;
+
+    std::vector<float> pos_x, pos_y, pos_z;
+    std::vector<float> quat_x, quat_y, quat_z, quat_w;
+    std::vector<float> half_x, half_y, half_z;
+    std::vector<float> radius;
+    std::vector<float> mass;
+
+    void pack(Rigid* bodies);
+};
 
 struct Rigid {
     Solver* solver;
@@ -150,6 +166,10 @@ struct Solver {
 
     Rigid* bodies;
     Force* forces;
+
+    SoaData soa_;
+    BroadphaseGPU* broadphase_gpu_ = nullptr;
+    std::vector<int> pairs_a_, pairs_b_;
 
     Solver();
     ~Solver();

@@ -51,12 +51,18 @@ add_library(chysx_core STATIC
     src/rigid/avbd_cpu/avbd_spring.cpp
     src/rigid/avbd_cpu/avbd_manifold.cpp
     src/rigid/avbd_cpu/avbd_collide.cpp
+    src/rigid/avbd_cpu/avbd_broadphase_gpu.cu
 
     src/cloth/cloth_simulator.cu
 )
 
 target_include_directories(chysx_core PUBLIC src)
 target_link_libraries(chysx_core PUBLIC CUDA::cudart)
+
+option(AVBD_VALIDATE_BROADPHASE "Compare CPU and GPU broadphase results" OFF)
+if(AVBD_VALIDATE_BROADPHASE)
+    target_compile_definitions(chysx_core PUBLIC AVBD_VALIDATE_BROADPHASE)
+endif()
 
 set_target_properties(chysx_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON

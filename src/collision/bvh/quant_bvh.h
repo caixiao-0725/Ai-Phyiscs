@@ -131,6 +131,13 @@ public:
                const math::Vec3i* faces,
                std::uintptr_t     cuda_stream = 0);
 
+    // Overload without `faces`: stores only the original leaf id in
+    // PackedFace.w (sets .x/.y/.z to -1).  Use for broadphase where
+    // there are no mesh faces, only body AABBs.
+    void refit(const Aabb*        leaf_aabbs,
+               const math::Vec3f* leaf_centers,
+               std::uintptr_t     cuda_stream = 0);
+
     // Self-EF query: for each edge `e` in `edges[0..n_edges)` build
     // its (thickness-enlarged) AABB *inside* the kernel from
     // `verts[]`, do a stackless traversal of the tree, and emit
@@ -143,6 +150,15 @@ public:
                        int                   n_edges,
                        float                 thickness,
                        std::uintptr_t        cuda_stream = 0);
+
+    // Self-AABB query: each leaf traverses the tree and emits
+    // (original_id_i, original_id_j) pairs where i < j and the leaf
+    // AABBs overlap.  No covertex filter.  Optionally skips pairs
+    // where both leaves have mass <= 0 (static-static) via `mass`
+    // (may be nullptr to skip that filter).
+    void query_self_aabb(const Aabb*       leaf_aabbs,
+                         const float*      mass,
+                         std::uintptr_t    cuda_stream = 0);
 
     // ---- accessors (same shape as LinearBvh) -------------------------
 

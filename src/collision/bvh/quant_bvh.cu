@@ -644,6 +644,148 @@ __global__ void query_self_ef_kernel(
 }
 
 // ============================================================================
+// build_primitives without faces: stores only original leaf id in .w
+// ============================================================================
+
+__global__ void build_primitives_no_faces(
+    int n,
+    PackedFace*         __restrict__ prim_face,
+    Aabb*               __restrict__ prim_box,
+    const int*          __restrict__ prim_map,
+    const Aabb*         __restrict__ box) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int new_idx = prim_map[idx];
+    PackedFace p;
+    p.x = -1;
+    p.y = -1;
+    p.z = -1;
+    p.w = idx;
+    prim_face[new_idx] = p;
+    prim_box[new_idx]  = box[idx];
+}
+
+// ============================================================================
+// Stackless self-AABB query: each leaf traverses the tree, emitting
+// (original_i, original_j) pairs where i < j.  No covertex filter.
+// ============================================================================
+
+__global__ void query_self_aabb_kernel(
+    int                  n_leaves,
+    int                  int_size,
+    const Aabb*          __restrict__ leaf_aabbs,
+    const float*         __restrict__ mass,
+    const int*           __restrict__ sorted_id,
+    const PackedFace*    __restrict__ ext_face,
+    const Aabb*          __restrict__ scene_box,
+    const Ull2*          __restrict__ nodes,
+    int*                 __restrict__ pair_count,
+    math::Vec2i*         __restrict__ pair_list,
+    int                  max_pairs) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = tid < n_leaves;
+
+    const Aabb sb = scene_box[0];
+    const math::Vec3f origin = sb.mn;
+    const float bucket = static_cast<float>((1 << QuantBvh::aabb_bits) - 2);
+    const float dx = (sb.mx.x - sb.mn.x) / bucket;
+    const float dy = (sb.mx.y - sb.mn.y) / bucket;
+    const float dz = (sb.mx.z - sb.mn.z) / bucket;
+    const float idx_q = 1.0f / fmaxf(dx, 1e-30f);
+    const float idy_q = 1.0f / fmaxf(dy, 1e-30f);
+    const float idz_q = 1.0f / fmaxf(dz, 1e-30f);
+
+    int my_orig = -1;
+    float my_mass = 1.0f;
+    IntAabb bv;
+    if (active) {
+        my_orig = sorted_id[tid];
+        Aabb box = leaf_aabbs[my_orig];
+        if (mass) my_mass = mass[my_orig];
+        bv.mn_x = (int)((box.mn.x - origin.x) * idx_q);
+        bv.mn_y = (int)((box.mn.y - origin.y) * idy_q);
+        bv.mn_z = (int)((box.mn.z - origin.z) * idz_q);
+        bv.mx_x = (int)ceilf((box.mx.x - origin.x) * idx_q);
+        bv.mx_y = (int)ceilf((box.mx.y - origin.y) * idy_q);
+        bv.mx_z = (int)ceilf((box.mx.z - origin.z) * idz_q);
+    }
+
+    __shared__ math::Vec2i s_buf[kMaxResPerBlock];
+    __shared__ int         s_counter;
+    __shared__ int         s_global_off;
+    if (threadIdx.x == 0) s_counter = 0;
+
+    std::uint32_t st = 0u;
+
+    while (true) {
+        __syncthreads();
+
+        if (active) {
+            while (st != QuantBvh::max_index) {
+                Ull2 node = nodes[st];
+                const std::uint32_t lc     = (std::uint32_t)(node.x >> QuantBvh::offset3);
+                const std::uint32_t escape = (std::uint32_t)(node.y >> QuantBvh::offset3);
+
+                if (overlaps_ull2_int(node, bv)) {
+                    if (lc == QuantBvh::max_index) {
+                        const int leaf_slot = static_cast<int>(st) - int_size;
+                        const PackedFace fd = ext_face[leaf_slot];
+                        const int other_orig = fd.w;
+
+                        if (other_orig != my_orig && my_orig < other_orig) {
+                            bool skip = false;
+                            if (mass && my_mass <= 0.f && mass[other_orig] <= 0.f)
+                                skip = true;
+
+                            if (!skip) {
+                                Aabb other_box = leaf_aabbs[other_orig];
+                                Aabb my_box = leaf_aabbs[my_orig];
+                                if (my_box.overlaps(other_box)) {
+                                    const int s_idx = atomicAdd(&s_counter, 1);
+                                    if (s_idx >= kMaxResPerBlock) {
+                                        break;
+                                    }
+                                    s_buf[s_idx] = math::Vec2i(my_orig, other_orig);
+                                }
+                            }
+                        }
+                        st = escape;
+                    } else {
+                        st = lc;
+                    }
+                } else {
+                    st = escape;
+                }
+            }
+        }
+
+        __syncthreads();
+        int total = s_counter;
+        if (total > kMaxResPerBlock) total = kMaxResPerBlock;
+
+        if (threadIdx.x == 0)
+            s_global_off = atomicAdd(pair_count, total);
+
+        __syncthreads();
+        const int g_off = s_global_off;
+
+        if (g_off >= max_pairs || total == 0) return;
+        if (threadIdx.x == 0) s_counter = 0;
+
+        bool done = (total < kMaxResPerBlock);
+        if (g_off + total > max_pairs) {
+            total = max_pairs - g_off;
+            done = true;
+        }
+
+        for (int i = threadIdx.x; i < total; i += blockDim.x)
+            pair_list[g_off + i] = s_buf[i];
+
+        if (done) break;
+    }
+}
+
+// ============================================================================
 // Tiny utilities
 // ============================================================================
 
@@ -857,6 +999,112 @@ void QuantBvh::query_self_ef(const math::Vec2i*    edges,
         query_count_.gpu_data(), query_pairs_.gpu_data(),
         max_query_pairs_);
     check_cuda(cudaGetLastError(), "query_self_ef_kernel");
+}
+
+void QuantBvh::refit(const Aabb*        leaf_aabbs,
+                     const math::Vec3f* leaf_centers,
+                     std::uintptr_t     cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    const int N = n_leaves_;
+    Aabb* d_scene = scene_bbox_.gpu_data();
+
+    {
+        const int blocks = std::min(grid_for(N), 1024);
+        scene_aabb_pass1<<<blocks, kBlockDim, 0, stream>>>(
+            leaf_aabbs, N, scene_partial_.gpu_data());
+        scene_aabb_pass2<<<1, kBlockDim, 0, stream>>>(
+            scene_partial_.gpu_data(), blocks, d_scene);
+        check_cuda(cudaGetLastError(), "scene_aabb reduce (no-faces)");
+    }
+
+    compute_morton_and_id<<<grid_for(N), kBlockDim, 0, stream>>>(
+        leaf_centers, d_scene, N,
+        morton_in_.gpu_data(), sorted_id_in_.gpu_data());
+    check_cuda(cudaGetLastError(), "compute_morton_and_id (no-faces)");
+
+    cub::DeviceRadixSort::SortPairs(
+        cub_sort_temp_.gpu_data(), cub_sort_bytes_,
+        morton_in_.gpu_data(), morton_out_.gpu_data(),
+        sorted_id_in_.gpu_data(), sorted_id_.gpu_data(),
+        N, 0, sizeof(std::uint32_t) * 8, stream);
+
+    inverse_mapping_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, sorted_id_.gpu_data(), prim_map_.gpu_data());
+    check_cuda(cudaGetLastError(), "inverse_mapping (no-faces)");
+
+    build_primitives_no_faces<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, ext_face_.gpu_data(), ext_box_.gpu_data(),
+        prim_map_.gpu_data(), leaf_aabbs);
+    check_cuda(cudaGetLastError(), "build_primitives_no_faces");
+
+    calc_split_metric<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, morton_out_.gpu_data(), metric_.gpu_data());
+    check_cuda(cudaGetLastError(), "calc_split_metric (no-faces)");
+
+    memset_uint_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        ext_mark_.gpu_data(), 7u, N);
+    memset_int_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        reinterpret_cast<int*>(ext_par_.gpu_data()), -1, N);
+    memset_int_kernel<<<grid_for(N + 1), kBlockDim, 0, stream>>>(
+        ext_lca_.gpu_data(), -1, N + 1);
+    memset_uint_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        flag_.gpu_data(), 0u, N - 1);
+    memset_uint_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        int_mark_.gpu_data(), 0u, N - 1);
+
+    build_int_nodes_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, count_.gpu_data(), ext_lca_.gpu_data(), metric_.gpu_data(),
+        ext_par_.gpu_data(), ext_mark_.gpu_data(), ext_box_.gpu_data(),
+        int_rc_.gpu_data(), int_lc_.gpu_data(),
+        range_y_.gpu_data(), range_x_.gpu_data(),
+        int_mark_.gpu_data(), int_box_.gpu_data(),
+        flag_.gpu_data(), int_par_.gpu_data());
+    check_cuda(cudaGetLastError(), "build_int_nodes (no-faces)");
+
+    cub::DeviceScan::ExclusiveSum(
+        cub_scan_temp_.gpu_data(), cub_scan_bytes_,
+        count_.gpu_data(), offset_table_.gpu_data(),
+        N, stream);
+
+    calc_int_node_orders<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, int_lc_.gpu_data(), ext_lca_.gpu_data(),
+        count_.gpu_data(), offset_table_.gpu_data(),
+        tk_map_.gpu_data());
+    check_cuda(cudaGetLastError(), "calc_int_node_orders (no-faces)");
+
+    memset_int_kernel<<<1, 1, 0, stream>>>(
+        ext_lca_.gpu_data() + N, -1, 1);
+
+    update_bvh_ext_links<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N, tk_map_.gpu_data(), ext_lca_.gpu_data(), ext_par_.gpu_data());
+    check_cuda(cudaGetLastError(), "update_bvh_ext_links (no-faces)");
+
+    reorder_quantized_nodes<<<grid_for(N), kBlockDim, 0, stream>>>(
+        N - 1, tk_map_.gpu_data(), ext_lca_.gpu_data(), ext_box_.gpu_data(),
+        int_lc_.gpu_data(), int_mark_.gpu_data(),
+        range_y_.gpu_data(), int_box_.gpu_data(),
+        scene_bbox_.gpu_data(), nodes_.gpu_data());
+    check_cuda(cudaGetLastError(), "reorder_quantized_nodes (no-faces)");
+}
+
+void QuantBvh::query_self_aabb(const Aabb*       leaf_aabbs,
+                                const float*      mass,
+                                std::uintptr_t    cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    clear_int_kernel<<<1, 1, 0, stream>>>(query_count_.gpu_data());
+    query_self_aabb_kernel<<<grid_for(n_leaves_), kBlockDim, 0, stream>>>(
+        n_leaves_, n_leaves_ - 1,
+        leaf_aabbs, mass, sorted_id_.gpu_data(),
+        ext_face_.gpu_data(),
+        scene_bbox_.gpu_data(),
+        nodes_.gpu_data(),
+        query_count_.gpu_data(), query_pairs_.gpu_data(),
+        max_query_pairs_);
+    check_cuda(cudaGetLastError(), "query_self_aabb_kernel");
 }
 
 }  // namespace collision
