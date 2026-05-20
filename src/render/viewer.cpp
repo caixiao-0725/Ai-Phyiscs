@@ -154,12 +154,22 @@ void Viewer::handle_events() {
             continue;
 
         if (e.type == SDL_MOUSEBUTTONDOWN) {
-            if (e.button.button == SDL_BUTTON_LEFT) mouse_left_ = true;
-            if (e.button.button == SDL_BUTTON_RIGHT) mouse_right_ = true;
+            float rox, roy, roz, rdx, rdy, rdz;
+            bool hasRay = screen_to_ray(e.button.x, e.button.y,
+                                        rox, roy, roz, rdx, rdy, rdz);
+            bool consumed = false;
+            if (hasRay && scene_)
+                consumed = scene_->on_mouse_down(e.button.button,
+                                                 rox, roy, roz, rdx, rdy, rdz);
+            if (!consumed) {
+                if (e.button.button == SDL_BUTTON_LEFT) mouse_left_ = true;
+                if (e.button.button == SDL_BUTTON_RIGHT) mouse_right_ = true;
+            }
             mouse_x_ = e.button.x;
             mouse_y_ = e.button.y;
         }
         if (e.type == SDL_MOUSEBUTTONUP) {
+            if (scene_) scene_->on_mouse_up(e.button.button);
             if (e.button.button == SDL_BUTTON_LEFT) mouse_left_ = false;
             if (e.button.button == SDL_BUTTON_RIGHT) mouse_right_ = false;
         }
@@ -168,6 +178,13 @@ void Viewer::handle_events() {
             int dy = e.motion.y - mouse_y_;
             mouse_x_ = e.motion.x;
             mouse_y_ = e.motion.y;
+
+            if (scene_) {
+                float rox, roy, roz, rdx2, rdy2, rdz2;
+                if (screen_to_ray(e.motion.x, e.motion.y,
+                                  rox, roy, roz, rdx2, rdy2, rdz2))
+                    scene_->on_mouse_move(rox, roy, roz, rdx2, rdy2, rdz2);
+            }
 
             if (mouse_left_) {
                 cam_azimuth_ -= dx * 0.005f;
@@ -187,12 +204,16 @@ void Viewer::handle_events() {
         if (e.type == SDL_MOUSEWHEEL) {
             cam_distance_ *= (e.wheel.y > 0) ? 0.9f : 1.1f;
             if (cam_distance_ < 0.1f) cam_distance_ = 0.1f;
-            if (cam_distance_ > 100.0f) cam_distance_ = 100.0f;
+            if (cam_distance_ > 1000.0f) cam_distance_ = 1000.0f;
         }
         if (e.type == SDL_KEYDOWN) {
-            if (e.key.keysym.sym == SDLK_SPACE) paused_ = !paused_;
-            if (e.key.keysym.sym == SDLK_r && scene_) {
-                scene_->reset();
+            bool consumed = false;
+            if (scene_) consumed = scene_->on_key_down(e.key.keysym.sym);
+            if (!consumed) {
+                if (e.key.keysym.sym == SDLK_SPACE) paused_ = !paused_;
+                if (e.key.keysym.sym == SDLK_r && scene_) {
+                    scene_->reset();
+                }
             }
         }
     }
@@ -206,7 +227,7 @@ void Viewer::update_camera() {
     glLoadIdentity();
 
     float fov_y = 45.0f;
-    float near_p = 0.01f, far_p = 200.0f;
+    float near_p = 0.01f, far_p = 2000.0f;
     float top = near_p * std::tan(fov_y * 0.5f * 3.14159f / 180.0f);
     float right = top * aspect;
     glFrustum(-right, right, -top, top, near_p, far_p);
@@ -250,12 +271,13 @@ void Viewer::update_camera() {
 void Viewer::draw_grid() {
     glColor3f(0.3f, 0.3f, 0.3f);
     glBegin(GL_LINES);
-    for (int i = -5; i <= 5; ++i) {
+    const int extent = 50;
+    for (int i = -extent; i <= extent; ++i) {
         float f = static_cast<float>(i);
-        glVertex3f(f, -5.0f, 0.0f);
-        glVertex3f(f,  5.0f, 0.0f);
-        glVertex3f(-5.0f, f, 0.0f);
-        glVertex3f( 5.0f, f, 0.0f);
+        glVertex3f(f, static_cast<float>(-extent), 0.0f);
+        glVertex3f(f, static_cast<float>(extent), 0.0f);
+        glVertex3f(static_cast<float>(-extent), f, 0.0f);
+        glVertex3f(static_cast<float>(extent), f, 0.0f);
     }
     glEnd();
 }
@@ -283,6 +305,8 @@ void Viewer::draw_scene() {
     }
 
     glDisable(GL_LIGHTING);
+
+    if (scene_) scene_->draw_custom();
 }
 
 void Viewer::draw_mesh(const DrawMesh& m) {
@@ -369,6 +393,50 @@ void Viewer::draw_ui() {
     }
 
     ImGui::End();
+}
+
+bool Viewer::screen_to_ray(int sx, int sy,
+                           float& ox, float& oy, float& oz,
+                           float& dx, float& dy, float& dz) const {
+    if (win_w_ <= 0 || win_h_ <= 0) return false;
+    float aspect = static_cast<float>(win_w_) / static_cast<float>(win_h_);
+    float ndcX = static_cast<float>(sx) / static_cast<float>(win_w_) * 2.0f - 1.0f;
+    float ndcY = 1.0f - static_cast<float>(sy) / static_cast<float>(win_h_) * 2.0f;
+
+    float ex = cam_target_[0] + cam_distance_ * std::cos(cam_elevation_) * std::cos(cam_azimuth_);
+    float ey = cam_target_[1] + cam_distance_ * std::cos(cam_elevation_) * std::sin(cam_azimuth_);
+    float ez = cam_target_[2] + cam_distance_ * std::sin(cam_elevation_);
+
+    float fx = cam_target_[0] - ex;
+    float fy = cam_target_[1] - ey;
+    float fz = cam_target_[2] - ez;
+    float fl = std::sqrt(fx*fx + fy*fy + fz*fz);
+    fx /= fl; fy /= fl; fz /= fl;
+
+    // right = forward x up(0,0,1)
+    float rx = fy * 1.0f - fz * 0.0f;
+    float ry = fz * 0.0f - fx * 1.0f;
+    float rz = fx * 0.0f - fy * 0.0f;
+    float rl = std::sqrt(rx*rx + ry*ry + rz*rz);
+    if (rl < 1e-8f) { rx = 0; ry = 1; rz = 0; rl = 1; }
+    rx /= rl; ry /= rl; rz /= rl;
+    // up = right x forward
+    float ux = ry * fz - rz * fy;
+    float uy = rz * fx - rx * fz;
+    float uz = rx * fy - ry * fx;
+
+    float fov_y = 45.0f;
+    float tanHalf = std::tan(0.5f * fov_y * 3.14159265f / 180.0f);
+    float px = ndcX * aspect * tanHalf;
+    float py = ndcY * tanHalf;
+
+    ox = ex; oy = ey; oz = ez;
+    float rdx = fx + rx * px + ux * py;
+    float rdy = fy + ry * px + uy * py;
+    float rdz = fz + rz * px + uz * py;
+    float rdl = std::sqrt(rdx*rdx + rdy*rdy + rdz*rdz);
+    dx = rdx / rdl; dy = rdy / rdl; dz = rdz / rdl;
+    return true;
 }
 
 void Viewer::switch_scene(int index) {

@@ -37,12 +37,20 @@ add_library(chysx_core STATIC
     src/constraint/collision/self_collision_constraint.cu
     src/constraint/collision/untangle_constraint.cu
 
-    src/rigid/avbd_kernels.cu
-    src/rigid/contact_matching.cu
-    src/rigid/graph_coloring.cpp
-    src/rigid/narrow_phase.cu
-    src/rigid/rigid_broadphase.cu
-    src/rigid/rigid_simulator.cu
+    src/rigid/newton_avbd/avbd_kernels.cu
+    src/rigid/newton_avbd/contact_matching.cu
+    src/rigid/newton_avbd/graph_coloring.cpp
+    src/rigid/newton_avbd/narrow_phase.cu
+    src/rigid/newton_avbd/rigid_broadphase.cu
+    src/rigid/newton_avbd/rigid_simulator.cu
+
+    src/rigid/avbd_cpu/avbd_solver.cpp
+    src/rigid/avbd_cpu/avbd_rigid.cpp
+    src/rigid/avbd_cpu/avbd_force.cpp
+    src/rigid/avbd_cpu/avbd_joint.cpp
+    src/rigid/avbd_cpu/avbd_spring.cpp
+    src/rigid/avbd_cpu/avbd_manifold.cpp
+    src/rigid/avbd_cpu/avbd_collide.cpp
 
     src/cloth/cloth_simulator.cu
 )
@@ -71,6 +79,7 @@ add_library(chysx_scenes STATIC
     src/io/obj_io.cpp
     src/io/bgeo_writer.cpp
     scenes/cloth_freefall.cu
+    scenes/avbd_scenes.cpp
 )
 
 target_include_directories(chysx_scenes PUBLIC src src/io)
@@ -169,6 +178,11 @@ if(CHYSX_BUILD_VIEWER)
         external/SDL/include
     )
     target_link_libraries(imgui PUBLIC SDL2::SDL2 SDL2::SDL2main)
+
+    # avbd_scenes.cpp uses GL and SDL2/ImGui headers for custom rendering.
+    target_link_libraries(chysx_scenes PRIVATE imgui)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(chysx_scenes PRIVATE OpenGL::GL)
 
     # Viewer executable (.cu entry so nvcc performs the device link step)
     add_executable(chysx_viewer

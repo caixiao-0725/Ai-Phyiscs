@@ -8,10 +8,10 @@
 
 #pragma once
 
-#include "../collision/bvh/aabb.cuh"
-#include "../math/quat.cuh"
-#include "../math/vec.cuh"
-#include "../memory/cuda_array.h"
+#include "../../collision/bvh/aabb.cuh"
+#include "../../math/quat.cuh"
+#include "../../math/vec.cuh"
+#include "../../memory/cuda_array.h"
 
 namespace chysx {
 namespace rigid {

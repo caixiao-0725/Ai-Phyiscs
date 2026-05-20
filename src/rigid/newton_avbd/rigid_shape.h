@@ -4,8 +4,8 @@
 
 #pragma once
 
-#include "../math/vec.cuh"
-#include "../memory/cuda_array.h"
+#include "../../math/vec.cuh"
+#include "../../memory/cuda_array.h"
 
 namespace chysx {
 namespace rigid {

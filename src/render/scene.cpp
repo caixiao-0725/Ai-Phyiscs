@@ -3,6 +3,7 @@
 #include "scene.h"
 
 extern "C" void chysx_register_cloth_scenes();
+extern "C" void chysx_register_avbd_scenes();
 
 namespace chysx {
 namespace render {
@@ -22,6 +23,7 @@ const std::vector<SceneEntry>& scene_registry() {
 
 void register_all_scenes() {
     chysx_register_cloth_scenes();
+    chysx_register_avbd_scenes();
 }
 
 }  // namespace render

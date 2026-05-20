@@ -51,6 +51,9 @@ private:
     void draw_ui();
 
     void switch_scene(int index);
+    bool screen_to_ray(int sx, int sy,
+                       float& ox, float& oy, float& oz,
+                       float& dx, float& dy, float& dz) const;
 
     ViewerConfig cfg_;
     SDL_Window* window_ = nullptr;

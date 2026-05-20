@@ -5,9 +5,9 @@
 
 #pragma once
 
-#include "../math/matrix.cuh"
-#include "../math/quat.cuh"
-#include "../math/vec.cuh"
+#include "../../math/matrix.cuh"
+#include "../../math/quat.cuh"
+#include "../../math/vec.cuh"
 
 #include <cstdint>
 

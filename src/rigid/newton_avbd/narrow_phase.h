@@ -4,9 +4,9 @@
 
 #pragma once
 
-#include "../math/quat.cuh"
-#include "../math/vec.cuh"
-#include "../memory/cuda_array.h"
+#include "../../math/quat.cuh"
+#include "../../math/vec.cuh"
+#include "../../memory/cuda_array.h"
 #include "rigid_shape.h"
 
 #include <cstdint>

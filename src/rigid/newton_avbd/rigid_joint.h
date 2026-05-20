@@ -4,10 +4,10 @@
 
 #pragma once
 
-#include "../math/matrix.cuh"
-#include "../math/quat.cuh"
-#include "../math/vec.cuh"
-#include "../memory/cuda_array.h"
+#include "../../math/matrix.cuh"
+#include "../../math/quat.cuh"
+#include "../../math/vec.cuh"
+#include "../../memory/cuda_array.h"
 
 namespace chysx {
 namespace rigid {

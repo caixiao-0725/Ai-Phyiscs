@@ -3,7 +3,7 @@
 // Contact matching: CUB radix sort + binary search + atomic_min.
 
 #include "contact_matching.h"
-#include "../math/quat.cuh"
+#include "../../math/quat.cuh"
 
 #include <cub/device/device_radix_sort.cuh>
 #include <cuda_runtime.h>
