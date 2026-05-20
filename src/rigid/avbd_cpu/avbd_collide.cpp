@@ -23,7 +23,6 @@ struct OBB {
     float3 center;
     quat rotation;
     float3 half;
-    float3 axis[3];
 };
 
 struct SatAxis {
@@ -50,59 +49,62 @@ inline OBB makeOBB(const Rigid* body) {
     box.center = body->positionLin;
     box.rotation = body->positionAng;
     box.half = body->size * 0.5f;
-    box.axis[0] = rotate(body->positionAng, float3{1.0f, 0.0f, 0.0f});
-    box.axis[1] = rotate(body->positionAng, float3{0.0f, 1.0f, 0.0f});
-    box.axis[2] = rotate(body->positionAng, float3{0.0f, 0.0f, 1.0f});
     return box;
+}
+
+inline void computeAxes(const OBB& box, float3 ax[3]) {
+    ax[0] = rotate(box.rotation, float3{1.0f, 0.0f, 0.0f});
+    ax[1] = rotate(box.rotation, float3{0.0f, 1.0f, 0.0f});
+    ax[2] = rotate(box.rotation, float3{0.0f, 0.0f, 1.0f});
 }
 
 inline float absDot(float3 a, float3 b) { return std::fabs(dot(a, b)); }
 
-inline float3 supportPoint(const OBB& box, const float3& dir) {
-    float sx = dot(dir, box.axis[0]) >= 0.0f ? 1.0f : -1.0f;
-    float sy = dot(dir, box.axis[1]) >= 0.0f ? 1.0f : -1.0f;
-    float sz = dot(dir, box.axis[2]) >= 0.0f ? 1.0f : -1.0f;
-    return box.center + box.axis[0] * (box.half.x * sx) +
-           box.axis[1] * (box.half.y * sy) + box.axis[2] * (box.half.z * sz);
+inline float3 supportPoint(const OBB& box, const float3 ax[3], const float3& dir) {
+    float sx = dot(dir, ax[0]) >= 0.0f ? 1.0f : -1.0f;
+    float sy = dot(dir, ax[1]) >= 0.0f ? 1.0f : -1.0f;
+    float sz = dot(dir, ax[2]) >= 0.0f ? 1.0f : -1.0f;
+    return box.center + ax[0] * (box.half.x * sx) +
+           ax[1] * (box.half.y * sy) + ax[2] * (box.half.z * sz);
 }
 
-inline void getFaceAxes(const OBB& box, int axisIndex,
+inline void getFaceAxes(const float3 ax[3], const float3& halfExt, int axisIndex,
                         float3& u, float3& v, float& extentU, float& extentV) {
     if (axisIndex == 0) {
-        u = box.axis[1]; v = box.axis[2]; extentU = box.half.y; extentV = box.half.z;
+        u = ax[1]; v = ax[2]; extentU = halfExt.y; extentV = halfExt.z;
     } else if (axisIndex == 1) {
-        u = box.axis[0]; v = box.axis[2]; extentU = box.half.x; extentV = box.half.z;
+        u = ax[0]; v = ax[2]; extentU = halfExt.x; extentV = halfExt.z;
     } else {
-        u = box.axis[0]; v = box.axis[1]; extentU = box.half.x; extentV = box.half.y;
+        u = ax[0]; v = ax[1]; extentU = halfExt.x; extentV = halfExt.y;
     }
 }
 
-inline void buildFaceFrame(const OBB& box, int axisIndex,
+inline void buildFaceFrame(const OBB& box, const float3 ax[3], int axisIndex,
                            const float3& outwardNormal, FaceFrame& frame) {
-    float s = dot(outwardNormal, box.axis[axisIndex]) >= 0.0f ? 1.0f : -1.0f;
+    float s = dot(outwardNormal, ax[axisIndex]) >= 0.0f ? 1.0f : -1.0f;
     frame.axisIndex = axisIndex;
-    frame.normal = box.axis[axisIndex] * s;
+    frame.normal = ax[axisIndex] * s;
     frame.center = box.center + frame.normal * box.half[axisIndex];
-    getFaceAxes(box, axisIndex, frame.u, frame.v, frame.extentU, frame.extentV);
+    getFaceAxes(ax, box.half, axisIndex, frame.u, frame.v, frame.extentU, frame.extentV);
 }
 
-inline int chooseIncidentFaceAxis(const OBB& box, const float3& referenceNormal) {
-    int axis = 0;
+inline int chooseIncidentFaceAxis(const float3 ax[3], const float3& referenceNormal) {
+    int best_axis = 0;
     float best = -FLT_MAX;
     for (int i = 0; i < 3; ++i) {
-        float d = absDot(box.axis[i], referenceNormal);
-        if (d > best) { best = d; axis = i; }
+        float d = absDot(ax[i], referenceNormal);
+        if (d > best) { best = d; best_axis = i; }
     }
-    return axis;
+    return best_axis;
 }
 
-inline void buildIncidentFace(const OBB& box, int axisIndex,
+inline void buildIncidentFace(const OBB& box, const float3 ax[3], int axisIndex,
                               const float3& referenceNormal, float3 outVerts[4]) {
-    float s = dot(box.axis[axisIndex], referenceNormal) > 0.0f ? -1.0f : 1.0f;
-    float3 faceNormal = box.axis[axisIndex] * s;
+    float s = dot(ax[axisIndex], referenceNormal) > 0.0f ? -1.0f : 1.0f;
+    float3 faceNormal = ax[axisIndex] * s;
     float3 faceCenter = box.center + faceNormal * box.half[axisIndex];
     float3 u, v; float extU, extV;
-    getFaceAxes(box, axisIndex, u, v, extU, extV);
+    getFaceAxes(ax, box.half, axisIndex, u, v, extU, extV);
     outVerts[0] = faceCenter + u * extU + v * extV;
     outVerts[1] = faceCenter - u * extU + v * extV;
     outVerts[2] = faceCenter - u * extU - v * extV;
@@ -160,7 +162,8 @@ inline bool addContact(Rigid* bodyA, Rigid* bodyB,
     return true;
 }
 
-inline bool testAxis(const OBB& boxA, const OBB& boxB,
+inline bool testAxis(const OBB& boxA, const float3 axA[3],
+                     const OBB& boxB, const float3 axB[3],
                      const float3& delta, const float3& axis,
                      AxisType type, int indexA, int indexB, SatAxis& best) {
     float lenSq = lengthSq(axis);
@@ -169,12 +172,12 @@ inline bool testAxis(const OBB& boxA, const OBB& boxB,
     float3 n = axis * invLen;
     if (dot(n, delta) < 0.0f) n = -n;
     float distance = std::fabs(dot(delta, n));
-    float rA = boxA.half.x * absDot(n, boxA.axis[0]) +
-               boxA.half.y * absDot(n, boxA.axis[1]) +
-               boxA.half.z * absDot(n, boxA.axis[2]);
-    float rB = boxB.half.x * absDot(n, boxB.axis[0]) +
-               boxB.half.y * absDot(n, boxB.axis[1]) +
-               boxB.half.z * absDot(n, boxB.axis[2]);
+    float rA = boxA.half.x * absDot(n, axA[0]) +
+               boxA.half.y * absDot(n, axA[1]) +
+               boxA.half.z * absDot(n, axA[2]);
+    float rB = boxB.half.x * absDot(n, axB[0]) +
+               boxB.half.y * absDot(n, axB[1]) +
+               boxB.half.z * absDot(n, axB[2]);
     float separation = distance - (rA + rB);
     if (separation > 0.0f) return false;
     if (!best.valid || separation > best.separation) {
@@ -188,17 +191,17 @@ inline bool testAxis(const OBB& boxA, const OBB& boxB,
     return true;
 }
 
-inline void supportEdge(const OBB& box, int axisIndex, const float3& dir,
-                        float3& edgeA, float3& edgeB) {
+inline void supportEdge(const OBB& box, const float3 ax[3], int axisIndex,
+                        const float3& dir, float3& edgeA, float3& edgeB) {
     int axis1 = (axisIndex + 1) % 3;
     int axis2 = (axisIndex + 2) % 3;
-    float sign1 = dot(dir, box.axis[axis1]) >= 0.0f ? 1.0f : -1.0f;
-    float sign2 = dot(dir, box.axis[axis2]) >= 0.0f ? 1.0f : -1.0f;
+    float sign1 = dot(dir, ax[axis1]) >= 0.0f ? 1.0f : -1.0f;
+    float sign2 = dot(dir, ax[axis2]) >= 0.0f ? 1.0f : -1.0f;
     float3 edgeCenter = box.center +
-        box.axis[axis1] * (box.half[axis1] * sign1) +
-        box.axis[axis2] * (box.half[axis2] * sign2);
-    edgeA = edgeCenter - box.axis[axisIndex] * box.half[axisIndex];
-    edgeB = edgeCenter + box.axis[axisIndex] * box.half[axisIndex];
+        ax[axis1] * (box.half[axis1] * sign1) +
+        ax[axis2] * (box.half[axis2] * sign2);
+    edgeA = edgeCenter - ax[axisIndex] * box.half[axisIndex];
+    edgeB = edgeCenter + ax[axisIndex] * box.half[axisIndex];
 }
 
 inline void closestPointsOnSegments(const float3& p0, const float3& p1,
@@ -234,21 +237,24 @@ inline void closestPointsOnSegments(const float3& p0, const float3& p1,
 }
 
 inline int buildFaceManifold(Rigid* bodyA, Rigid* bodyB,
-                             const OBB& boxA, const OBB& boxB,
+                             const OBB& boxA, const float3 axA[3],
+                             const OBB& boxB, const float3 axB[3],
                              bool referenceIsA, int referenceAxis,
                              const float3& normalAB,
                              Manifold::Contact* contacts) {
     const OBB& referenceBox = referenceIsA ? boxA : boxB;
+    const float3* refAx = referenceIsA ? axA : axB;
     const OBB& incidentBox = referenceIsA ? boxB : boxA;
+    const float3* incAx = referenceIsA ? axB : axA;
     float3 referenceOutward = referenceIsA ? normalAB : -normalAB;
 
     FaceFrame referenceFace{};
-    buildFaceFrame(referenceBox, referenceAxis, referenceOutward, referenceFace);
-    int incidentAxis = chooseIncidentFaceAxis(incidentBox, referenceFace.normal);
+    buildFaceFrame(referenceBox, refAx, referenceAxis, referenceOutward, referenceFace);
+    int incidentAxis = chooseIncidentFaceAxis(incAx, referenceFace.normal);
 
     float3 clip0[MAX_POLY_VERTS];
     float3 clip1[MAX_POLY_VERTS];
-    buildIncidentFace(incidentBox, incidentAxis, referenceFace.normal, clip0);
+    buildIncidentFace(incidentBox, incAx, incidentAxis, referenceFace.normal, clip0);
     int count = 4;
 
     count = clipPolygonAgainstPlane(clip0, count, referenceFace.u,
@@ -282,20 +288,21 @@ inline int buildFaceManifold(Rigid* bodyA, Rigid* bodyB,
     }
 
     if (!contactCount) {
-        float3 xA = supportPoint(boxA, normalAB);
-        float3 xB = supportPoint(boxB, -normalAB);
+        float3 xA = supportPoint(boxA, axA, normalAB);
+        float3 xB = supportPoint(boxB, axB, -normalAB);
         addContact(bodyA, bodyB, contacts, contactCount, contactMidpoints, xA, xB, featurePrefix);
     }
     return contactCount;
 }
 
 inline int buildEdgeContact(Rigid* bodyA, Rigid* bodyB,
-                            const OBB& boxA, const OBB& boxB,
+                            const OBB& boxA, const float3 axA[3],
+                            const OBB& boxB, const float3 axB[3],
                             int axisA, int axisB, const float3& normalAB,
                             Manifold::Contact* contacts) {
     float3 a0, a1, b0, b1;
-    supportEdge(boxA, axisA, normalAB, a0, a1);
-    supportEdge(boxB, axisB, -normalAB, b0, b1);
+    supportEdge(boxA, axA, axisA, normalAB, a0, a1);
+    supportEdge(boxB, axB, axisB, -normalAB, b0, b1);
     float3 xA, xB;
     closestPointsOnSegments(a0, a1, b0, b1, xA, xB);
     int contactCount = 0;
@@ -303,8 +310,8 @@ inline int buildEdgeContact(Rigid* bodyA, Rigid* bodyB,
     int featureKey = (AXIS_EDGE << 24) | ((axisA & 0xFF) << 8) | (axisB & 0xFF);
     addContact(bodyA, bodyB, contacts, contactCount, contactMidpoints, xA, xB, featureKey);
     if (!contactCount) {
-        xA = supportPoint(boxA, normalAB);
-        xB = supportPoint(boxB, -normalAB);
+        xA = supportPoint(boxA, axA, normalAB);
+        xB = supportPoint(boxB, axB, -normalAB);
         addContact(bodyA, bodyB, contacts, contactCount, contactMidpoints, xA, xB, featureKey);
     }
     return contactCount;
@@ -315,6 +322,11 @@ inline int buildEdgeContact(Rigid* bodyA, Rigid* bodyB,
 int Manifold::collide(Rigid* bodyA, Rigid* bodyB, Contact* contacts, float3x3& basisOut) {
     OBB boxA = makeOBB(bodyA);
     OBB boxB = makeOBB(bodyB);
+
+    float3 axA[3], axB[3];
+    computeAxes(boxA, axA);
+    computeAxes(boxB, axB);
+
     float3 delta = boxB.center - boxA.center;
 
     SatAxis bestFace{};
@@ -326,12 +338,12 @@ int Manifold::collide(Rigid* bodyA, Rigid* bodyB, Contact* contacts, float3x3& b
     bestEdge.valid = false;
 
     for (int i = 0; i < 3; ++i)
-        if (!testAxis(boxA, boxB, delta, boxA.axis[i], AXIS_FACE_A, i, -1, bestFace)) return 0;
+        if (!testAxis(boxA, axA, boxB, axB, delta, axA[i], AXIS_FACE_A, i, -1, bestFace)) return 0;
     for (int i = 0; i < 3; ++i)
-        if (!testAxis(boxA, boxB, delta, boxB.axis[i], AXIS_FACE_B, -1, i, bestFace)) return 0;
+        if (!testAxis(boxA, axA, boxB, axB, delta, axB[i], AXIS_FACE_B, -1, i, bestFace)) return 0;
     for (int i = 0; i < 3; ++i)
         for (int j = 0; j < 3; ++j)
-            if (!testAxis(boxA, boxB, delta, cross(boxA.axis[i], boxB.axis[j]),
+            if (!testAxis(boxA, axA, boxB, axB, delta, cross(axA[i], axB[j]),
                           AXIS_EDGE, i, j, bestEdge)) return 0;
 
     if (!bestFace.valid) return 0;
@@ -347,10 +359,10 @@ int Manifold::collide(Rigid* bodyA, Rigid* bodyB, Contact* contacts, float3x3& b
     basisOut = orthonormal(-best.normalAB);
 
     if (best.type == AXIS_EDGE)
-        return buildEdgeContact(bodyA, bodyB, boxA, boxB, best.indexA, best.indexB, best.normalAB, contacts);
+        return buildEdgeContact(bodyA, bodyB, boxA, axA, boxB, axB, best.indexA, best.indexB, best.normalAB, contacts);
     if (best.type == AXIS_FACE_A)
-        return buildFaceManifold(bodyA, bodyB, boxA, boxB, true, best.indexA, best.normalAB, contacts);
-    return buildFaceManifold(bodyA, bodyB, boxA, boxB, false, best.indexB, best.normalAB, contacts);
+        return buildFaceManifold(bodyA, bodyB, boxA, axA, boxB, axB, true, best.indexA, best.normalAB, contacts);
+    return buildFaceManifold(bodyA, bodyB, boxA, axA, boxB, axB, false, best.indexB, best.normalAB, contacts);
 }
 
 }  // namespace avbd
