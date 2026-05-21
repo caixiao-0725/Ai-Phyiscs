@@ -3,6 +3,7 @@
 
 #include "avbd_solver.h"
 #include "avbd_broadphase_gpu.h"
+#include "avbd_narrowphase_gpu.h"
 
 #include <cmath>
 #include <algorithm>
@@ -24,6 +25,7 @@ void SoaData::pack(Rigid* bodies) {
     half_x.resize(count); half_y.resize(count); half_z.resize(count);
     radius.resize(count);
     mass.resize(count);
+    friction.resize(count);
 
     int i = 0;
     for (Rigid* b = bodies; b; b = b->next, i++) {
@@ -40,6 +42,7 @@ void SoaData::pack(Rigid* bodies) {
         half_z[i] = b->size.z * 0.5f;
         radius[i] = b->radius;
         mass[i] = b->mass;
+        friction[i] = b->friction;
     }
 }
 
@@ -51,6 +54,7 @@ Solver::Solver()
 Solver::~Solver() {
     clear();
     delete broadphase_gpu_;
+    delete narrowphase_gpu_;
 }
 
 Rigid* Solver::pick(float3 origin, float3 dir, float3& local) {
@@ -154,7 +158,7 @@ void Solver::step() {
         soa_.pos_x.data(), soa_.pos_y.data(), soa_.pos_z.data(),
         soa_.quat_x.data(), soa_.quat_y.data(), soa_.quat_z.data(), soa_.quat_w.data(),
         soa_.half_x.data(), soa_.half_y.data(), soa_.half_z.data(),
-        soa_.mass.data(),
+        soa_.mass.data(), soa_.friction.data(),
         soa_.count, pairs_a_.data(), pairs_b_.data());
 
 #ifdef AVBD_VALIDATE_BROADPHASE
@@ -187,12 +191,154 @@ void Solver::step() {
     }
 #endif
 
-    // CPU narrowphase: for each GPU broadphase pair, run SAT
-    for (int k = 0; k < pair_count; k++) {
-        Rigid* bodyA = soa_.body_ptrs[pairs_a_[k]];
-        Rigid* bodyB = soa_.body_ptrs[pairs_b_[k]];
-        if (!bodyA->constrainedTo(bodyB))
-            new Manifold(this, bodyA, bodyB);
+    // GPU narrowphase: run SAT on GPU for all broadphase pairs
+    if (!narrowphase_gpu_)
+        narrowphase_gpu_ = new NarrowphaseGPU();
+
+    if (pair_count > 0) {
+        int max_manifolds = pair_count;
+        int max_contacts_total = pair_count * 8;
+        std::vector<GpuManifold> gpu_manifolds(max_manifolds);
+        std::vector<GpuContact> gpu_contacts(max_contacts_total);
+        int total_contacts = 0;
+
+        int n_manifolds = narrowphase_gpu_->query(
+            broadphase_gpu_->pos_x_dev(), broadphase_gpu_->pos_y_dev(), broadphase_gpu_->pos_z_dev(),
+            broadphase_gpu_->quat_x_dev(), broadphase_gpu_->quat_y_dev(),
+            broadphase_gpu_->quat_z_dev(), broadphase_gpu_->quat_w_dev(),
+            broadphase_gpu_->half_x_dev(), broadphase_gpu_->half_y_dev(), broadphase_gpu_->half_z_dev(),
+            broadphase_gpu_->friction_dev(),
+            broadphase_gpu_->pair_a_dev(), broadphase_gpu_->pair_b_dev(),
+            pair_count, soa_.count,
+            gpu_manifolds.data(), gpu_contacts.data(), total_contacts);
+
+        // Print vertex table periodically
+        {
+            static int vtx_frame = 0;
+            if (vtx_frame % 300 == 0) {
+                const int* vc = narrowphase_gpu_->vertex_counts();
+                const VertexEntry* vt = narrowphase_gpu_->vertex_table();
+                int stride = narrowphase_gpu_->vertex_table_stride();
+                int overflow = 0;
+                fprintf(stderr, "VERTEX TABLE [frame %d]: bodies=%d manifolds=%d\n",
+                        vtx_frame, soa_.count, n_manifolds);
+                int print_limit = soa_.count < 20 ? soa_.count : 20;
+                for (int b = 0; b < print_limit; b++) {
+                    int cnt = vc[b];
+                    int clamped = cnt < stride ? cnt : stride;
+                    if (cnt > stride) overflow++;
+                    fprintf(stderr, "  body %2d: %d neighbors [", b, cnt);
+                    for (int s = 0; s < clamped; s++) {
+                        const VertexEntry& e = vt[b * stride + s];
+                        if (s > 0) fprintf(stderr, ", ");
+                        fprintf(stderr, "(other=%d, mfld=%d)", e.other_body, e.manifold_idx);
+                    }
+                    if (cnt > stride) fprintf(stderr, ", ... +%d overflow", cnt - stride);
+                    fprintf(stderr, "]\n");
+                }
+                if (soa_.count > print_limit)
+                    fprintf(stderr, "  ... (%d more bodies)\n", soa_.count - print_limit);
+                if (overflow > 0)
+                    fprintf(stderr, "  WARNING: %d bodies exceeded %d neighbor slots\n",
+                            overflow, stride);
+            }
+            vtx_frame++;
+        }
+
+#ifdef AVBD_VALIDATE_NARROWPHASE
+        {
+            int cpu_collide_count = 0;
+            int gpu_collide_count = n_manifolds;
+
+            // Build GPU result set: (min_idx, max_idx) -> num_contacts
+            std::vector<std::pair<std::pair<int,int>, int>> gpu_set;
+            for (int k = 0; k < n_manifolds; k++) {
+                int a = gpu_manifolds[k].body_a, b = gpu_manifolds[k].body_b;
+                if (a > b) std::swap(a, b);
+                gpu_set.push_back({{a, b}, gpu_manifolds[k].num_contacts});
+            }
+            std::sort(gpu_set.begin(), gpu_set.end());
+
+            // Run CPU narrowphase on the same pairs
+            std::vector<std::pair<std::pair<int,int>, int>> cpu_set;
+            for (int k = 0; k < pair_count; k++) {
+                Rigid* bA = soa_.body_ptrs[pairs_a_[k]];
+                Rigid* bB = soa_.body_ptrs[pairs_b_[k]];
+                Manifold::Contact tmpC[8] = {};
+                float3x3 tmpBasis{};
+                int nc = Manifold::collide(bA, bB, tmpC, tmpBasis);
+                if (nc > 0) {
+                    cpu_collide_count++;
+                    int a = pairs_a_[k], b = pairs_b_[k];
+                    if (a > b) std::swap(a, b);
+                    cpu_set.push_back({{a, b}, nc});
+                }
+            }
+            std::sort(cpu_set.begin(), cpu_set.end());
+
+            // Compare: find CPU collisions missing from GPU
+            int missing = 0, mismatch_nc = 0;
+            for (auto& cp : cpu_set) {
+                auto it = std::lower_bound(gpu_set.begin(), gpu_set.end(), cp,
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+                if (it == gpu_set.end() || it->first != cp.first) {
+                    if (missing < 10)
+                        fprintf(stderr, "  NP VALIDATE: CPU pair (%d,%d) nc=%d MISSING from GPU\n",
+                                cp.first.first, cp.first.second, cp.second);
+                    missing++;
+                } else if (it->second != cp.second) {
+                    if (mismatch_nc < 10)
+                        fprintf(stderr, "  NP VALIDATE: pair (%d,%d) cpu_nc=%d gpu_nc=%d\n",
+                                cp.first.first, cp.first.second, cp.second, it->second);
+                    mismatch_nc++;
+                }
+            }
+            // Find GPU collisions not in CPU (extra)
+            int extra = 0;
+            for (auto& gp : gpu_set) {
+                auto it = std::lower_bound(cpu_set.begin(), cpu_set.end(), gp,
+                    [](const auto& a, const auto& b) { return a.first < b.first; });
+                if (it == cpu_set.end() || it->first != gp.first)
+                    extra++;
+            }
+
+            static int np_frame = 0;
+            if (np_frame % 60 == 0 || missing > 0) {
+                fprintf(stderr, "NP VALIDATE [frame %d]: pairs=%d cpu_collisions=%d gpu_manifolds=%d "
+                        "missing=%d mismatch_nc=%d extra=%d\n",
+                        np_frame, pair_count, cpu_collide_count, gpu_collide_count,
+                        missing, mismatch_nc, extra);
+            }
+            np_frame++;
+        }
+#endif
+
+        for (int k = 0; k < n_manifolds; k++) {
+            const GpuManifold& gm = gpu_manifolds[k];
+            Rigid* bodyA = soa_.body_ptrs[gm.body_a];
+            Rigid* bodyB = soa_.body_ptrs[gm.body_b];
+            if (bodyA->constrainedTo(bodyB))
+                continue;
+
+            Manifold* m = new Manifold(this, bodyA, bodyB);
+            m->gpu_num_contacts_ = gm.num_contacts;
+            m->gpu_basis_ = float3x3{
+                gm.basis[0], gm.basis[1], gm.basis[2],
+                gm.basis[3], gm.basis[4], gm.basis[5],
+                gm.basis[6], gm.basis[7], gm.basis[8]};
+
+            for (int c = 0; c < gm.num_contacts; c++) {
+                const GpuContact& gc = gpu_contacts[gm.contact_offset + c];
+                Manifold::Contact& mc = m->gpu_new_contacts_[c];
+                mc.feature.key = gc.feature_key;
+                mc.rA = float3{gc.rA_x, gc.rA_y, gc.rA_z};
+                mc.rB = float3{gc.rB_x, gc.rB_y, gc.rB_z};
+                mc.C0 = float3{0, 0, 0};
+                mc.penalty = float3{AVBD_PENALTY_MIN, AVBD_PENALTY_MIN, AVBD_PENALTY_MIN};
+                mc.lambda = float3{0, 0, 0};
+                mc.stick = false;
+            }
+        }
     }
 
     // Initialize and warmstart forces

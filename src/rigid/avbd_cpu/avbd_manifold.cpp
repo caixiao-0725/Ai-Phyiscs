@@ -15,7 +15,17 @@ bool Manifold::initialize() {
     friction = std::sqrt(bodyA->friction * bodyB->friction);
 
     Contact newContacts[8] = {};
-    int newNumContacts = collide(bodyA, bodyB, newContacts, basis);
+    int newNumContacts;
+
+    if (gpu_num_contacts_ >= 0) {
+        newNumContacts = gpu_num_contacts_;
+        for (int i = 0; i < newNumContacts; i++)
+            newContacts[i] = gpu_new_contacts_[i];
+        basis = gpu_basis_;
+        gpu_num_contacts_ = -1;
+    } else {
+        newNumContacts = collide(bodyA, bodyB, newContacts, basis);
+    }
 
     for (int i = 0; i < newNumContacts; i++) {
         for (int j = 0; j < numContacts; j++) {

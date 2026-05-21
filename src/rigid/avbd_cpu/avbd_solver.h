@@ -21,6 +21,7 @@ struct Force;
 struct Manifold;
 struct Solver;
 class BroadphaseGPU;
+class NarrowphaseGPU;
 
 struct SoaData {
     int count = 0;
@@ -31,6 +32,7 @@ struct SoaData {
     std::vector<float> half_x, half_y, half_z;
     std::vector<float> radius;
     std::vector<float> mass;
+    std::vector<float> friction;
 
     void pack(Rigid* bodies);
 };
@@ -143,6 +145,12 @@ struct Manifold : Force {
     int numContacts;
     float friction;
 
+    // When GPU narrowphase provides collision results, they are stored here
+    // and used by initialize() instead of calling collide() on CPU.
+    Contact gpu_new_contacts_[8];
+    float3x3 gpu_basis_;
+    int gpu_num_contacts_ = -1;  // -1 means no GPU result available
+
     Manifold(Solver* solver, Rigid* bodyA, Rigid* bodyB);
 
     bool initialize() override;
@@ -169,6 +177,7 @@ struct Solver {
 
     SoaData soa_;
     BroadphaseGPU* broadphase_gpu_ = nullptr;
+    NarrowphaseGPU* narrowphase_gpu_ = nullptr;
     std::vector<int> pairs_a_, pairs_b_;
 
     Solver();

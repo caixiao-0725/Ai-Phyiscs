@@ -95,7 +95,7 @@ void Viewer::run() {
 
     const auto& reg = scene_registry();
     if (!reg.empty()) {
-        switch_scene(0);
+        switch_scene(2);
     }
 
     running_ = true;

@@ -63,6 +63,18 @@ __global__ void compute_body_aabbs_kernel(
     out_center[i] = math::Vec3f(cx, cy, cz);
 }
 
+__global__ void split_pairs_kernel(
+    const math::Vec2i* __restrict__ pairs_in,
+    int count,
+    int* __restrict__ pair_a,
+    int* __restrict__ pair_b)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= count) return;
+    pair_a[i] = pairs_in[i].x;
+    pair_b[i] = pairs_in[i].y;
+}
+
 }  // namespace
 
 void BroadphaseGPU::build(int max_bodies, int max_pairs) {
@@ -74,8 +86,12 @@ void BroadphaseGPU::build(int max_bodies, int max_pairs) {
     quat_z_.resize(max_bodies); quat_w_.resize(max_bodies);
     half_x_.resize(max_bodies); half_y_.resize(max_bodies); half_z_.resize(max_bodies);
     mass_.resize(max_bodies);
+    friction_.resize(max_bodies);
     aabbs_.resize(max_bodies);
     centers_.resize(max_bodies);
+
+    pair_a_split_.resize(max_pairs);
+    pair_b_split_.resize(max_pairs);
 
     bvh_.build(max_bodies, max_pairs);
 }
@@ -85,7 +101,7 @@ int BroadphaseGPU::query(
     const float* quat_x, const float* quat_y, const float* quat_z,
     const float* quat_w,
     const float* half_x, const float* half_y, const float* half_z,
-    const float* mass,
+    const float* mass, const float* friction,
     int n_bodies,
     int* pair_a, int* pair_b)
 {
@@ -106,6 +122,7 @@ int BroadphaseGPU::query(
     upload(quat_z_, quat_z); upload(quat_w_, quat_w);
     upload(half_x_, half_x); upload(half_y_, half_y); upload(half_z_, half_z);
     upload(mass_, mass);
+    upload(friction_, friction);
 
     compute_body_aabbs_kernel<<<grid(n_bodies), kBlock>>>(
         pos_x_.gpu_data(), pos_y_.gpu_data(), pos_z_.gpu_data(),
@@ -125,16 +142,26 @@ int BroadphaseGPU::query(
           "pair_count D2H");
     int count = std::min(count_host, max_pairs_);
 
+    // Split Vec2i pairs into separate a/b arrays on GPU for narrowphase
     if (count > 0) {
-        std::vector<math::Vec2i> pairs_tmp(count);
-        check(cudaMemcpy(pairs_tmp.data(), bvh_.query_pairs_dev(),
-                         count * sizeof(math::Vec2i), cudaMemcpyDeviceToHost),
-              "pair_list D2H");
-
-        for (int k = 0; k < count; k++) {
-            pair_a[k] = pairs_tmp[k].x;
-            pair_b[k] = pairs_tmp[k].y;
+        if (count > (int)pair_a_split_.gpu_size()) {
+            pair_a_split_.resize(count);
+            pair_b_split_.resize(count);
         }
+        split_pairs_kernel<<<grid(count), kBlock>>>(
+            reinterpret_cast<const math::Vec2i*>(bvh_.query_pairs_dev()),
+            count,
+            pair_a_split_.gpu_data(),
+            pair_b_split_.gpu_data());
+        check(cudaGetLastError(), "split_pairs");
+
+        // Also download to CPU for the caller
+        check(cudaMemcpy(pair_a, pair_a_split_.gpu_data(),
+                         count * sizeof(int), cudaMemcpyDeviceToHost),
+              "pair_a D2H");
+        check(cudaMemcpy(pair_b, pair_b_split_.gpu_data(),
+                         count * sizeof(int), cudaMemcpyDeviceToHost),
+              "pair_b D2H");
     }
 
     return count;
