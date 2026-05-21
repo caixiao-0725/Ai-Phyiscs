@@ -24,6 +24,7 @@ struct GpuManifold;
 class BroadphaseGPU;
 class NarrowphaseGPU;
 class GraphColoringGPU;
+class GpuSolver;
 
 struct SoaData {
     int count = 0;
@@ -35,8 +36,13 @@ struct SoaData {
     std::vector<float> radius;
     std::vector<float> mass;
     std::vector<float> friction;
+    std::vector<float> moment_x, moment_y, moment_z;
+    std::vector<float> vel_x, vel_y, vel_z;
+    std::vector<float> velang_x, velang_y, velang_z;
+    std::vector<float> prevvel_x, prevvel_y, prevvel_z;
 
     void pack(Rigid* bodies);
+    void unpack(Rigid* bodies);
 };
 
 struct Rigid {
@@ -152,7 +158,6 @@ struct Manifold : Force {
     Contact gpu_new_contacts_[8];
     float3x3 gpu_basis_;
     int gpu_num_contacts_ = -1;  // -1 means no GPU result available
-    int ws_manifold_idx_ = -1;   // index into solver's ws_manifolds_ for write-back
 
     Manifold(Solver* solver, Rigid* bodyA, Rigid* bodyB);
 
@@ -182,12 +187,8 @@ struct Solver {
     BroadphaseGPU* broadphase_gpu_ = nullptr;
     NarrowphaseGPU* narrowphase_gpu_ = nullptr;
     GraphColoringGPU* graph_coloring_gpu_ = nullptr;
+    GpuSolver* gpu_solver_ = nullptr;
     std::vector<int> pairs_a_, pairs_b_;
-
-    // Warm-start bookkeeping: saved per step() for post-solver write-back
-    int ws_n_manifolds_ = 0;
-    int ws_total_contacts_ = 0;
-    std::vector<GpuManifold> ws_manifolds_;
 
     Solver();
     ~Solver();
