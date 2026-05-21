@@ -20,6 +20,7 @@ struct Rigid;
 struct Force;
 struct Manifold;
 struct Solver;
+struct GpuManifold;
 class BroadphaseGPU;
 class NarrowphaseGPU;
 class GraphColoringGPU;
@@ -151,6 +152,7 @@ struct Manifold : Force {
     Contact gpu_new_contacts_[8];
     float3x3 gpu_basis_;
     int gpu_num_contacts_ = -1;  // -1 means no GPU result available
+    int ws_manifold_idx_ = -1;   // index into solver's ws_manifolds_ for write-back
 
     Manifold(Solver* solver, Rigid* bodyA, Rigid* bodyB);
 
@@ -181,6 +183,11 @@ struct Solver {
     NarrowphaseGPU* narrowphase_gpu_ = nullptr;
     GraphColoringGPU* graph_coloring_gpu_ = nullptr;
     std::vector<int> pairs_a_, pairs_b_;
+
+    // Warm-start bookkeeping: saved per step() for post-solver write-back
+    int ws_n_manifolds_ = 0;
+    int ws_total_contacts_ = 0;
+    std::vector<GpuManifold> ws_manifolds_;
 
     Solver();
     ~Solver();

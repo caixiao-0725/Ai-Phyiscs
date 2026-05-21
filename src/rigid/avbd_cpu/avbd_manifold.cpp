@@ -18,6 +18,8 @@ bool Manifold::initialize() {
     int newNumContacts;
 
     if (gpu_num_contacts_ >= 0) {
+        // GPU path: contacts have warm-start data from GPU warmstart kernel
+        // (raw post-solver values from prev frame, matched by feature_key).
         newNumContacts = gpu_num_contacts_;
         for (int i = 0; i < newNumContacts; i++)
             newContacts[i] = gpu_new_contacts_[i];
@@ -25,19 +27,20 @@ bool Manifold::initialize() {
         gpu_num_contacts_ = -1;
     } else {
         newNumContacts = collide(bodyA, bodyB, newContacts, basis);
-    }
 
-    for (int i = 0; i < newNumContacts; i++) {
-        for (int j = 0; j < numContacts; j++) {
-            if (newContacts[i].feature.key == contacts[j].feature.key) {
-                float3 newRA = newContacts[i].rA;
-                float3 newRB = newContacts[i].rB;
-                newContacts[i] = contacts[j];
-                if (!contacts[j].stick) {
-                    newContacts[i].rA = newRA;
-                    newContacts[i].rB = newRB;
+        // CPU warm-start matching (only for CPU narrowphase path)
+        for (int i = 0; i < newNumContacts; i++) {
+            for (int j = 0; j < numContacts; j++) {
+                if (newContacts[i].feature.key == contacts[j].feature.key) {
+                    float3 newRA = newContacts[i].rA;
+                    float3 newRB = newContacts[i].rB;
+                    newContacts[i] = contacts[j];
+                    if (!contacts[j].stick) {
+                        newContacts[i].rA = newRA;
+                        newContacts[i].rB = newRB;
+                    }
+                    break;
                 }
-                break;
             }
         }
     }
@@ -51,6 +54,7 @@ bool Manifold::initialize() {
         float3 xB = transform(bodyB->positionLin, bodyB->positionAng, contacts[i].rB);
         contacts[i].C0 = basis * (xA - xB) + float3{AVBD_COLLISION_MARGIN, 0, 0};
 
+        // Scale lambda and penalty (both CPU and GPU paths transfer raw values)
         contacts[i].lambda = contacts[i].lambda * solver->alpha * solver->gamma;
         contacts[i].penalty = clamp(contacts[i].penalty * solver->gamma, AVBD_PENALTY_MIN, AVBD_PENALTY_MAX);
     }

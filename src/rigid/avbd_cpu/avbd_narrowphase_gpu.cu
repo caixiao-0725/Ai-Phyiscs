@@ -222,11 +222,17 @@ __device__ bool tryAddContact(GpuContact* contacts, int& cnt,
     if (cnt >= MAX_CONTACTS) return false;
     Q4 invA = qconj(qA);
     Q4 invB = qconj(qB);
-    contacts[cnt].feature_key = featKey;
+    GpuContact& c = contacts[cnt];
+    c.feature_key = featKey;
     F3 rA = qrot(invA, xA - posA);
     F3 rB = qrot(invB, xB - posB);
-    contacts[cnt].rA_x = rA.x; contacts[cnt].rA_y = rA.y; contacts[cnt].rA_z = rA.z;
-    contacts[cnt].rB_x = rB.x; contacts[cnt].rB_y = rB.y; contacts[cnt].rB_z = rB.z;
+    c.rA_x = rA.x; c.rA_y = rA.y; c.rA_z = rA.z;
+    c.rB_x = rB.x; c.rB_y = rB.y; c.rB_z = rB.z;
+    // Default warm-start values (overwritten by warmstart_kernel if matched)
+    c.lambda_x = 0.0f; c.lambda_y = 0.0f; c.lambda_z = 0.0f;
+    c.penalty_x = 1.0f; c.penalty_y = 1.0f; c.penalty_z = 1.0f;
+    c.C0_x = 0.0f; c.C0_y = 0.0f; c.C0_z = 0.0f;
+    c.stick = 0;
     midpoints[cnt] = mid;
     cnt++;
     return true;
@@ -452,6 +458,78 @@ __global__ void sat_narrowphase_kernel(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Warm-start kernel: match current contacts against previous frame
+// ---------------------------------------------------------------------------
+
+__global__ void warmstart_kernel(
+    GpuManifold* __restrict__ cur_manifolds,
+    GpuContact*  __restrict__ cur_contacts,
+    int n_cur_manifolds,
+    const GpuManifold* __restrict__ prev_manifolds,
+    const GpuContact*  __restrict__ prev_contacts,
+    const int* __restrict__ prev_vtx_counts,
+    const VertexEntry* __restrict__ prev_vtx_table,
+    int prev_vtx_stride,
+    int prev_n_bodies,
+    float /*alpha_unused*/,
+    float /*gamma_unused*/)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_cur_manifolds) return;
+
+    const GpuManifold& cm = cur_manifolds[tid];
+    int bodyA = cm.body_a;
+    int bodyB = cm.body_b;
+
+    // Look up in prev frame's vertex table: does bodyA have bodyB as neighbor?
+    int prev_midx = -1;
+    if (bodyA < prev_n_bodies) {
+        int cnt = prev_vtx_counts[bodyA];
+        if (cnt > prev_vtx_stride) cnt = prev_vtx_stride;
+        for (int s = 0; s < cnt; s++) {
+            const VertexEntry& e = prev_vtx_table[bodyA * prev_vtx_stride + s];
+            if (e.other_body == bodyB) {
+                prev_midx = e.manifold_idx;
+                break;
+            }
+        }
+    }
+
+    if (prev_midx < 0) return;
+
+    const GpuManifold& pm = prev_manifolds[prev_midx];
+
+    // For each current contact, search for matching feature_key in prev manifold
+    for (int ci = 0; ci < cm.num_contacts; ci++) {
+        GpuContact& cc = cur_contacts[cm.contact_offset + ci];
+
+        for (int pj = 0; pj < pm.num_contacts; pj++) {
+            const GpuContact& pc = prev_contacts[pm.contact_offset + pj];
+            if (cc.feature_key != pc.feature_key) continue;
+
+            // Found matching contact — raw transfer of post-solver state.
+            // CPU initialize() will apply alpha*gamma scaling.
+            bool prev_stick = (pc.stick != 0);
+            if (prev_stick) {
+                cc.rA_x = pc.rA_x; cc.rA_y = pc.rA_y; cc.rA_z = pc.rA_z;
+                cc.rB_x = pc.rB_x; cc.rB_y = pc.rB_y; cc.rB_z = pc.rB_z;
+            }
+            cc.lambda_x = pc.lambda_x;
+            cc.lambda_y = pc.lambda_y;
+            cc.lambda_z = pc.lambda_z;
+            cc.penalty_x = pc.penalty_x;
+            cc.penalty_y = pc.penalty_y;
+            cc.penalty_z = pc.penalty_z;
+            cc.C0_x = pc.C0_x;
+            cc.C0_y = pc.C0_y;
+            cc.C0_z = pc.C0_z;
+            cc.stick = pc.stick;
+            break;
+        }
+    }
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -549,6 +627,80 @@ int NarrowphaseGPU::query(
 
     total_contacts_out = n_contacts;
     return n_manifolds;
+}
+
+void NarrowphaseGPU::warmstart(int n_manifolds, int n_contacts, int n_bodies,
+                                GpuContact* contacts_out)
+{
+    if (n_manifolds <= 0 || prev_n_manifolds_ <= 0 || n_contacts <= 0)
+        return;
+
+    // Run warm-start kernel: match current contacts against prev frame.
+    // The kernel transfers lambda/penalty/C0/stick directly (no scaling here;
+    // these are raw values from the previous frame's post-solver state).
+    warmstart_kernel<<<grid(n_manifolds), kBlock>>>(
+        manifolds_.gpu_data(),
+        contacts_.gpu_data(),
+        n_manifolds,
+        prev_manifolds_.gpu_data(),
+        prev_contacts_.gpu_data(),
+        prev_vtx_counts_.gpu_data(),
+        prev_vtx_table_.gpu_data(),
+        VERTEX_TABLE_MAX_NEIGHBORS,
+        prev_n_bodies_,
+        1.0f, 1.0f);  // no scaling — raw transfer
+    check(cudaGetLastError(), "warmstart_kernel launch");
+
+    // Re-download the warm-started contacts
+    if (contacts_out) {
+        check(cudaMemcpy(contacts_out, contacts_.gpu_data(),
+                         n_contacts * sizeof(GpuContact), cudaMemcpyDeviceToHost),
+              "ws contacts D2H");
+    }
+}
+
+void NarrowphaseGPU::upload_contacts(const GpuContact* contacts, int n_contacts) {
+    if (n_contacts <= 0 || !contacts) return;
+    check(cudaMemcpy(contacts_.gpu_data(), contacts,
+                     n_contacts * sizeof(GpuContact), cudaMemcpyHostToDevice),
+          "upload_contacts H2D");
+}
+
+void NarrowphaseGPU::snapshot_for_next_frame(int n_manifolds, int n_contacts, int n_bodies)
+{
+    size_t need_m = (size_t)(max_pairs_ > n_manifolds ? max_pairs_ : n_manifolds);
+    size_t need_c = (size_t)(max_pairs_ * MAX_CONTACTS);
+    if (need_c < (size_t)n_contacts) need_c = (size_t)n_contacts;
+
+    if (prev_manifolds_.gpu_size() < need_m)
+        prev_manifolds_.allocate_device(need_m);
+    if (prev_contacts_.gpu_size() < need_c)
+        prev_contacts_.allocate_device(need_c);
+    if (prev_vtx_counts_.gpu_size() < (size_t)n_bodies)
+        prev_vtx_counts_.allocate_device(n_bodies);
+    size_t vtx_total = (size_t)n_bodies * VERTEX_TABLE_MAX_NEIGHBORS;
+    if (prev_vtx_table_.gpu_size() < vtx_total)
+        prev_vtx_table_.allocate_device(vtx_total);
+
+    if (n_manifolds > 0)
+        check(cudaMemcpy(prev_manifolds_.gpu_data(), manifolds_.gpu_data(),
+                         n_manifolds * sizeof(GpuManifold), cudaMemcpyDeviceToDevice),
+              "snap manifolds D2D");
+    if (n_contacts > 0)
+        check(cudaMemcpy(prev_contacts_.gpu_data(), contacts_.gpu_data(),
+                         n_contacts * sizeof(GpuContact), cudaMemcpyDeviceToDevice),
+              "snap contacts D2D");
+    if (n_bodies > 0) {
+        check(cudaMemcpy(prev_vtx_counts_.gpu_data(), vtx_counts_.gpu_data(),
+                         n_bodies * sizeof(int), cudaMemcpyDeviceToDevice),
+              "snap vtx_counts D2D");
+        check(cudaMemcpy(prev_vtx_table_.gpu_data(), vtx_table_.gpu_data(),
+                         vtx_total * sizeof(VertexEntry), cudaMemcpyDeviceToDevice),
+              "snap vtx_table D2D");
+    }
+
+    prev_n_manifolds_ = n_manifolds;
+    prev_n_bodies_ = n_bodies;
 }
 
 }  // namespace avbd

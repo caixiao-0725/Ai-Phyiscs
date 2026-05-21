@@ -214,97 +214,102 @@ void Solver::step() {
             pair_count, soa_.count,
             gpu_manifolds.data(), gpu_contacts.data(), total_contacts);
 
-        // Print vertex table periodically
-        {
-            static int vtx_frame = 0;
-            if (vtx_frame % 300 == 0) {
-                const int* vc = narrowphase_gpu_->vertex_counts();
-                const VertexEntry* vt = narrowphase_gpu_->vertex_table();
-                int stride = narrowphase_gpu_->vertex_table_stride();
-                int overflow = 0;
-                fprintf(stderr, "VERTEX TABLE [frame %d]: bodies=%d manifolds=%d\n",
-                        vtx_frame, soa_.count, n_manifolds);
-                int print_limit = soa_.count < 20 ? soa_.count : 20;
-                for (int b = 0; b < print_limit; b++) {
-                    int cnt = vc[b];
-                    int clamped = cnt < stride ? cnt : stride;
-                    if (cnt > stride) overflow++;
-                    fprintf(stderr, "  body %2d: %d neighbors [", b, cnt);
-                    for (int s = 0; s < clamped; s++) {
-                        const VertexEntry& e = vt[b * stride + s];
-                        if (s > 0) fprintf(stderr, ", ");
-                        fprintf(stderr, "(other=%d, mfld=%d)", e.other_body, e.manifold_idx);
-                    }
-                    if (cnt > stride) fprintf(stderr, ", ... +%d overflow", cnt - stride);
-                    fprintf(stderr, "]\n");
-                }
-                if (soa_.count > print_limit)
-                    fprintf(stderr, "  ... (%d more bodies)\n", soa_.count - print_limit);
-                if (overflow > 0)
-                    fprintf(stderr, "  WARNING: %d bodies exceeded %d neighbor slots\n",
-                            overflow, stride);
-            }
-            vtx_frame++;
-        }
+        // GPU warm-start: match contacts against previous frame on GPU,
+        // then re-download contacts with warm-start data filled in.
+        narrowphase_gpu_->warmstart(n_manifolds, total_contacts, soa_.count,
+                                    gpu_contacts.data());
 
-        // GPU graph coloring comparison (runs all four algorithms periodically)
-        {
-            static int coloring_frame = 0;
-            if (n_manifolds > 0 && coloring_frame % 300 == 0) {
-                if (!graph_coloring_gpu_)
-                    graph_coloring_gpu_ = new GraphColoringGPU();
+        // // Print vertex table periodically
+        // {
+        //     static int vtx_frame = 0;
+        //     if (vtx_frame % 300 == 0) {
+        //         const int* vc = narrowphase_gpu_->vertex_counts();
+        //         const VertexEntry* vt = narrowphase_gpu_->vertex_table();
+        //         int stride = narrowphase_gpu_->vertex_table_stride();
+        //         int overflow = 0;
+        //         fprintf(stderr, "VERTEX TABLE [frame %d]: bodies=%d manifolds=%d\n",
+        //                 vtx_frame, soa_.count, n_manifolds);
+        //         int print_limit = soa_.count < 20 ? soa_.count : 20;
+        //         for (int b = 0; b < print_limit; b++) {
+        //             int cnt = vc[b];
+        //             int clamped = cnt < stride ? cnt : stride;
+        //             if (cnt > stride) overflow++;
+        //             fprintf(stderr, "  body %2d: %d neighbors [", b, cnt);
+        //             for (int s = 0; s < clamped; s++) {
+        //                 const VertexEntry& e = vt[b * stride + s];
+        //                 if (s > 0) fprintf(stderr, ", ");
+        //                 fprintf(stderr, "(other=%d, mfld=%d)", e.other_body, e.manifold_idx);
+        //             }
+        //             if (cnt > stride) fprintf(stderr, ", ... +%d overflow", cnt - stride);
+        //             fprintf(stderr, "]\n");
+        //         }
+        //         if (soa_.count > print_limit)
+        //             fprintf(stderr, "  ... (%d more bodies)\n", soa_.count - print_limit);
+        //         if (overflow > 0)
+        //             fprintf(stderr, "  WARNING: %d bodies exceeded %d neighbor slots\n",
+        //                     overflow, stride);
+        //     }
+        //     vtx_frame++;
+        // }
 
-                const int* vc_dev = narrowphase_gpu_->vtx_counts_dev();
-                const VertexEntry* vt_dev = narrowphase_gpu_->vtx_table_dev();
-                int stride = narrowphase_gpu_->vertex_table_stride();
-                unsigned seed = (unsigned)coloring_frame;
+        // // GPU graph coloring comparison (runs all four algorithms periodically)
+        // {
+        //     static int coloring_frame = 0;
+        //     if (n_manifolds > 0 && coloring_frame % 300 == 0) {
+        //         if (!graph_coloring_gpu_)
+        //             graph_coloring_gpu_ = new GraphColoringGPU();
 
-                fprintf(stderr, "\n=== GRAPH COLORING [frame %d] bodies=%d manifolds=%d ===\n",
-                        coloring_frame, soa_.count, n_manifolds);
+        //         const int* vc_dev = narrowphase_gpu_->vtx_counts_dev();
+        //         const VertexEntry* vt_dev = narrowphase_gpu_->vtx_table_dev();
+        //         int stride = narrowphase_gpu_->vertex_table_stride();
+        //         unsigned seed = (unsigned)coloring_frame;
 
-                auto vivace = graph_coloring_gpu_->color_vivace(vc_dev, vt_dev, soa_.count, stride, seed);
-                fprintf(stderr, "  Vivace:  colors=%d  rounds=%d  time=%.3f ms\n",
-                        vivace.num_colors, vivace.num_rounds, vivace.elapsed_ms);
+        //         fprintf(stderr, "\n=== GRAPH COLORING [frame %d] bodies=%d manifolds=%d ===\n",
+        //                 coloring_frame, soa_.count, n_manifolds);
 
-                auto luby = graph_coloring_gpu_->color_luby(vc_dev, vt_dev, soa_.count, stride, seed);
-                fprintf(stderr, "  Luby:    colors=%d  rounds=%d  time=%.3f ms\n",
-                        luby.num_colors, luby.num_rounds, luby.elapsed_ms);
+        //         auto vivace = graph_coloring_gpu_->color_vivace(vc_dev, vt_dev, soa_.count, stride, seed);
+        //         fprintf(stderr, "  Vivace:  colors=%d  rounds=%d  time=%.3f ms\n",
+        //                 vivace.num_colors, vivace.num_rounds, vivace.elapsed_ms);
 
-                auto jp = graph_coloring_gpu_->color_jp(vc_dev, vt_dev, soa_.count, stride, seed);
-                fprintf(stderr, "  JP:      colors=%d  rounds=%d  time=%.3f ms\n",
-                        jp.num_colors, jp.num_rounds, jp.elapsed_ms);
+        //         auto luby = graph_coloring_gpu_->color_luby(vc_dev, vt_dev, soa_.count, stride, seed);
+        //         fprintf(stderr, "  Luby:    colors=%d  rounds=%d  time=%.3f ms\n",
+        //                 luby.num_colors, luby.num_rounds, luby.elapsed_ms);
 
-                auto ldf = graph_coloring_gpu_->color_ldf(vc_dev, vt_dev, soa_.count, stride);
-                fprintf(stderr, "  LDF:     colors=%d  rounds=%d  time=%.3f ms\n",
-                        ldf.num_colors, ldf.num_rounds, ldf.elapsed_ms);
+        //         auto jp = graph_coloring_gpu_->color_jp(vc_dev, vt_dev, soa_.count, stride, seed);
+        //         fprintf(stderr, "  JP:      colors=%d  rounds=%d  time=%.3f ms\n",
+        //                 jp.num_colors, jp.num_rounds, jp.elapsed_ms);
 
-                // Print coloring for first few bodies (JP result as example)
-                const int* jp_colors = graph_coloring_gpu_->colors_cpu();
-                int print_n = soa_.count < 20 ? soa_.count : 20;
-                fprintf(stderr, "  JP colors: [");
-                for (int i = 0; i < print_n; i++) {
-                    if (i > 0) fprintf(stderr, ", ");
-                    fprintf(stderr, "%d", jp_colors[i]);
-                }
-                if (soa_.count > print_n) fprintf(stderr, ", ...");
-                fprintf(stderr, "]\n");
+        //         auto ldf = graph_coloring_gpu_->color_ldf(vc_dev, vt_dev, soa_.count, stride);
+        //         fprintf(stderr, "  LDF:     colors=%d  rounds=%d  time=%.3f ms\n",
+        //                 ldf.num_colors, ldf.num_rounds, ldf.elapsed_ms);
 
-                // Validate: no two neighbors share the same color
-                const int* vc = narrowphase_gpu_->vertex_counts();
-                const VertexEntry* vt = narrowphase_gpu_->vertex_table();
-                int violations = 0;
-                for (int b = 0; b < soa_.count; b++) {
-                    int cnt = vc[b] < stride ? vc[b] : stride;
-                    for (int s = 0; s < cnt; s++) {
-                        int nb = vt[b * stride + s].other_body;
-                        if (nb >= 0 && nb < soa_.count && jp_colors[b] == jp_colors[nb])
-                            violations++;
-                    }
-                }
-                fprintf(stderr, "  JP validation: %d coloring violations\n", violations / 2);
-            }
-            coloring_frame++;
-        }
+        //         // Print coloring for first few bodies (JP result as example)
+        //         const int* jp_colors = graph_coloring_gpu_->colors_cpu();
+        //         int print_n = soa_.count < 20 ? soa_.count : 20;
+        //         fprintf(stderr, "  JP colors: [");
+        //         for (int i = 0; i < print_n; i++) {
+        //             if (i > 0) fprintf(stderr, ", ");
+        //             fprintf(stderr, "%d", jp_colors[i]);
+        //         }
+        //         if (soa_.count > print_n) fprintf(stderr, ", ...");
+        //         fprintf(stderr, "]\n");
+
+        //         // Validate: no two neighbors share the same color
+        //         const int* vc = narrowphase_gpu_->vertex_counts();
+        //         const VertexEntry* vt = narrowphase_gpu_->vertex_table();
+        //         int violations = 0;
+        //         for (int b = 0; b < soa_.count; b++) {
+        //             int cnt = vc[b] < stride ? vc[b] : stride;
+        //             for (int s = 0; s < cnt; s++) {
+        //                 int nb = vt[b * stride + s].other_body;
+        //                 if (nb >= 0 && nb < soa_.count && jp_colors[b] == jp_colors[nb])
+        //                     violations++;
+        //             }
+        //         }
+        //         fprintf(stderr, "  JP validation: %d coloring violations\n", violations / 2);
+        //     }
+        //     coloring_frame++;
+        // }
 
 #ifdef AVBD_VALIDATE_NARROWPHASE
         {
@@ -374,6 +379,11 @@ void Solver::step() {
         }
 #endif
 
+        // Save manifold data for post-solver write-back
+        ws_n_manifolds_ = n_manifolds;
+        ws_total_contacts_ = total_contacts;
+        ws_manifolds_.assign(gpu_manifolds.begin(), gpu_manifolds.begin() + n_manifolds);
+
         for (int k = 0; k < n_manifolds; k++) {
             const GpuManifold& gm = gpu_manifolds[k];
             Rigid* bodyA = soa_.body_ptrs[gm.body_a];
@@ -383,6 +393,7 @@ void Solver::step() {
 
             Manifold* m = new Manifold(this, bodyA, bodyB);
             m->gpu_num_contacts_ = gm.num_contacts;
+            m->ws_manifold_idx_ = k;
             m->gpu_basis_ = float3x3{
                 gm.basis[0], gm.basis[1], gm.basis[2],
                 gm.basis[3], gm.basis[4], gm.basis[5],
@@ -394,10 +405,10 @@ void Solver::step() {
                 mc.feature.key = gc.feature_key;
                 mc.rA = float3{gc.rA_x, gc.rA_y, gc.rA_z};
                 mc.rB = float3{gc.rB_x, gc.rB_y, gc.rB_z};
-                mc.C0 = float3{0, 0, 0};
-                mc.penalty = float3{AVBD_PENALTY_MIN, AVBD_PENALTY_MIN, AVBD_PENALTY_MIN};
-                mc.lambda = float3{0, 0, 0};
-                mc.stick = false;
+                mc.C0 = float3{gc.C0_x, gc.C0_y, gc.C0_z};
+                mc.penalty = float3{gc.penalty_x, gc.penalty_y, gc.penalty_z};
+                mc.lambda = float3{gc.lambda_x, gc.lambda_y, gc.lambda_z};
+                mc.stick = (gc.stick != 0);
             }
         }
     }
@@ -475,6 +486,37 @@ void Solver::step() {
             body->velocityLin = (body->positionLin - body->initialLin) / dt;
             body->velocityAng = (body->positionAng - body->initialAng) / dt;
         }
+    }
+
+    // Write back post-solver contact state to GPU and snapshot for next frame's warm-start.
+    // Walk all Manifold forces and pack their contacts back into the GPU contact array.
+    if (narrowphase_gpu_ && ws_n_manifolds_ > 0) {
+        std::vector<GpuContact> wb_contacts(ws_total_contacts_);
+        // Copy current contact data back from Manifold objects
+        for (Force* force = forces; force != nullptr; force = force->next) {
+            Manifold* m = dynamic_cast<Manifold*>(force);
+            if (!m || m->ws_manifold_idx_ < 0) continue;
+            int midx = m->ws_manifold_idx_;
+            if (midx >= ws_n_manifolds_) continue;
+            const GpuManifold& gm = ws_manifolds_[midx];
+            for (int c = 0; c < m->numContacts && c < gm.num_contacts; c++) {
+                int off = gm.contact_offset + c;
+                if (off >= ws_total_contacts_) continue;
+                GpuContact& gc = wb_contacts[off];
+                const Manifold::Contact& mc = m->contacts[c];
+                gc.feature_key = mc.feature.key;
+                gc.rA_x = mc.rA.x; gc.rA_y = mc.rA.y; gc.rA_z = mc.rA.z;
+                gc.rB_x = mc.rB.x; gc.rB_y = mc.rB.y; gc.rB_z = mc.rB.z;
+                gc.lambda_x = mc.lambda.x; gc.lambda_y = mc.lambda.y; gc.lambda_z = mc.lambda.z;
+                gc.penalty_x = mc.penalty.x; gc.penalty_y = mc.penalty.y; gc.penalty_z = mc.penalty.z;
+                gc.C0_x = mc.C0.x; gc.C0_y = mc.C0.y; gc.C0_z = mc.C0.z;
+                gc.stick = mc.stick ? 1 : 0;
+            }
+        }
+        narrowphase_gpu_->upload_contacts(wb_contacts.data(), ws_total_contacts_);
+        narrowphase_gpu_->snapshot_for_next_frame(ws_n_manifolds_, ws_total_contacts_, soa_.count);
+        ws_n_manifolds_ = 0;
+        ws_total_contacts_ = 0;
     }
 }
 
