@@ -22,6 +22,7 @@ struct Manifold;
 struct Solver;
 class BroadphaseGPU;
 class NarrowphaseGPU;
+class GraphColoringGPU;
 
 struct SoaData {
     int count = 0;
@@ -178,6 +179,7 @@ struct Solver {
     SoaData soa_;
     BroadphaseGPU* broadphase_gpu_ = nullptr;
     NarrowphaseGPU* narrowphase_gpu_ = nullptr;
+    GraphColoringGPU* graph_coloring_gpu_ = nullptr;
     std::vector<int> pairs_a_, pairs_b_;
 
     Solver();

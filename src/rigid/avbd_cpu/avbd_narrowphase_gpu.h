@@ -63,6 +63,10 @@ public:
     const VertexEntry* vertex_table() const { return vtx_table_.cpu_data(); }
     int vertex_table_stride() const { return VERTEX_TABLE_MAX_NEIGHBORS; }
 
+    // GPU device pointers for direct use by graph coloring kernels
+    const int* vtx_counts_dev() const { return vtx_counts_.gpu_data(); }
+    const VertexEntry* vtx_table_dev() const { return vtx_table_.gpu_data(); }
+
 private:
     int max_pairs_  = 0;
     int max_bodies_ = 0;

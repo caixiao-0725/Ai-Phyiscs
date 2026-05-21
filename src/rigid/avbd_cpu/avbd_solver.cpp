@@ -4,6 +4,7 @@
 #include "avbd_solver.h"
 #include "avbd_broadphase_gpu.h"
 #include "avbd_narrowphase_gpu.h"
+#include "avbd_graph_coloring.h"
 
 #include <cmath>
 #include <algorithm>
@@ -55,6 +56,7 @@ Solver::~Solver() {
     clear();
     delete broadphase_gpu_;
     delete narrowphase_gpu_;
+    delete graph_coloring_gpu_;
 }
 
 Rigid* Solver::pick(float3 origin, float3 dir, float3& local) {
@@ -243,6 +245,65 @@ void Solver::step() {
                             overflow, stride);
             }
             vtx_frame++;
+        }
+
+        // GPU graph coloring comparison (runs all four algorithms periodically)
+        {
+            static int coloring_frame = 0;
+            if (n_manifolds > 0 && coloring_frame % 300 == 0) {
+                if (!graph_coloring_gpu_)
+                    graph_coloring_gpu_ = new GraphColoringGPU();
+
+                const int* vc_dev = narrowphase_gpu_->vtx_counts_dev();
+                const VertexEntry* vt_dev = narrowphase_gpu_->vtx_table_dev();
+                int stride = narrowphase_gpu_->vertex_table_stride();
+                unsigned seed = (unsigned)coloring_frame;
+
+                fprintf(stderr, "\n=== GRAPH COLORING [frame %d] bodies=%d manifolds=%d ===\n",
+                        coloring_frame, soa_.count, n_manifolds);
+
+                auto vivace = graph_coloring_gpu_->color_vivace(vc_dev, vt_dev, soa_.count, stride, seed);
+                fprintf(stderr, "  Vivace:  colors=%d  rounds=%d  time=%.3f ms\n",
+                        vivace.num_colors, vivace.num_rounds, vivace.elapsed_ms);
+
+                auto luby = graph_coloring_gpu_->color_luby(vc_dev, vt_dev, soa_.count, stride, seed);
+                fprintf(stderr, "  Luby:    colors=%d  rounds=%d  time=%.3f ms\n",
+                        luby.num_colors, luby.num_rounds, luby.elapsed_ms);
+
+                auto jp = graph_coloring_gpu_->color_jp(vc_dev, vt_dev, soa_.count, stride, seed);
+                fprintf(stderr, "  JP:      colors=%d  rounds=%d  time=%.3f ms\n",
+                        jp.num_colors, jp.num_rounds, jp.elapsed_ms);
+
+                auto ldf = graph_coloring_gpu_->color_ldf(vc_dev, vt_dev, soa_.count, stride);
+                fprintf(stderr, "  LDF:     colors=%d  rounds=%d  time=%.3f ms\n",
+                        ldf.num_colors, ldf.num_rounds, ldf.elapsed_ms);
+
+                // Print coloring for first few bodies (JP result as example)
+                const int* jp_colors = graph_coloring_gpu_->colors_cpu();
+                int print_n = soa_.count < 20 ? soa_.count : 20;
+                fprintf(stderr, "  JP colors: [");
+                for (int i = 0; i < print_n; i++) {
+                    if (i > 0) fprintf(stderr, ", ");
+                    fprintf(stderr, "%d", jp_colors[i]);
+                }
+                if (soa_.count > print_n) fprintf(stderr, ", ...");
+                fprintf(stderr, "]\n");
+
+                // Validate: no two neighbors share the same color
+                const int* vc = narrowphase_gpu_->vertex_counts();
+                const VertexEntry* vt = narrowphase_gpu_->vertex_table();
+                int violations = 0;
+                for (int b = 0; b < soa_.count; b++) {
+                    int cnt = vc[b] < stride ? vc[b] : stride;
+                    for (int s = 0; s < cnt; s++) {
+                        int nb = vt[b * stride + s].other_body;
+                        if (nb >= 0 && nb < soa_.count && jp_colors[b] == jp_colors[nb])
+                            violations++;
+                    }
+                }
+                fprintf(stderr, "  JP validation: %d coloring violations\n", violations / 2);
+            }
+            coloring_frame++;
         }
 
 #ifdef AVBD_VALIDATE_NARROWPHASE

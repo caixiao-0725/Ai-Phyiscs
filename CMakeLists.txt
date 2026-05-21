@@ -53,6 +53,7 @@ add_library(chysx_core STATIC
     src/rigid/avbd_cpu/avbd_collide.cpp
     src/rigid/avbd_cpu/avbd_broadphase_gpu.cu
     src/rigid/avbd_cpu/avbd_narrowphase_gpu.cu
+    src/rigid/avbd_cpu/avbd_graph_coloring.cu
 
     src/cloth/cloth_simulator.cu
 )
