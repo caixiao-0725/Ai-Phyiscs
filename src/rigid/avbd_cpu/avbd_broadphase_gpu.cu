@@ -132,9 +132,9 @@ int BroadphaseGPU::query(
     check(cudaGetLastError(), "compute_body_aabbs");
 
     bvh_.build(n_bodies, max_pairs_);
-    bvh_.refit(aabbs_.gpu_data(), centers_.gpu_data());
+    bvh_.refit_full(aabbs_.gpu_data(), centers_.gpu_data());
 
-    bvh_.query_self_aabb(aabbs_.gpu_data(), mass_.gpu_data());
+    bvh_.query_self_aabb_full(aabbs_.gpu_data(), mass_.gpu_data());
 
     int count_host = 0;
     check(cudaMemcpy(&count_host, bvh_.query_count_dev(),
@@ -190,16 +190,16 @@ int BroadphaseGPU::query_gpu(
     check(cudaGetLastError(), "compute_body_aabbs");
 
     bvh_.build(n_bodies, max_pairs_);
-    bvh_.refit(aabbs_.gpu_data(), centers_.gpu_data());
+    bvh_.refit_full(aabbs_.gpu_data(), centers_.gpu_data());
 
-    bvh_.query_self_aabb(aabbs_.gpu_data(), mass_dev);
+    bvh_.query_self_aabb_full(aabbs_.gpu_data(), mass_dev);
 
     int count_host = 0;
     check(cudaMemcpy(&count_host, bvh_.query_count_dev(),
                      sizeof(int), cudaMemcpyDeviceToHost),
           "pair_count D2H");
     int count = std::min(count_host, max_pairs_);
-    printf("BroadphaseGPU: found %d  %d pairs\n", count_host, count);
+
     if (count > 0) {
         if (count > (int)pair_a_split_.gpu_size()) {
             pair_a_split_.resize(count);

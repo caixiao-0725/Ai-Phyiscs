@@ -82,6 +82,18 @@ struct alignas(16) PackedFace {
 };
 static_assert(sizeof(PackedFace) == 16, "PackedFace must be 16 bytes (int4 layout)");
 
+// 32-byte full-float stackless BVH node.  Same DFS layout as the
+// quantized `Ull2` tree but stores full `float` AABB bounds.
+// Node overlap tests use 6 float comparisons instead of 14-bit
+// integer bitfield tests --- no quantization loss.
+struct alignas(16) FullBvhNode {
+    int lc;          // left-child index, or -1 for leaf
+    int escape;      // escape index, or -1 to stop
+    float mn_x, mn_y, mn_z;
+    float mx_x, mx_y, mx_z;
+};
+static_assert(sizeof(FullBvhNode) == 32, "FullBvhNode must be 32 bytes");
+
 class QuantBvh {
 public:
     // ---- packing constants (also referenced inside the kernels) ------
@@ -160,6 +172,24 @@ public:
                          const float*      mass,
                          std::uintptr_t    cuda_stream = 0);
 
+    // ---- Full-float (32-byte node) stackless BVH -----------------------
+    // Same tree topology as the quantized path but uses full float
+    // AABB bounds.  No quantization loss, 2x memory per node.
+
+    void refit_full(const Aabb*        leaf_aabbs,
+                    const math::Vec3f* leaf_centers,
+                    std::uintptr_t     cuda_stream = 0);
+
+    void query_self_aabb_full(const Aabb*       leaf_aabbs,
+                              const float*      mass,
+                              std::uintptr_t    cuda_stream = 0);
+
+    // Diagnostic profiling for query_self_aabb performance analysis.
+    // Prints per-thread traversal statistics to stderr.
+    void profile_query_self_aabb(const Aabb*       leaf_aabbs,
+                                  const float*      mass,
+                                  std::uintptr_t    cuda_stream = 0);
+
     // ---- accessors (same shape as LinearBvh) -------------------------
 
     int n_leaves() const noexcept { return n_leaves_; }
@@ -227,6 +257,9 @@ private:
     // [0, N-1), leaves at [N-1, 2N-1).  This is the only buffer the
     // query kernel touches.
     CudaArray<Ull2>          nodes_;
+
+    // Full-float (32-byte) stackless tree, same length as nodes_.
+    CudaArray<FullBvhNode>   full_nodes_;
 
     // Query result.
     CudaArray<int>           query_count_;
