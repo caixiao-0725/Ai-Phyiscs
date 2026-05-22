@@ -83,6 +83,12 @@ public:
     float* friction_dev() { return friction_.gpu_data(); }
     int body_count() const { return n_bodies_; }
 
+    /// Set up the ground body at slot n_bodies (the virtual n+1th body).
+    /// Must be called after upload_bodies or after solve() leaves state valid.
+    /// Ensures capacity includes the extra slot, writes mass=0, pos=(0,0,ground_z),
+    /// identity quat, and zero velocity/moment into that slot.
+    void setup_ground_body(float ground_z, float ground_friction);
+
 private:
     void ensure_capacity(int n_bodies);
 

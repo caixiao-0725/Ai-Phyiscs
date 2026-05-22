@@ -459,6 +459,110 @@ __global__ void sat_narrowphase_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Ground plane narrowphase: one thread per dynamic body, tests 8 box vertices
+// against the ground plane (z = ground_z, normal = +Z).
+// Ground body index = ground_body_idx (typically n_bodies).
+// Appends manifolds/contacts after existing body-body results.
+// ---------------------------------------------------------------------------
+
+__device__ const float kCornerSign[8][3] = {
+    {-1,-1,-1},{+1,-1,-1},{+1,+1,-1},{-1,+1,-1},
+    {-1,-1,+1},{+1,-1,+1},{+1,+1,+1},{-1,+1,+1}
+};
+
+__global__ void ground_plane_narrowphase_kernel(
+    const float* __restrict__ px, const float* __restrict__ py, const float* __restrict__ pz,
+    const float* __restrict__ qx, const float* __restrict__ qy, const float* __restrict__ qz,
+    const float* __restrict__ qw,
+    const float* __restrict__ hx, const float* __restrict__ hy, const float* __restrict__ hz,
+    const float* __restrict__ fric,
+    const float* __restrict__ mass,
+    int n_bodies,
+    float ground_z, float ground_friction,
+    int ground_body_idx,
+    GpuManifold* __restrict__ manifolds,
+    GpuContact*  __restrict__ contacts,
+    int* __restrict__ manifold_count,
+    int* __restrict__ contact_count,
+    int max_contacts,
+    int* __restrict__ vtx_counts,
+    VertexEntry* __restrict__ vtx_table,
+    int vtx_stride)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_bodies) return;
+    if (mass[i] <= 0.0f) return;
+
+    F3 cen = {px[i], py[i], pz[i]};
+    Q4 quat = {qx[i], qy[i], qz[i], qw[i]};
+    F3 half = {hx[i], hy[i], hz[i]};
+
+    GpuContact localC[MAX_CONTACTS];
+    int nc = 0;
+
+    F3 groundNormal = f3(0, 0, 1);
+    F3 groundPoint  = f3(0, 0, ground_z);
+    Q4 invQ = qconj(quat);
+
+    constexpr float kGroundMargin = 0.02f;
+
+    for (int c = 0; c < 8 && nc < MAX_CONTACTS; c++) {
+        F3 local = f3(kCornerSign[c][0] * half.x,
+                      kCornerSign[c][1] * half.y,
+                      kCornerSign[c][2] * half.z);
+        F3 world = cen + qrot(quat, local);
+        float dist = world.z - ground_z;
+        if (dist > kGroundMargin) continue;
+
+        F3 contactOnBody = world;
+        F3 contactOnGround = f3(world.x, world.y, ground_z);
+
+        F3 rA = qrot(invQ, contactOnBody - cen);
+        F3 rB = contactOnGround - groundPoint;
+
+        GpuContact& ct = localC[nc];
+        ct.feature_key = (3 << 24) | c;
+        ct.rA_x = rA.x; ct.rA_y = rA.y; ct.rA_z = rA.z;
+        ct.rB_x = rB.x; ct.rB_y = rB.y; ct.rB_z = rB.z;
+        ct.lambda_x = 0; ct.lambda_y = 0; ct.lambda_z = 0;
+        ct.penalty_x = 1; ct.penalty_y = 1; ct.penalty_z = 1;
+        ct.C0_x = 0; ct.C0_y = 0; ct.C0_z = 0;
+        ct.stick = 0;
+        nc++;
+    }
+
+    if (nc <= 0) return;
+
+    int coff = atomicAdd(contact_count, nc);
+    if (coff + nc > max_contacts) return;
+
+    int midx = atomicAdd(manifold_count, 1);
+
+    for (int j = 0; j < nc; j++)
+        contacts[coff + j] = localC[j];
+
+    GpuManifold& m = manifolds[midx];
+    m.body_a = i;
+    m.body_b = ground_body_idx;
+    m.num_contacts = nc;
+    m.contact_offset = coff;
+    m.friction = sqrtf(fric[i] * ground_friction);
+
+    orthonormalBasis(f3(0, 0, 1), m.basis);
+
+    int slotA = atomicAdd(&vtx_counts[i], 1);
+    if (slotA < vtx_stride) {
+        vtx_table[i * vtx_stride + slotA].other_body = ground_body_idx;
+        vtx_table[i * vtx_stride + slotA].manifold_idx = midx;
+    }
+    int slotB = atomicAdd(&vtx_counts[ground_body_idx], 1);
+    if (slotB < vtx_stride) {
+        vtx_table[ground_body_idx * vtx_stride + slotB].other_body = i;
+        vtx_table[ground_body_idx * vtx_stride + slotB].manifold_idx = midx;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Warm-start kernel: match current contacts against previous frame
 // ---------------------------------------------------------------------------
 
@@ -671,10 +775,12 @@ void NarrowphaseGPU::query_gpu(
 {
     n_manifolds_out = 0;
     n_contacts_out = 0;
-    if (n_pairs <= 0) return;
 
     if (n_pairs > max_pairs_)
         build(n_pairs * 2);
+
+    if (max_pairs_ == 0)
+        build(256);
 
     if (n_bodies > max_bodies_) {
         max_bodies_ = n_bodies;
@@ -687,6 +793,8 @@ void NarrowphaseGPU::query_gpu(
     check(cudaMemset(manifold_count_.gpu_data(), 0, sizeof(int)), "zero manifold_count");
     check(cudaMemset(contact_count_.gpu_data(), 0, sizeof(int)), "zero contact_count");
     check(cudaMemset(vtx_counts_.gpu_data(), 0, n_bodies * sizeof(int)), "zero vtx_counts");
+
+    if (n_pairs <= 0) return;
 
     sat_narrowphase_kernel<<<grid(n_pairs), kBlock>>>(
         pos_x_dev, pos_y_dev, pos_z_dev,
@@ -713,6 +821,58 @@ void NarrowphaseGPU::query_gpu(
 
     n_manifolds_out = min(n_manifolds, max_pairs_);
     n_contacts_out = min(n_contacts, max_contacts);
+}
+
+void NarrowphaseGPU::append_ground_plane_gpu(
+    const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+    const float* quat_x_dev, const float* quat_y_dev,
+    const float* quat_z_dev, const float* quat_w_dev,
+    const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+    const float* friction_dev, const float* mass_dev,
+    int n_bodies, float ground_z, float ground_friction,
+    int ground_body_idx,
+    int& n_manifolds_inout, int& n_contacts_inout)
+{
+    if (n_bodies <= 0) return;
+
+    int n_bodies_with_ground = ground_body_idx + 1;
+    if (n_bodies_with_ground > max_bodies_) {
+        max_bodies_ = n_bodies_with_ground;
+        vtx_counts_.resize(max_bodies_);
+        vtx_table_.resize(max_bodies_ * VERTEX_TABLE_MAX_NEIGHBORS);
+    }
+    // Zero only the ground body's vtx_count slot (body slots 0..n_bodies-1 already zeroed)
+    check(cudaMemset(vtx_counts_.gpu_data() + ground_body_idx, 0, sizeof(int)),
+          "zero ground vtx_count");
+
+    int max_contacts = max_pairs_ * MAX_CONTACTS;
+
+    ground_plane_narrowphase_kernel<<<grid(n_bodies), kBlock>>>(
+        pos_x_dev, pos_y_dev, pos_z_dev,
+        quat_x_dev, quat_y_dev, quat_z_dev, quat_w_dev,
+        half_x_dev, half_y_dev, half_z_dev,
+        friction_dev, mass_dev,
+        n_bodies,
+        ground_z, ground_friction,
+        ground_body_idx,
+        manifolds_.gpu_data(),
+        contacts_.gpu_data(),
+        manifold_count_.gpu_data(),
+        contact_count_.gpu_data(),
+        max_contacts,
+        vtx_counts_.gpu_data(),
+        vtx_table_.gpu_data(),
+        VERTEX_TABLE_MAX_NEIGHBORS);
+    check(cudaGetLastError(), "ground_plane_narrowphase_kernel launch");
+
+    int n_manifolds = 0, n_contacts = 0;
+    check(cudaMemcpy(&n_manifolds, manifold_count_.gpu_data(), sizeof(int),
+                     cudaMemcpyDeviceToHost), "manifold_count D2H (ground)");
+    check(cudaMemcpy(&n_contacts, contact_count_.gpu_data(), sizeof(int),
+                     cudaMemcpyDeviceToHost), "contact_count D2H (ground)");
+
+    n_manifolds_inout = min(n_manifolds, max_pairs_);
+    n_contacts_inout = min(n_contacts, max_contacts);
 }
 
 void NarrowphaseGPU::warmstart_gpu(int n_manifolds, int n_contacts, int n_bodies)

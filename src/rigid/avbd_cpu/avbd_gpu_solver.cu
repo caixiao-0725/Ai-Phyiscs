@@ -601,6 +601,34 @@ void GpuSolver::upload_bodies_hybrid(
     #undef UPLOAD_ARRAY
 }
 
+void GpuSolver::setup_ground_body(float ground_z, float ground_friction) {
+    int idx = n_bodies_;
+    ensure_capacity(idx + 1);
+
+    auto setOne = [&](CudaArray<float>& arr, float val) {
+        float v = val;
+        check(cudaMemcpy(arr.gpu_data() + idx, &v, sizeof(float),
+                         cudaMemcpyHostToDevice), "ground body slot");
+    };
+
+    setOne(pos_x_, 0.0f);  setOne(pos_y_, 0.0f);  setOne(pos_z_, ground_z);
+    setOne(quat_x_, 0.0f); setOne(quat_y_, 0.0f);
+    setOne(quat_z_, 0.0f); setOne(quat_w_, 1.0f);
+    setOne(vel_x_, 0.0f);  setOne(vel_y_, 0.0f);  setOne(vel_z_, 0.0f);
+    setOne(velang_x_, 0.0f); setOne(velang_y_, 0.0f); setOne(velang_z_, 0.0f);
+    setOne(prevvel_x_, 0.0f); setOne(prevvel_y_, 0.0f); setOne(prevvel_z_, 0.0f);
+    setOne(mass_, 0.0f);
+    setOne(moment_x_, 1.0f); setOne(moment_y_, 1.0f); setOne(moment_z_, 1.0f);
+    setOne(half_x_, 1000.0f); setOne(half_y_, 1000.0f); setOne(half_z_, 0.0f);
+    setOne(friction_, ground_friction);
+    setOne(initial_x_, 0.0f);  setOne(initial_y_, 0.0f);  setOne(initial_z_, ground_z);
+    setOne(initial_qx_, 0.0f); setOne(initial_qy_, 0.0f);
+    setOne(initial_qz_, 0.0f); setOne(initial_qw_, 1.0f);
+    setOne(inertial_x_, 0.0f);  setOne(inertial_y_, 0.0f);  setOne(inertial_z_, ground_z);
+    setOne(inertial_qx_, 0.0f); setOne(inertial_qy_, 0.0f);
+    setOne(inertial_qz_, 0.0f); setOne(inertial_qw_, 1.0f);
+}
+
 void GpuSolver::solve(
     GpuManifold* manifolds_dev, GpuContact* contacts_dev,
     int n_manifolds,
@@ -665,6 +693,7 @@ void GpuSolver::solve(
                 initial_qx_.gpu_data(), initial_qy_.gpu_data(), initial_qz_.gpu_data(), initial_qw_.gpu_data(),
                 alpha, beta_lin);
         }
+
     }
     check(cudaGetLastError(), "solver iterations");
 

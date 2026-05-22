@@ -78,6 +78,11 @@ inline float3 applyProjectiveMatrix(const float m[16], float3 p) {
 }
 
 inline bool findShadowPlane(const Solver* solver, float3& planePoint, float3& planeNormal) {
+    if (solver->has_ground_plane) {
+        planePoint  = {0, 0, solver->ground_z};
+        planeNormal = {0, 0, 1};
+        return true;
+    }
     const float3 up{0, 0, 1};
     float bestScore = 0.0f;
     bool found = false;
@@ -141,6 +146,20 @@ public:
 
     void draw_meshes(std::vector<DrawMesh>& /*out*/) override {}
 
+    void drawGroundPlane() {
+        if (!solver_->has_ground_plane) return;
+        float z = solver_->ground_z;
+        float ext = 200.0f;
+        glColor4f(0.85f, 0.87f, 0.90f, 1.0f);
+        glBegin(GL_QUADS);
+        glNormal3f(0, 0, 1);
+        glVertex3f(-ext, -ext, z);
+        glVertex3f( ext, -ext, z);
+        glVertex3f( ext,  ext, z);
+        glVertex3f(-ext,  ext, z);
+        glEnd();
+    }
+
     void draw_custom() override {
         // GPU path: all bodies rendered via VBO from CUDA-GL interop
         if (gpu_renderer_ && solver_->gpu_state_valid_ && gpu_renderer_->n_bodies() > 0) {
@@ -169,6 +188,7 @@ public:
             glLightfv(GL_LIGHT0, GL_DIFFUSE, light_dif);
 
             renderer->draw_triangles();
+            drawGroundPlane();
             glDisable(GL_LIGHTING);
             glDisable(GL_POLYGON_OFFSET_FILL);
 
@@ -198,6 +218,8 @@ public:
             glShadeModel(GL_FLAT);
             glEnable(GL_DEPTH_TEST);
             glDisable(GL_CULL_FACE);
+
+            drawGroundPlane();
 
             for (const Rigid* body = solver_->bodies; body; body = body->next)
                 if (body->mass <= 0.0f)
@@ -543,28 +565,29 @@ private:
 // ---- Scene setup functions ----
 
 void setupPyramid(Solver* s) {
-    const int SIZE = 200;
+    const int SIZE = 50;
     s->clear();
-    new Rigid(s, {120, 120, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+    s->set_ground_plane(0.0f, 0.5f);
+    float rho = 0.01f;
     for (int y = 0; y < SIZE; y++)
         for (int x = 0; x < SIZE - y; x++) {
-            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 0.0f, y * 0.5f + 0.01f });
-            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 2.0f, y * 0.5f + 0.01f });
-            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, -2.0f, y * 0.5f + 0.01f });
-            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, -4.0f, y * 0.5f + 0.01f });
-            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 4.0f, y * 0.5f + 0.01f });
+            new Rigid(s, { 1, 0.5f, 0.5f }, 0.01f + 0.001*(SIZE-y), 0.5f,
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 0.0f, y * 0.499f + 0.00f });
+            //new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
+            //    { x * 1.01f + y * 0.5f - SIZE / 2.0f, 2.0f, y * 0.5f + 0.01f });
+            //new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
+            //    { x * 1.01f + y * 0.5f - SIZE / 2.0f, -2.0f, y * 0.5f + 0.01f });
+            //new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
+            //    { x * 1.01f + y * 0.5f - SIZE / 2.0f, -4.0f, y * 0.5f + 0.01f });
+            //new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
+            //    { x * 1.01f + y * 0.5f - SIZE / 2.0f, 4.0f, y * 0.5f + 0.01f });
         }
 
 }
 
 void setupRope(Solver* s) {
     s->clear();
-    new Rigid(s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -20});
+    s->set_ground_plane(-19.5f, 0.5f);
     Rigid* prev = nullptr;
     for (int i = 0; i < 20; i++) {
         Rigid* curr = new Rigid(s, {1, 0.5f, 0.5f}, i == 0 ? 0.0f : 1.0f, 0.5f,
@@ -578,7 +601,7 @@ void setupHeavyRope(Solver* s) {
     const int N = 20;
     const float SZ = 5.0f;
     s->clear();
-    new Rigid(s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -20});
+    s->set_ground_plane(-19.5f, 0.5f);
     Rigid* prev = nullptr;
     for (int i = 0; i < N; i++) {
         float3 sz = i == N-1 ? float3{SZ, SZ, SZ} : float3{1, 0.5f, 0.5f};
@@ -593,14 +616,14 @@ void setupHeavyRope(Solver* s) {
 
 void setupStack(Solver* s) {
     s->clear();
-    new Rigid(s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    s->set_ground_plane(0.5f, 0.5f);
     for (int i = 0; i < 110; i++)
         new Rigid(s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, i * 1.0f + 1.0f});
 }
 
 void setupSoftBody(Solver* s) {
     s->clear();
-    new Rigid(s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    s->set_ground_plane(0.5f, 0.5f);
 
     const float Klin = 1000.0f;
     const float Kang = 250.0f;
@@ -661,7 +684,7 @@ void setupBridge(Solver* s) {
     const float halfL = plankLen * 0.5f, halfW = plankW * 0.5f;
 
     s->clear();
-    new Rigid(s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    s->set_ground_plane(0.5f, 0.5f);
 
     Rigid* prev = nullptr;
     for (int i = 0; i < N; i++) {
@@ -686,7 +709,7 @@ void setupBreakable(Solver* s) {
     const float breakForce = 90.0f;
 
     s->clear();
-    new Rigid(s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    s->set_ground_plane(0.5f, 0.5f);
 
     Rigid* prev = nullptr;
     for (int i = 0; i <= N; i++) {
@@ -706,7 +729,7 @@ void setupBreakable(Solver* s) {
 
 void setupSpring(Solver* s) {
     s->clear();
-    new Rigid(s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, 0});
+    s->set_ground_plane(0.5f, 0.5f);
     Rigid* anchor = new Rigid(s, {1, 1, 1}, 0.0f, 0.5f, {0, 0, 14.0f});
     Rigid* block  = new Rigid(s, {2, 2, 2}, 1.0f, 0.5f, {0, 0, 8.0f});
     new Spring(s, anchor, block, {0,0,0}, {0,0,0}, 100.0f, 4.0f);

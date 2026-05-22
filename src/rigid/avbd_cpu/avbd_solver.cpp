@@ -142,16 +142,17 @@ Rigid* Solver::pick(float3 origin, float3 dir, float3& local) {
 void Solver::clear() {
     while (forces) delete forces;
     while (bodies) delete bodies;
+    has_ground_plane = false;
 }
 
 void Solver::defaultParams() {
     dt = 1.0f / 60.0f;
     gravity = -10.0f;
-    iterations = 10;
+    iterations = 4;
     betaLin = 10000.0f;
     betaAng = 100.0f;
     alpha = 0.95f;
-    gamma = 0.999f;
+    gamma = 0.99f;
 }
 
 void Solver::step() {
@@ -220,6 +221,14 @@ void Solver::step() {
     }
 #endif
 
+    // Set up ground body at index body_count (virtual n+1th body)
+    int ground_body_idx = body_count;
+    int n_bodies_for_solver = body_count;
+    if (has_ground_plane) {
+        gpu_solver_->setup_ground_body(ground_z, ground_friction);
+        n_bodies_for_solver = body_count + 1;
+    }
+
     // GPU broadphase: read directly from GpuSolver GPU arrays (zero H2D)
     int pair_count = broadphase_gpu_->query_gpu(
         gpu_solver_->pos_x_dev(), gpu_solver_->pos_y_dev(), gpu_solver_->pos_z_dev(),
@@ -230,145 +239,170 @@ void Solver::step() {
         body_count);
 
     // GPU narrowphase: run SAT on GPU for all broadphase pairs
-    if (pair_count > 0) {
+    {
         int n_manifolds = 0, total_contacts = 0;
 
-        narrowphase_gpu_->query_gpu(
-            gpu_solver_->pos_x_dev(), gpu_solver_->pos_y_dev(), gpu_solver_->pos_z_dev(),
-            gpu_solver_->quat_x_dev(), gpu_solver_->quat_y_dev(),
-            gpu_solver_->quat_z_dev(), gpu_solver_->quat_w_dev(),
-            gpu_solver_->half_x_dev(), gpu_solver_->half_y_dev(), gpu_solver_->half_z_dev(),
-            gpu_solver_->friction_dev(),
-            broadphase_gpu_->pair_a_dev(), broadphase_gpu_->pair_b_dev(),
-            pair_count, body_count,
-            n_manifolds, total_contacts);
-
-        // GPU warm-start (no D2H)
-        narrowphase_gpu_->warmstart_gpu(n_manifolds, total_contacts, body_count);
-
-        // Graph coloring for Gauss-Seidel parallelization
-        const int* vtx_counts_dev = narrowphase_gpu_->vtx_counts_dev();
-        const VertexEntry* vtx_table_dev = narrowphase_gpu_->vtx_table_dev();
-        int vtx_stride = narrowphase_gpu_->vertex_table_stride();
-
-        auto coloring = graph_coloring_gpu_->color_jp(
-            vtx_counts_dev, vtx_table_dev, body_count, vtx_stride);
-        int num_colors = coloring.num_colors;
-        const int* colors_dev = graph_coloring_gpu_->colors_gpu();
-
-        // GPU solver: init bodies, colored GS iterations, velocity update
-        gpu_solver_->solve(
-            narrowphase_gpu_->manifolds_dev(),
-            narrowphase_gpu_->contacts_dev(),
-            n_manifolds,
-            vtx_counts_dev, vtx_table_dev, vtx_stride,
-            colors_dev, num_colors,
-            iterations, dt, gravity,
-            alpha, betaLin, gamma);
-
-        gpu_state_valid_ = true;
-
-        // Only download to CPU when joints/springs need it
-        if (has_joint_spring) {
-            if (!need_full_upload) soa_.pack(bodies);
-            gpu_solver_->download_positions(
-                soa_.pos_x.data(), soa_.pos_y.data(), soa_.pos_z.data(),
-                soa_.quat_x.data(), soa_.quat_y.data(), soa_.quat_z.data(), soa_.quat_w.data(),
-                soa_.vel_x.data(), soa_.vel_y.data(), soa_.vel_z.data(),
-                soa_.velang_x.data(), soa_.velang_y.data(), soa_.velang_z.data(),
-                body_count);
-            soa_.unpack(bodies);
+        if (pair_count > 0) {
+            narrowphase_gpu_->query_gpu(
+                gpu_solver_->pos_x_dev(), gpu_solver_->pos_y_dev(), gpu_solver_->pos_z_dev(),
+                gpu_solver_->quat_x_dev(), gpu_solver_->quat_y_dev(),
+                gpu_solver_->quat_z_dev(), gpu_solver_->quat_w_dev(),
+                gpu_solver_->half_x_dev(), gpu_solver_->half_y_dev(), gpu_solver_->half_z_dev(),
+                gpu_solver_->friction_dev(),
+                broadphase_gpu_->pair_a_dev(), broadphase_gpu_->pair_b_dev(),
+                pair_count, n_bodies_for_solver,
+                n_manifolds, total_contacts);
+        } else {
+            narrowphase_gpu_->query_gpu(
+                gpu_solver_->pos_x_dev(), gpu_solver_->pos_y_dev(), gpu_solver_->pos_z_dev(),
+                gpu_solver_->quat_x_dev(), gpu_solver_->quat_y_dev(),
+                gpu_solver_->quat_z_dev(), gpu_solver_->quat_w_dev(),
+                gpu_solver_->half_x_dev(), gpu_solver_->half_y_dev(), gpu_solver_->half_z_dev(),
+                gpu_solver_->friction_dev(),
+                nullptr, nullptr,
+                0, n_bodies_for_solver,
+                n_manifolds, total_contacts);
         }
 
-        // Snapshot contacts D2D for next frame's warm-start
-        narrowphase_gpu_->snapshot_for_next_frame(n_manifolds, total_contacts, body_count);
-    } else {
-        if (has_joint_spring) {
-            // No collisions + joints/springs: CPU-only path
-            // (joints need inertial/initial state which only exists on CPU)
-            if (!need_full_upload) soa_.pack(bodies);
+        // Append ground-plane contacts (box-plane narrowphase)
+        if (has_ground_plane) {
+            narrowphase_gpu_->append_ground_plane_gpu(
+                gpu_solver_->pos_x_dev(), gpu_solver_->pos_y_dev(), gpu_solver_->pos_z_dev(),
+                gpu_solver_->quat_x_dev(), gpu_solver_->quat_y_dev(),
+                gpu_solver_->quat_z_dev(), gpu_solver_->quat_w_dev(),
+                gpu_solver_->half_x_dev(), gpu_solver_->half_y_dev(), gpu_solver_->half_z_dev(),
+                gpu_solver_->friction_dev(), gpu_solver_->mass_dev(),
+                body_count, ground_z, ground_friction,
+                ground_body_idx,
+                n_manifolds, total_contacts);
+        }
 
-            for (Rigid* body = bodies; body != nullptr; body = body->next) {
-                body->inertialLin = body->positionLin + body->velocityLin * dt;
-                if (body->mass > 0)
-                    body->inertialLin += float3{0, 0, gravity} * (dt * dt);
-                body->inertialAng = body->positionAng + body->velocityAng * dt;
+        if (n_manifolds > 0) {
+            // GPU warm-start (no D2H)
+            narrowphase_gpu_->warmstart_gpu(n_manifolds, total_contacts, n_bodies_for_solver);
 
-                float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
-                float accelExt = accel.z * sign(gravity);
-                float accelWeight = clamp(accelExt / std::fabs(gravity), 0.0f, 1.0f);
-                if (!std::isfinite(accelWeight))
-                    accelWeight = 0.0f;
+            // Graph coloring for Gauss-Seidel parallelization
+            const int* vtx_counts_dev = narrowphase_gpu_->vtx_counts_dev();
+            const VertexEntry* vtx_table_dev = narrowphase_gpu_->vtx_table_dev();
+            int vtx_stride = narrowphase_gpu_->vertex_table_stride();
 
-                body->initialLin = body->positionLin;
-                body->initialAng = body->positionAng;
-                if (body->mass > 0) {
-                    body->positionLin = body->positionLin + body->velocityLin * dt +
-                                        float3{0, 0, gravity} * (accelWeight * dt * dt);
-                    body->positionAng = body->positionAng + body->velocityAng * dt;
-                }
-            }
+            auto coloring = graph_coloring_gpu_->color_jp(
+                vtx_counts_dev, vtx_table_dev, n_bodies_for_solver, vtx_stride);
+            int num_colors = coloring.num_colors;
+            const int* colors_dev = graph_coloring_gpu_->colors_gpu();
 
-            for (Force* force = forces; force != nullptr;) {
-                if (!force->initialize()) {
-                    Force* next = force->next;
-                    delete force;
-                    force = next;
-                } else {
-                    force = force->next;
-                }
-            }
-            for (int it = 0; it < iterations; it++) {
-                for (Rigid* body = bodies; body != nullptr; body = body->next) {
-                    if (body->mass <= 0) continue;
-                    float3x3 MLin = diagonal(body->mass, body->mass, body->mass);
-                    float3x3 MAng = diagonal(body->moment.x, body->moment.y, body->moment.z);
-                    float3x3 lhsLin = MLin / (dt * dt);
-                    float3x3 lhsAng = MAng / (dt * dt);
-                    float3x3 lhsCross = float3x3{0, 0, 0, 0, 0, 0, 0, 0, 0};
-                    float3 rhsLin = MLin / (dt * dt) * (body->positionLin - body->inertialLin);
-                    float3 rhsAng = MAng / (dt * dt) * (body->positionAng - body->inertialAng);
-                    for (Force* force = body->forces; force != nullptr;
-                         force = (force->bodyA == body) ? force->nextA : force->nextB)
-                        force->updatePrimal(body, alpha, lhsLin, lhsAng, lhsCross, rhsLin, rhsAng);
-                    float3 dxLin, dxAng;
-                    solve(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, dxLin, dxAng);
-                    body->positionLin = body->positionLin + dxLin;
-                    body->positionAng = body->positionAng + dxAng;
-                }
-                for (Force* force = forces; force != nullptr; force = force->next)
-                    force->updateDual(alpha);
-            }
-            for (Rigid* body = bodies; body != nullptr; body = body->next) {
-                body->prevVelocityLin = body->velocityLin;
-                if (body->mass > 0) {
-                    body->velocityLin = (body->positionLin - body->initialLin) / dt;
-                    body->velocityAng = (body->positionAng - body->initialAng) / dt;
-                }
-            }
-
-            // Re-upload the joint-mutated state to GPU for next frame
-            soa_.pack(bodies);
-            gpu_solver_->upload_bodies(
-                soa_.pos_x.data(), soa_.pos_y.data(), soa_.pos_z.data(),
-                soa_.quat_x.data(), soa_.quat_y.data(), soa_.quat_z.data(), soa_.quat_w.data(),
-                soa_.vel_x.data(), soa_.vel_y.data(), soa_.vel_z.data(),
-                soa_.velang_x.data(), soa_.velang_y.data(), soa_.velang_z.data(),
-                soa_.prevvel_x.data(), soa_.prevvel_y.data(), soa_.prevvel_z.data(),
-                soa_.mass.data(), soa_.moment_x.data(), soa_.moment_y.data(), soa_.moment_z.data(),
-                soa_.half_x.data(), soa_.half_y.data(), soa_.half_z.data(),
-                soa_.friction.data(),
-                soa_.count);
-            gpu_state_valid_ = true;
-        } else {
-            // No collisions, no joints: GPU init + velocity update
+            // GPU solver: init bodies, colored GS iterations, velocity update
             gpu_solver_->solve(
-                nullptr, nullptr, 0,
-                nullptr, nullptr, 0,
-                nullptr, 0,
+                narrowphase_gpu_->manifolds_dev(),
+                narrowphase_gpu_->contacts_dev(),
+                n_manifolds,
+                vtx_counts_dev, vtx_table_dev, vtx_stride,
+                colors_dev, num_colors,
                 iterations, dt, gravity,
                 alpha, betaLin, gamma);
+
             gpu_state_valid_ = true;
+
+            // Only download to CPU when joints/springs need it
+            if (has_joint_spring) {
+                if (!need_full_upload) soa_.pack(bodies);
+                gpu_solver_->download_positions(
+                    soa_.pos_x.data(), soa_.pos_y.data(), soa_.pos_z.data(),
+                    soa_.quat_x.data(), soa_.quat_y.data(), soa_.quat_z.data(), soa_.quat_w.data(),
+                    soa_.vel_x.data(), soa_.vel_y.data(), soa_.vel_z.data(),
+                    soa_.velang_x.data(), soa_.velang_y.data(), soa_.velang_z.data(),
+                    body_count);
+                soa_.unpack(bodies);
+            }
+
+            // Snapshot contacts D2D for next frame's warm-start
+            narrowphase_gpu_->snapshot_for_next_frame(n_manifolds, total_contacts, n_bodies_for_solver);
+        } else {
+            if (has_joint_spring) {
+                // No collisions + joints/springs: CPU-only path
+                if (!need_full_upload) soa_.pack(bodies);
+
+                for (Rigid* body = bodies; body != nullptr; body = body->next) {
+                    body->inertialLin = body->positionLin + body->velocityLin * dt;
+                    if (body->mass > 0)
+                        body->inertialLin += float3{0, 0, gravity} * (dt * dt);
+                    body->inertialAng = body->positionAng + body->velocityAng * dt;
+
+                    float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
+                    float accelExt = accel.z * sign(gravity);
+                    float accelWeight = clamp(accelExt / std::fabs(gravity), 0.0f, 1.0f);
+                    if (!std::isfinite(accelWeight))
+                        accelWeight = 0.0f;
+
+                    body->initialLin = body->positionLin;
+                    body->initialAng = body->positionAng;
+                    if (body->mass > 0) {
+                        body->positionLin = body->positionLin + body->velocityLin * dt +
+                                            float3{0, 0, gravity} * (accelWeight * dt * dt);
+                        body->positionAng = body->positionAng + body->velocityAng * dt;
+                    }
+                }
+
+                for (Force* force = forces; force != nullptr;) {
+                    if (!force->initialize()) {
+                        Force* next = force->next;
+                        delete force;
+                        force = next;
+                    } else {
+                        force = force->next;
+                    }
+                }
+                for (int it = 0; it < iterations; it++) {
+                    for (Rigid* body = bodies; body != nullptr; body = body->next) {
+                        if (body->mass <= 0) continue;
+                        float3x3 MLin = diagonal(body->mass, body->mass, body->mass);
+                        float3x3 MAng = diagonal(body->moment.x, body->moment.y, body->moment.z);
+                        float3x3 lhsLin = MLin / (dt * dt);
+                        float3x3 lhsAng = MAng / (dt * dt);
+                        float3x3 lhsCross = float3x3{0, 0, 0, 0, 0, 0, 0, 0, 0};
+                        float3 rhsLin = MLin / (dt * dt) * (body->positionLin - body->inertialLin);
+                        float3 rhsAng = MAng / (dt * dt) * (body->positionAng - body->inertialAng);
+                        for (Force* force = body->forces; force != nullptr;
+                             force = (force->bodyA == body) ? force->nextA : force->nextB)
+                            force->updatePrimal(body, alpha, lhsLin, lhsAng, lhsCross, rhsLin, rhsAng);
+                        float3 dxLin, dxAng;
+                        solve(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, dxLin, dxAng);
+                        body->positionLin = body->positionLin + dxLin;
+                        body->positionAng = body->positionAng + dxAng;
+                    }
+                    for (Force* force = forces; force != nullptr; force = force->next)
+                        force->updateDual(alpha);
+                }
+                for (Rigid* body = bodies; body != nullptr; body = body->next) {
+                    body->prevVelocityLin = body->velocityLin;
+                    if (body->mass > 0) {
+                        body->velocityLin = (body->positionLin - body->initialLin) / dt;
+                        body->velocityAng = (body->positionAng - body->initialAng) / dt;
+                    }
+                }
+
+                soa_.pack(bodies);
+                gpu_solver_->upload_bodies(
+                    soa_.pos_x.data(), soa_.pos_y.data(), soa_.pos_z.data(),
+                    soa_.quat_x.data(), soa_.quat_y.data(), soa_.quat_z.data(), soa_.quat_w.data(),
+                    soa_.vel_x.data(), soa_.vel_y.data(), soa_.vel_z.data(),
+                    soa_.velang_x.data(), soa_.velang_y.data(), soa_.velang_z.data(),
+                    soa_.prevvel_x.data(), soa_.prevvel_y.data(), soa_.prevvel_z.data(),
+                    soa_.mass.data(), soa_.moment_x.data(), soa_.moment_y.data(), soa_.moment_z.data(),
+                    soa_.half_x.data(), soa_.half_y.data(), soa_.half_z.data(),
+                    soa_.friction.data(),
+                    soa_.count);
+                gpu_state_valid_ = true;
+            } else {
+                // No collisions, no joints: GPU init + velocity update
+                gpu_solver_->solve(
+                    nullptr, nullptr, 0,
+                    nullptr, nullptr, 0,
+                    nullptr, 0,
+                    iterations, dt, gravity,
+                    alpha, betaLin, gamma);
+                gpu_state_valid_ = true;
+            }
         }
     }
 

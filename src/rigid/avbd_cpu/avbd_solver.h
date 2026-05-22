@@ -180,6 +180,18 @@ struct Solver {
     float betaAng;
     float gamma;
 
+    // Ground plane: z = ground_z, normal = +Z.
+    // When enabled, bodies are prevented from penetrating below this plane.
+    bool  has_ground_plane = false;
+    float ground_z = 0.0f;
+    float ground_friction = 0.5f;
+
+    void set_ground_plane(float z, float friction = 0.5f) {
+        has_ground_plane = true;
+        ground_z = z;
+        ground_friction = friction;
+    }
+
     Rigid* bodies;
     Force* forces;
 

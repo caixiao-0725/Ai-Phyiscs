@@ -84,6 +84,20 @@ public:
     /// GPU-only warm-start: no D2H re-download of contacts.
     void warmstart_gpu(int n_manifolds, int n_contacts, int n_bodies);
 
+    /// Append ground-plane contacts to the existing narrowphase results.
+    /// Must be called after query_gpu() and before warmstart.
+    /// ground_body_idx is the virtual body index for the ground (typically n_bodies).
+    /// n_bodies_with_ground = n_bodies + 1 (used for vtx table sizing).
+    void append_ground_plane_gpu(
+        const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+        const float* quat_x_dev, const float* quat_y_dev,
+        const float* quat_z_dev, const float* quat_w_dev,
+        const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+        const float* friction_dev, const float* mass_dev,
+        int n_bodies, float ground_z, float ground_friction,
+        int ground_body_idx,
+        int& n_manifolds_inout, int& n_contacts_inout);
+
     /// Save current frame's GPU data as "previous frame" for next frame's warm-start.
     /// Call this AFTER the solver loop, with final contact state uploaded.
     void snapshot_for_next_frame(int n_manifolds, int n_contacts, int n_bodies);
