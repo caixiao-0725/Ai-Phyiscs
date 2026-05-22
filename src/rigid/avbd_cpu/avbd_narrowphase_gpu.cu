@@ -659,6 +659,81 @@ void NarrowphaseGPU::warmstart(int n_manifolds, int n_contacts, int n_bodies,
     }
 }
 
+void NarrowphaseGPU::query_gpu(
+    const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+    const float* quat_x_dev, const float* quat_y_dev,
+    const float* quat_z_dev, const float* quat_w_dev,
+    const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+    const float* friction_dev,
+    const int* pair_a_dev, const int* pair_b_dev,
+    int n_pairs, int n_bodies,
+    int& n_manifolds_out, int& n_contacts_out)
+{
+    n_manifolds_out = 0;
+    n_contacts_out = 0;
+    if (n_pairs <= 0) return;
+
+    if (n_pairs > max_pairs_)
+        build(n_pairs * 2);
+
+    if (n_bodies > max_bodies_) {
+        max_bodies_ = n_bodies;
+        vtx_counts_.resize(max_bodies_);
+        vtx_table_.resize(max_bodies_ * VERTEX_TABLE_MAX_NEIGHBORS);
+    }
+
+    int max_contacts = max_pairs_ * MAX_CONTACTS;
+
+    check(cudaMemset(manifold_count_.gpu_data(), 0, sizeof(int)), "zero manifold_count");
+    check(cudaMemset(contact_count_.gpu_data(), 0, sizeof(int)), "zero contact_count");
+    check(cudaMemset(vtx_counts_.gpu_data(), 0, n_bodies * sizeof(int)), "zero vtx_counts");
+
+    sat_narrowphase_kernel<<<grid(n_pairs), kBlock>>>(
+        pos_x_dev, pos_y_dev, pos_z_dev,
+        quat_x_dev, quat_y_dev, quat_z_dev, quat_w_dev,
+        half_x_dev, half_y_dev, half_z_dev,
+        friction_dev,
+        pair_a_dev, pair_b_dev,
+        n_pairs,
+        manifolds_.gpu_data(),
+        contacts_.gpu_data(),
+        manifold_count_.gpu_data(),
+        contact_count_.gpu_data(),
+        max_contacts,
+        vtx_counts_.gpu_data(),
+        vtx_table_.gpu_data(),
+        VERTEX_TABLE_MAX_NEIGHBORS);
+    check(cudaGetLastError(), "sat_narrowphase_kernel launch");
+
+    int n_manifolds = 0, n_contacts = 0;
+    check(cudaMemcpy(&n_manifolds, manifold_count_.gpu_data(), sizeof(int),
+                     cudaMemcpyDeviceToHost), "manifold_count D2H");
+    check(cudaMemcpy(&n_contacts, contact_count_.gpu_data(), sizeof(int),
+                     cudaMemcpyDeviceToHost), "contact_count D2H");
+
+    n_manifolds_out = min(n_manifolds, max_pairs_);
+    n_contacts_out = min(n_contacts, max_contacts);
+}
+
+void NarrowphaseGPU::warmstart_gpu(int n_manifolds, int n_contacts, int n_bodies)
+{
+    if (n_manifolds <= 0 || prev_n_manifolds_ <= 0 || n_contacts <= 0)
+        return;
+
+    warmstart_kernel<<<grid(n_manifolds), kBlock>>>(
+        manifolds_.gpu_data(),
+        contacts_.gpu_data(),
+        n_manifolds,
+        prev_manifolds_.gpu_data(),
+        prev_contacts_.gpu_data(),
+        prev_vtx_counts_.gpu_data(),
+        prev_vtx_table_.gpu_data(),
+        VERTEX_TABLE_MAX_NEIGHBORS,
+        prev_n_bodies_,
+        1.0f, 1.0f);
+    check(cudaGetLastError(), "warmstart_kernel launch");
+}
+
 void NarrowphaseGPU::upload_contacts(const GpuContact* contacts, int n_contacts) {
     if (n_contacts <= 0 || !contacts) return;
     check(cudaMemcpy(contacts_.gpu_data(), contacts,

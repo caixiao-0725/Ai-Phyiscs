@@ -64,11 +64,25 @@ public:
               GpuManifold* manifolds_out, GpuContact* contacts_out,
               int& total_contacts_out);
 
+    /// GPU-only variant: no D2H download of manifolds/contacts/vtx.
+    /// Returns {n_manifolds, n_contacts} via the output params.
+    void query_gpu(const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+                   const float* quat_x_dev, const float* quat_y_dev,
+                   const float* quat_z_dev, const float* quat_w_dev,
+                   const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+                   const float* friction_dev,
+                   const int* pair_a_dev, const int* pair_b_dev,
+                   int n_pairs, int n_bodies,
+                   int& n_manifolds_out, int& n_contacts_out);
+
     /// Run warm-start kernel on GPU: match current manifolds/contacts against
     /// previous frame's data using the vertex table, transfer lambda/penalty/C0/stick.
     /// Must be called after query(). Re-downloads contacts to contacts_out.
     void warmstart(int n_manifolds, int n_contacts, int n_bodies,
                    GpuContact* contacts_out);
+
+    /// GPU-only warm-start: no D2H re-download of contacts.
+    void warmstart_gpu(int n_manifolds, int n_contacts, int n_bodies);
 
     /// Save current frame's GPU data as "previous frame" for next frame's warm-start.
     /// Call this AFTER the solver loop, with final contact state uploaded.

@@ -32,6 +32,22 @@ __device__ unsigned rng_next(unsigned& state) {
 }
 
 // ---------------------------------------------------------------------------
+//  Helper: max-reduce colors[] to get num_colors = max(colors[i]) + 1
+// ---------------------------------------------------------------------------
+
+__global__ void max_color_kernel(const int* colors, int n, int* out_max) {
+    __shared__ int s_max;
+    if (threadIdx.x == 0) s_max = -1;
+    __syncthreads();
+
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) atomicMax(&s_max, colors[i]);
+    __syncthreads();
+
+    if (threadIdx.x == 0) atomicMax(out_max, s_max);
+}
+
+// ---------------------------------------------------------------------------
 //  Helper: count uncolored vertices
 // ---------------------------------------------------------------------------
 
@@ -558,10 +574,14 @@ ColoringStats GraphColoringGPU::color_jp(
         if (rounds > 200) break;
     }
 
-    colors_.copy_to_host();
-    int num_colors = 0;
-    for (int i = 0; i < n_bodies; i++)
-        num_colors = max(num_colors, colors_.cpu_data()[i] + 1);
+    // GPU max-reduction to compute num_colors without downloading colors_
+    int max_color = -1;
+    check(cudaMemset(remaining_.gpu_data(), 0xFF, sizeof(int)), "init max_color -1");
+    max_color_kernel<<<grid(n_bodies), kBlock>>>(
+        colors_.gpu_data(), n_bodies, remaining_.gpu_data());
+    check(cudaMemcpy(&max_color, remaining_.gpu_data(), sizeof(int),
+                     cudaMemcpyDeviceToHost), "max_color D2H");
+    int num_colors = max_color + 1;
 
     cudaEventRecord(t1);
     cudaEventSynchronize(t1);

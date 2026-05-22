@@ -167,5 +167,54 @@ int BroadphaseGPU::query(
     return count;
 }
 
+int BroadphaseGPU::query_gpu(
+    const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+    const float* quat_x_dev, const float* quat_y_dev,
+    const float* quat_z_dev, const float* quat_w_dev,
+    const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+    const float* mass_dev,
+    int n_bodies)
+{
+    if (n_bodies <= 1) return 0;
+    if (n_bodies > max_bodies_) {
+        int mp = std::min(n_bodies * 8, n_bodies * (n_bodies - 1) / 2);
+        if (mp < 256) mp = 256;
+        build(n_bodies, mp);
+    }
+
+    compute_body_aabbs_kernel<<<grid(n_bodies), kBlock>>>(
+        pos_x_dev, pos_y_dev, pos_z_dev,
+        quat_x_dev, quat_y_dev, quat_z_dev, quat_w_dev,
+        half_x_dev, half_y_dev, half_z_dev,
+        n_bodies, aabbs_.gpu_data(), centers_.gpu_data());
+    check(cudaGetLastError(), "compute_body_aabbs");
+
+    bvh_.build(n_bodies, max_pairs_);
+    bvh_.refit(aabbs_.gpu_data(), centers_.gpu_data());
+
+    bvh_.query_self_aabb(aabbs_.gpu_data(), mass_dev);
+
+    int count_host = 0;
+    check(cudaMemcpy(&count_host, bvh_.query_count_dev(),
+                     sizeof(int), cudaMemcpyDeviceToHost),
+          "pair_count D2H");
+    int count = std::min(count_host, max_pairs_);
+
+    if (count > 0) {
+        if (count > (int)pair_a_split_.gpu_size()) {
+            pair_a_split_.resize(count);
+            pair_b_split_.resize(count);
+        }
+        split_pairs_kernel<<<grid(count), kBlock>>>(
+            reinterpret_cast<const math::Vec2i*>(bvh_.query_pairs_dev()),
+            count,
+            pair_a_split_.gpu_data(),
+            pair_b_split_.gpu_data());
+        check(cudaGetLastError(), "split_pairs");
+    }
+
+    return count;
+}
+
 }  // namespace avbd
 }  // namespace chysx

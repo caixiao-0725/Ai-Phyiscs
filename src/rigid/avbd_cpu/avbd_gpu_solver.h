@@ -36,6 +36,21 @@ public:
         const float* friction,
         int n_bodies);
 
+    /// Hybrid upload: copy pose/half/mass/friction D2D from device pointers
+    /// (e.g. broadphase GPU buffers), upload velocity/moment H2D from CPU.
+    /// Avoids redundant H2D for data already on GPU.
+    void upload_bodies_hybrid(
+        const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+        const float* quat_x_dev, const float* quat_y_dev,
+        const float* quat_z_dev, const float* quat_w_dev,
+        const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+        const float* mass_dev, const float* friction_dev,
+        const float* vel_x, const float* vel_y, const float* vel_z,
+        const float* velang_x, const float* velang_y, const float* velang_z,
+        const float* prevvel_x, const float* prevvel_y, const float* prevvel_z,
+        const float* moment_x, const float* moment_y, const float* moment_z,
+        int n_bodies);
+
     /// Run the full GPU solver: init bodies, colored GS iterations, velocity update.
     void solve(
         GpuManifold* manifolds_dev, GpuContact* contacts_dev,
@@ -53,7 +68,7 @@ public:
         float* velang_x, float* velang_y, float* velang_z,
         int n_bodies);
 
-    // GPU pointers for external use (e.g., broadphase reads position)
+    // GPU pointers for external use (e.g., broadphase reads position, renderer reads state)
     float* pos_x_dev() { return pos_x_.gpu_data(); }
     float* pos_y_dev() { return pos_y_.gpu_data(); }
     float* pos_z_dev() { return pos_z_.gpu_data(); }
@@ -61,11 +76,18 @@ public:
     float* quat_y_dev() { return quat_y_.gpu_data(); }
     float* quat_z_dev() { return quat_z_.gpu_data(); }
     float* quat_w_dev() { return quat_w_.gpu_data(); }
+    float* half_x_dev() { return half_x_.gpu_data(); }
+    float* half_y_dev() { return half_y_.gpu_data(); }
+    float* half_z_dev() { return half_z_.gpu_data(); }
+    float* mass_dev() { return mass_.gpu_data(); }
+    float* friction_dev() { return friction_.gpu_data(); }
+    int body_count() const { return n_bodies_; }
 
 private:
     void ensure_capacity(int n_bodies);
 
-    int n_bodies_ = 0;
+    int n_bodies_ = 0;       // active body count (set each frame)
+    int capacity_  = 0;       // allocated buffer capacity
 
     // Position / orientation (read-write during solver)
     CudaArray<float> pos_x_, pos_y_, pos_z_;

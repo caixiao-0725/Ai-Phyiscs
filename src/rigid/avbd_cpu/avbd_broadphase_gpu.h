@@ -36,6 +36,15 @@ public:
               int n_bodies,
               int* pair_a, int* pair_b);
 
+    /// GPU-resident variant: all input pointers are already on device.
+    /// No H2D upload, no pair D2H download. Returns pair count only.
+    int query_gpu(const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+                  const float* quat_x_dev, const float* quat_y_dev,
+                  const float* quat_z_dev, const float* quat_w_dev,
+                  const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+                  const float* mass_dev,
+                  int n_bodies);
+
     // GPU-side SoA pointers for narrowphase to read directly
     const float* pos_x_dev() const { return pos_x_.gpu_data(); }
     const float* pos_y_dev() const { return pos_y_.gpu_data(); }

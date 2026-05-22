@@ -520,8 +520,8 @@ __global__ void velocity_update_kernel(
 // -----------------------------------------------------------------------
 
 void GpuSolver::ensure_capacity(int n) {
-    if (n <= n_bodies_) return;
-    n_bodies_ = n;
+    if (n <= capacity_) return;
+    capacity_ = n;
     pos_x_.resize(n); pos_y_.resize(n); pos_z_.resize(n);
     quat_x_.resize(n); quat_y_.resize(n); quat_z_.resize(n); quat_w_.resize(n);
     vel_x_.resize(n); vel_y_.resize(n); vel_z_.resize(n);
@@ -552,6 +552,7 @@ void GpuSolver::upload_bodies(
     int n)
 {
     ensure_capacity(n);
+    n_bodies_ = n;
     UPLOAD_ARRAY(pos_x_, px, n); UPLOAD_ARRAY(pos_y_, py, n); UPLOAD_ARRAY(pos_z_, pz, n);
     UPLOAD_ARRAY(quat_x_, qx, n); UPLOAD_ARRAY(quat_y_, qy, n);
     UPLOAD_ARRAY(quat_z_, qz, n); UPLOAD_ARRAY(quat_w_, qw, n);
@@ -564,6 +565,41 @@ void GpuSolver::upload_bodies(
     UPLOAD_ARRAY(friction_, fric, n);
 }
 #undef UPLOAD_ARRAY
+
+void GpuSolver::upload_bodies_hybrid(
+    const float* px_d, const float* py_d, const float* pz_d,
+    const float* qx_d, const float* qy_d, const float* qz_d, const float* qw_d,
+    const float* hx_d, const float* hy_d, const float* hz_d,
+    const float* mass_d, const float* fric_d,
+    const float* vx, const float* vy, const float* vz,
+    const float* vax, const float* vay, const float* vaz,
+    const float* pvx, const float* pvy, const float* pvz,
+    const float* mom_x, const float* mom_y, const float* mom_z,
+    int n)
+{
+    ensure_capacity(n);
+    n_bodies_ = n;
+    size_t fb = n * sizeof(float);
+
+    // D2D copies for data already on GPU
+    #define D2D(dst, src) check(cudaMemcpy(dst.gpu_data(), src, fb, cudaMemcpyDeviceToDevice), #dst " D2D")
+    D2D(pos_x_, px_d);  D2D(pos_y_, py_d);  D2D(pos_z_, pz_d);
+    D2D(quat_x_, qx_d); D2D(quat_y_, qy_d); D2D(quat_z_, qz_d); D2D(quat_w_, qw_d);
+    D2D(half_x_, hx_d); D2D(half_y_, hy_d); D2D(half_z_, hz_d);
+    D2D(mass_, mass_d);
+    D2D(friction_, fric_d);
+    #undef D2D
+
+    // H2D for data only available on CPU
+    #define UPLOAD_ARRAY(dst, src, n) \
+        memcpy(dst.cpu_data(), src, (n) * sizeof(float)); \
+        dst.copy_to_device()
+    UPLOAD_ARRAY(vel_x_, vx, n);    UPLOAD_ARRAY(vel_y_, vy, n);    UPLOAD_ARRAY(vel_z_, vz, n);
+    UPLOAD_ARRAY(velang_x_, vax, n); UPLOAD_ARRAY(velang_y_, vay, n); UPLOAD_ARRAY(velang_z_, vaz, n);
+    UPLOAD_ARRAY(prevvel_x_, pvx, n); UPLOAD_ARRAY(prevvel_y_, pvy, n); UPLOAD_ARRAY(prevvel_z_, pvz, n);
+    UPLOAD_ARRAY(moment_x_, mom_x, n); UPLOAD_ARRAY(moment_y_, mom_y, n); UPLOAD_ARRAY(moment_z_, mom_z, n);
+    #undef UPLOAD_ARRAY
+}
 
 void GpuSolver::solve(
     GpuManifold* manifolds_dev, GpuContact* contacts_dev,

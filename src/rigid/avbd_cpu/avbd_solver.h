@@ -190,6 +190,15 @@ struct Solver {
     GpuSolver* gpu_solver_ = nullptr;
     std::vector<int> pairs_a_, pairs_b_;
 
+    // When true, the last step() used the GPU solver path and
+    // gpu_solver_ contains up-to-date body state on the device.
+    bool gpu_state_valid_ = false;
+
+    // Tracks whether the previous frame left valid GPU state, so we can
+    // skip the full CPU→GPU upload on subsequent frames.
+    bool gpu_state_valid_prev_ = false;
+    int prev_body_count_ = 0;
+
     Solver();
     ~Solver();
 
@@ -197,6 +206,8 @@ struct Solver {
     void clear();
     void defaultParams();
     void step();
+
+    GpuSolver* gpu_solver() { return gpu_solver_; }
 };
 
 }  // namespace avbd

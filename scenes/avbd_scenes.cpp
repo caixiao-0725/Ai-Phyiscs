@@ -14,6 +14,8 @@
 
 #include "render/scene.h"
 #include "rigid/avbd_cpu/avbd_solver.h"
+#include "rigid/avbd_cpu/avbd_gpu_solver.h"
+#include "rigid/avbd_cpu/avbd_gpu_renderer.h"
 
 #include <cmath>
 #include <cstdio>
@@ -118,7 +120,7 @@ public:
         : name_(sceneName), setupFn_(std::move(setupFn)) {
         solver_ = new Solver();
     }
-    ~AVBDScene() override { releaseDrag(); delete solver_; }
+    ~AVBDScene() override { releaseDrag(); delete gpu_renderer_; delete solver_; }
 
     const char* name() const override { return name_; }
 
@@ -129,6 +131,7 @@ public:
 
     void step(float /*dt*/) override {
         solver_->step();
+        updateGpuRender();
     }
 
     void reset() override {
@@ -139,34 +142,81 @@ public:
     void draw_meshes(std::vector<DrawMesh>& /*out*/) override {}
 
     void draw_custom() override {
-        glEnable(GL_LINE_SMOOTH);
-        glLineWidth(2.0f);
-        glPointSize(3.0f);
-        glDisable(GL_LIGHTING);
-        glShadeModel(GL_FLAT);
-        glEnable(GL_DEPTH_TEST);
-        glDisable(GL_CULL_FACE);
+        // GPU path: all bodies rendered via VBO from CUDA-GL interop
+        if (gpu_renderer_ && solver_->gpu_state_valid_ && gpu_renderer_->n_bodies() > 0) {
+            GpuRenderer* renderer = gpu_renderer_;
+            glEnable(GL_LINE_SMOOTH);
+            glLineWidth(2.0f);
+            glDisable(GL_LIGHTING);
+            glShadeModel(GL_FLAT);
+            glEnable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
 
-        // Static bodies first
-        for (const Rigid* body = solver_->bodies; body; body = body->next)
-            if (body->mass <= 0.0f)
-                drawBody(body);
+            // Filled boxes
+            glColor4f(0.80f, 0.84f, 0.90f, 1.0f);
+            glEnable(GL_POLYGON_OFFSET_FILL);
+            glPolygonOffset(1.0f, 1.0f);
 
-        drawProjectedShadows();
+            glEnable(GL_LIGHTING);
+            glEnable(GL_LIGHT0);
+            glEnable(GL_COLOR_MATERIAL);
+            glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+            float light_pos[] = {2.0f, -3.0f, 5.0f, 0.0f};
+            float light_amb[] = {0.2f, 0.2f, 0.2f, 1.0f};
+            float light_dif[] = {0.9f, 0.9f, 0.9f, 1.0f};
+            glLightfv(GL_LIGHT0, GL_POSITION, light_pos);
+            glLightfv(GL_LIGHT0, GL_AMBIENT, light_amb);
+            glLightfv(GL_LIGHT0, GL_DIFFUSE, light_dif);
 
-        // Dynamic bodies after shadows
-        for (const Rigid* body = solver_->bodies; body; body = body->next)
-            if (body->mass > 0.0f)
-                drawBody(body);
+            renderer->draw_triangles();
+            glDisable(GL_LIGHTING);
+            glDisable(GL_POLYGON_OFFSET_FILL);
 
-        // Forces (joints, springs, contacts)
-        for (const Force* f = solver_->forces; f; f = f->next) {
-            if (const Joint* j = dynamic_cast<const Joint*>(f))
-                drawJoint(j);
-            else if (const Spring* s = dynamic_cast<const Spring*>(f))
-                drawSpring(s);
-            else if (const Manifold* m = dynamic_cast<const Manifold*>(f))
-                drawManifold(m);
+            // Projected shadows (compute shadow matrix on CPU, project on GPU)
+            drawProjectedShadowsGpu(renderer);
+
+            // Wireframe edges
+            glColor4f(0.10f, 0.12f, 0.14f, 1.0f);
+            renderer->draw_edges();
+
+            // Forces still drawn on CPU (joints/springs are few)
+            glPointSize(3.0f);
+            for (const Force* f = solver_->forces; f; f = f->next) {
+                if (const Joint* j = dynamic_cast<const Joint*>(f))
+                    drawJoint(j);
+                else if (const Spring* s = dynamic_cast<const Spring*>(f))
+                    drawSpring(s);
+                else if (const Manifold* m = dynamic_cast<const Manifold*>(f))
+                    drawManifold(m);
+            }
+        } else {
+            // CPU fallback path (original)
+            glEnable(GL_LINE_SMOOTH);
+            glLineWidth(2.0f);
+            glPointSize(3.0f);
+            glDisable(GL_LIGHTING);
+            glShadeModel(GL_FLAT);
+            glEnable(GL_DEPTH_TEST);
+            glDisable(GL_CULL_FACE);
+
+            for (const Rigid* body = solver_->bodies; body; body = body->next)
+                if (body->mass <= 0.0f)
+                    drawBody(body);
+
+            drawProjectedShadows();
+
+            for (const Rigid* body = solver_->bodies; body; body = body->next)
+                if (body->mass > 0.0f)
+                    drawBody(body);
+
+            for (const Force* f = solver_->forces; f; f = f->next) {
+                if (const Joint* j = dynamic_cast<const Joint*>(f))
+                    drawJoint(j);
+                else if (const Spring* s = dynamic_cast<const Spring*>(f))
+                    drawSpring(s);
+                else if (const Manifold* m = dynamic_cast<const Manifold*>(f))
+                    drawManifold(m);
+            }
         }
     }
 
@@ -236,6 +286,7 @@ private:
     const char* name_;
     SceneSetupFn setupFn_;
     Solver* solver_ = nullptr;
+    GpuRenderer* gpu_renderer_ = nullptr;
 
     // Drag state
     Joint* drag_ = nullptr;
@@ -251,6 +302,19 @@ private:
     float boxDensity_ = 1.0f;
 
     bool showContacts_ = true;
+
+    void updateGpuRender() {
+        if (!solver_->gpu_state_valid_ || !solver_->gpu_solver()) return;
+        if (!gpu_renderer_)
+            gpu_renderer_ = new GpuRenderer();
+        gpu_renderer_->update(
+            *solver_->gpu_solver(),
+            solver_->gpu_solver()->half_x_dev(),
+            solver_->gpu_solver()->half_y_dev(),
+            solver_->gpu_solver()->half_z_dev(),
+            solver_->gpu_solver()->mass_dev(),
+            solver_->soa_.count);
+    }
 
     void releaseDrag() {
         if (drag_) { delete drag_; drag_ = nullptr; }
@@ -327,6 +391,72 @@ private:
             glVertex3f(v1.x, v1.y, v1.z);
         }
         glEnd();
+    }
+
+    void drawProjectedShadowsGpu(GpuRenderer* renderer) {
+        GLint stencilBits = 0;
+        glGetIntegerv(GL_STENCIL_BITS, &stencilBits);
+        bool useStencil = stencilBits > 0;
+
+        float3 planePoint, planeNormal;
+        if (!findShadowPlane(solver_, planePoint, planeNormal)) return;
+
+        float plane[4];
+        makePlaneFromPointNormal(planePoint, planeNormal, plane);
+
+        float3 l = normalize(float3{0.45f, 0.95f, 1.0f});
+        float light[4] = {l.x, l.y, l.z, 0.0f};
+
+        float shadowMat[16];
+        makeShadowMatrix(shadowMat, light, plane);
+
+        // Update shadow VBO on GPU
+        renderer->update_shadows(
+            *solver_->gpu_solver(),
+            solver_->gpu_solver()->half_x_dev(),
+            solver_->gpu_solver()->half_y_dev(),
+            solver_->gpu_solver()->half_z_dev(),
+            solver_->gpu_solver()->mass_dev(),
+            solver_->soa_.count, shadowMat);
+
+        GLboolean lightingWas = glIsEnabled(GL_LIGHTING);
+        GLboolean polyOffWas  = glIsEnabled(GL_POLYGON_OFFSET_FILL);
+        GLboolean stencilWas  = glIsEnabled(GL_STENCIL_TEST);
+        GLboolean depthWrite  = GL_TRUE;
+        glGetBooleanv(GL_DEPTH_WRITEMASK, &depthWrite);
+        GLboolean colorMask[4]; glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+
+        glDisable(GL_LIGHTING);
+        glDisable(GL_CULL_FACE);
+        glEnable(GL_POLYGON_OFFSET_FILL);
+        glPolygonOffset(-1.0f, -1.0f);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+
+        if (useStencil) {
+            glEnable(GL_STENCIL_TEST);
+            glClear(GL_STENCIL_BUFFER_BIT);
+            glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+            glStencilMask(0xFF);
+            glStencilFunc(GL_ALWAYS, 1, 0xFF);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_REPLACE);
+            renderer->draw_shadow_triangles();
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glColor3f(0.72f, 0.72f, 0.72f);
+            glStencilFunc(GL_EQUAL, 1, 0xFF);
+            glStencilOp(GL_KEEP, GL_KEEP, GL_ZERO);
+            renderer->draw_shadow_triangles();
+        } else {
+            glColor3f(0.72f, 0.72f, 0.72f);
+            renderer->draw_shadow_triangles();
+        }
+
+        glDepthMask(depthWrite);
+        glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+        if (useStencil) glStencilMask(0xFF);
+        polyOffWas  ? glEnable(GL_POLYGON_OFFSET_FILL) : glDisable(GL_POLYGON_OFFSET_FILL);
+        lightingWas ? glEnable(GL_LIGHTING)            : glDisable(GL_LIGHTING);
+        stencilWas && useStencil ? glEnable(GL_STENCIL_TEST) : glDisable(GL_STENCIL_TEST);
     }
 
     void drawProjectedShadows() {
@@ -413,13 +543,23 @@ private:
 // ---- Scene setup functions ----
 
 void setupPyramid(Solver* s) {
-    const int SIZE = 16;
+    const int SIZE = 200;
     s->clear();
-    new Rigid(s, {100, 100, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
+    new Rigid(s, {1000, 1000, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
     for (int y = 0; y < SIZE; y++)
-        for (int x = 0; x < SIZE - y; x++)
-            new Rigid(s, {1, 0.5f, 0.5f}, 1.0f, 0.5f,
-                      {x * 1.01f + y * 0.5f - SIZE / 2.0f, 0.0f, y * 0.85f + 0.5f});
+        for (int x = 0; x < SIZE - y; x++) {
+            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 0.0f, y * 0.5f + 0.01f });
+            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 2.0f, y * 0.5f + 0.01f });
+            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, -2.0f, y * 0.5f + 0.01f });
+            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, -4.0f, y * 0.5f + 0.01f });
+            new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 4.0f, y * 0.5f + 0.01f });
+        }
+
 }
 
 void setupRope(Solver* s) {

@@ -728,27 +728,37 @@ __global__ void query_self_aabb_kernel(
 
                 if (overlaps_ull2_int(node, bv)) {
                     if (lc == QuantBvh::max_index) {
-                        const int leaf_slot = static_cast<int>(st) - int_size;
-                        const PackedFace fd = ext_face[leaf_slot];
-                        const int other_orig = fd.w;
 
-                        if (other_orig != my_orig && my_orig < other_orig) {
-                            bool skip = false;
-                            if (mass && my_mass <= 0.f && mass[other_orig] <= 0.f)
-                                skip = true;
-
-                            if (!skip) {
-                                Aabb other_box = leaf_aabbs[other_orig];
-                                Aabb my_box = leaf_aabbs[my_orig];
-                                if (my_box.overlaps(other_box)) {
-                                    const int s_idx = atomicAdd(&s_counter, 1);
-                                    if (s_idx >= kMaxResPerBlock) {
+                                const int leaf_slot = static_cast<int>(st) - int_size;
+                                if(tid < leaf_slot){
+                                    int sIdx = atomicAdd(&s_counter, 1);
+                                    if (sIdx >= kMaxResPerBlock) {
                                         break;
                                     }
-                                    s_buf[s_idx] = math::Vec2i(my_orig, other_orig);
+                                    s_buf[sIdx] = math::Vec2i(my_orig, ext_face[leaf_slot].w);
                                 }
-                            }
-                        }
+
+                        // const int leaf_slot = static_cast<int>(st) - int_size;
+                        // const PackedFace fd = ext_face[leaf_slot];
+                        // const int other_orig = fd.w;
+
+                        // if (other_orig != my_orig && my_orig < other_orig) {
+                        //     bool skip = false;
+                        //     if (mass && my_mass <= 0.f && mass[other_orig] <= 0.f)
+                        //         skip = true;
+
+                        //     if (!skip) {
+                        //         Aabb other_box = leaf_aabbs[other_orig];
+                        //         Aabb my_box = leaf_aabbs[my_orig];
+                        //         if (my_box.overlaps(other_box)) {
+                        //             const int s_idx = atomicAdd(&s_counter, 1);
+                        //             if (s_idx >= kMaxResPerBlock) {
+                        //                 break;
+                        //             }
+                        //             s_buf[s_idx] = math::Vec2i(my_orig, other_orig);
+                        //         }
+                        //     }
+                        // }
                         st = escape;
                     } else {
                         st = lc;
