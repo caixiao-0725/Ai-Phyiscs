@@ -543,7 +543,7 @@ private:
 // ---- Scene setup functions ----
 
 void setupPyramid(Solver* s) {
-    const int SIZE = 200;
+    const int SIZE = 100;
     s->clear();
     new Rigid(s, {1000, 1000, 1}, 0.0f, 0.5f, {0, 0, -0.5f});
     for (int y = 0; y < SIZE; y++)
@@ -551,13 +551,13 @@ void setupPyramid(Solver* s) {
             new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
                 { x * 1.01f + y * 0.5f - SIZE / 2.0f, 0.0f, y * 0.5f + 0.01f });
             new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 2.0f, y * 0.5f + 0.01f });
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 20.0f, y * 0.5f + 0.01f });
             new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, -2.0f, y * 0.5f + 0.01f });
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, -20.0f, y * 0.5f + 0.01f });
             new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, -4.0f, y * 0.5f + 0.01f });
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, -40.0f, y * 0.5f + 0.01f });
             new Rigid(s, { 1, 0.5f, 0.5f }, 1.0f, 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 4.0f, y * 0.5f + 0.01f });
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 40.0f, y * 0.5f + 0.01f });
         }
 
 }

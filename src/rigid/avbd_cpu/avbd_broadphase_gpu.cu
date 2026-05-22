@@ -199,7 +199,7 @@ int BroadphaseGPU::query_gpu(
                      sizeof(int), cudaMemcpyDeviceToHost),
           "pair_count D2H");
     int count = std::min(count_host, max_pairs_);
-
+    printf("BroadphaseGPU: found %d  %d pairs\n", count_host, count);
     if (count > 0) {
         if (count > (int)pair_a_split_.gpu_size()) {
             pair_a_split_.resize(count);
