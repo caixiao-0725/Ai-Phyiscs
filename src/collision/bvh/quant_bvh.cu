@@ -540,12 +540,14 @@ __global__ void query_self_aabb_full_kernel(
     if (threadIdx.x == 0) s_counter = 0;
 
     int st = 0;
+    int visit_budget = 2 * (n_leaves + int_size);
 
     while (true) {
         __syncthreads();
 
         if (active) {
             while (st != -1) {
+                if (--visit_budget < 0) { st = -1; break; }
                 const FullBvhNode node = nodes[st];
 
                 bool hit = !(node.mx_x < bv.mn.x || node.mn_x > bv.mx.x ||
@@ -863,49 +865,28 @@ __global__ void query_self_aabb_kernel(
     if (threadIdx.x == 0) s_counter = 0;
 
     std::uint32_t st = 0u;
+    int visit_budget = 2 * (n_leaves + int_size);
 
     while (true) {
         __syncthreads();
 
         if (active) {
             while (st != QuantBvh::max_index) {
+                if (--visit_budget < 0) { st = QuantBvh::max_index; break; }
                 Ull2 node = nodes[st];
                 const std::uint32_t lc     = (std::uint32_t)(node.x >> QuantBvh::offset3);
                 const std::uint32_t escape = (std::uint32_t)(node.y >> QuantBvh::offset3);
 
                 if (overlaps_ull2_int(node, bv)) {
                     if (lc == QuantBvh::max_index) {
-
-                                const int leaf_slot = static_cast<int>(st) - int_size;
-                                if(tid < leaf_slot){
-                                    int sIdx = atomicAdd(&s_counter, 1);
-                                    if (sIdx >= kMaxResPerBlock) {
-                                        break;
-                                    }
-                                    s_buf[sIdx] = math::Vec2i(my_orig, ext_face[leaf_slot].w);
-                                }
-
-                        // const int leaf_slot = static_cast<int>(st) - int_size;
-                        // const PackedFace fd = ext_face[leaf_slot];
-                        // const int other_orig = fd.w;
-
-                        // if (other_orig != my_orig && my_orig < other_orig) {
-                        //     bool skip = false;
-                        //     if (mass && my_mass <= 0.f && mass[other_orig] <= 0.f)
-                        //         skip = true;
-
-                        //     if (!skip) {
-                        //         Aabb other_box = leaf_aabbs[other_orig];
-                        //         Aabb my_box = leaf_aabbs[my_orig];
-                        //         if (my_box.overlaps(other_box)) {
-                        //             const int s_idx = atomicAdd(&s_counter, 1);
-                        //             if (s_idx >= kMaxResPerBlock) {
-                        //                 break;
-                        //             }
-                        //             s_buf[s_idx] = math::Vec2i(my_orig, other_orig);
-                        //         }
-                        //     }
-                        // }
+                        const int leaf_slot = static_cast<int>(st) - int_size;
+                        if (tid < leaf_slot) {
+                            int sIdx = atomicAdd(&s_counter, 1);
+                            if (sIdx >= kMaxResPerBlock) {
+                                break;
+                            }
+                            s_buf[sIdx] = math::Vec2i(my_orig, ext_face[leaf_slot].w);
+                        }
                         st = escape;
                     } else {
                         st = lc;

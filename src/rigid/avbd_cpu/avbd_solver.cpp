@@ -9,7 +9,6 @@
 
 #include <cmath>
 #include <algorithm>
-#include <cstdio>
 #include <utility>
 #include <vector>
 
@@ -143,6 +142,9 @@ void Solver::clear() {
     while (forces) delete forces;
     while (bodies) delete bodies;
     has_ground_plane = false;
+    gpu_state_valid_ = false;
+    gpu_state_valid_prev_ = false;
+    prev_body_count_ = 0;
 }
 
 void Solver::defaultParams() {
@@ -177,9 +179,6 @@ void Solver::step() {
     if (!graph_coloring_gpu_) graph_coloring_gpu_ = new GraphColoringGPU();
     if (!broadphase_gpu_) {
         broadphase_gpu_ = new BroadphaseGPU();
-        int max_pairs = body_count * (body_count - 1) / 2;
-        if (max_pairs < 256) max_pairs = 256;
-        broadphase_gpu_->build(body_count, max_pairs);
     }
 
     // Decide whether we need a full CPU→GPU upload.
@@ -202,7 +201,6 @@ void Solver::step() {
             soa_.friction.data(),
             soa_.count);
     }
-    // else: GPU solver already has up-to-date state from last frame's solve()
 
 #ifdef AVBD_VALIDATE_BROADPHASE
     if (need_full_upload) {
@@ -236,9 +234,8 @@ void Solver::step() {
         gpu_solver_->quat_z_dev(), gpu_solver_->quat_w_dev(),
         gpu_solver_->half_x_dev(), gpu_solver_->half_y_dev(), gpu_solver_->half_z_dev(),
         gpu_solver_->mass_dev(),
-        body_count);
+                body_count);
 
-    // GPU narrowphase: run SAT on GPU for all broadphase pairs
     {
         int n_manifolds = 0, total_contacts = 0;
 
@@ -278,10 +275,8 @@ void Solver::step() {
         }
 
         if (n_manifolds > 0) {
-            // GPU warm-start (no D2H)
             narrowphase_gpu_->warmstart_gpu(n_manifolds, total_contacts, n_bodies_for_solver);
 
-            // Graph coloring for Gauss-Seidel parallelization
             const int* vtx_counts_dev = narrowphase_gpu_->vtx_counts_dev();
             const VertexEntry* vtx_table_dev = narrowphase_gpu_->vtx_table_dev();
             int vtx_stride = narrowphase_gpu_->vertex_table_stride();
@@ -291,7 +286,6 @@ void Solver::step() {
             int num_colors = coloring.num_colors;
             const int* colors_dev = graph_coloring_gpu_->colors_gpu();
 
-            // GPU solver: init bodies, colored GS iterations, velocity update
             gpu_solver_->solve(
                 narrowphase_gpu_->manifolds_dev(),
                 narrowphase_gpu_->contacts_dev(),

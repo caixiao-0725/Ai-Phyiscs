@@ -7,10 +7,10 @@
 #include "avbd_broadphase_gpu.h"
 
 #include <cuda_runtime.h>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <algorithm>
-#include <vector>
 
 namespace chysx {
 namespace avbd {
@@ -107,7 +107,8 @@ int BroadphaseGPU::query(
 {
     if (n_bodies <= 1) return 0;
     if (n_bodies > max_bodies_) {
-        int mp = std::min(n_bodies * 8, n_bodies * (n_bodies - 1) / 2);
+        int64_t n = n_bodies;
+        int mp = static_cast<int>(std::min(n * 8, n * (n - 1) / 2));
         if (mp < 256) mp = 256;
         build(n_bodies, mp);
     }
@@ -177,7 +178,8 @@ int BroadphaseGPU::query_gpu(
 {
     if (n_bodies <= 1) return 0;
     if (n_bodies > max_bodies_) {
-        int mp = std::min(n_bodies * 8, n_bodies * (n_bodies - 1) / 2);
+        int64_t n = n_bodies;
+        int mp = static_cast<int>(std::min(n * 8, n * (n - 1) / 2));
         if (mp < 256) mp = 256;
         build(n_bodies, mp);
     }
@@ -191,7 +193,6 @@ int BroadphaseGPU::query_gpu(
 
     bvh_.build(n_bodies, max_pairs_);
     bvh_.refit_full(aabbs_.gpu_data(), centers_.gpu_data());
-
     bvh_.query_self_aabb_full(aabbs_.gpu_data(), mass_dev);
 
     int count_host = 0;

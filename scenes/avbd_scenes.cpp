@@ -569,7 +569,7 @@ void setupPyramid(Solver* s) {
     s->clear();
     s->set_ground_plane(0.0f, 0.5f);
     float rho = 0.01f;
-    int SIZE_I = 1;
+    int SIZE_I = 10;
     int SIZE_J = 40;
     for(int i = 0; i < SIZE_I; i++){
         for(int j = 0; j < SIZE_J; j++){

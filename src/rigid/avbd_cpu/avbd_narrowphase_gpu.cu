@@ -427,10 +427,14 @@ __global__ void sat_narrowphase_kernel(
 
     // Atomically reserve space in the global contact array
     int coff = atomicAdd(contact_count, nc);
-    if (coff + nc > max_contacts) return;  // overflow guard
+    if (coff + nc > max_contacts) return;
 
     // Atomically reserve a manifold slot
     int midx = atomicAdd(manifold_count, 1);
+    if (midx >= max_contacts / MAX_CONTACTS) {
+        atomicAdd(contact_count, -nc);
+        return;
+    }
 
     for (int i = 0; i < nc; i++)
         contacts[coff + i] = localContacts[i];
@@ -537,6 +541,10 @@ __global__ void ground_plane_narrowphase_kernel(
     if (coff + nc > max_contacts) return;
 
     int midx = atomicAdd(manifold_count, 1);
+    if (midx >= max_contacts / MAX_CONTACTS) {
+        atomicAdd(contact_count, -nc);
+        return;
+    }
 
     for (int j = 0; j < nc; j++)
         contacts[coff + j] = localC[j];
@@ -776,8 +784,11 @@ void NarrowphaseGPU::query_gpu(
     n_manifolds_out = 0;
     n_contacts_out = 0;
 
-    if (n_pairs > max_pairs_)
-        build(n_pairs * 2);
+    // Size buffers for both broadphase pairs AND potential ground-plane contacts
+    // (up to n_bodies additional manifolds from append_ground_plane_gpu).
+    int needed = n_pairs + n_bodies;
+    if (needed > max_pairs_)
+        build(needed * 2);
 
     if (max_pairs_ == 0)
         build(256);

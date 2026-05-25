@@ -551,7 +551,7 @@ void GpuSolver::upload_bodies(
     const float* fric,
     int n)
 {
-    ensure_capacity(n);
+    ensure_capacity(n + 1);
     n_bodies_ = n;
     UPLOAD_ARRAY(pos_x_, px, n); UPLOAD_ARRAY(pos_y_, py, n); UPLOAD_ARRAY(pos_z_, pz, n);
     UPLOAD_ARRAY(quat_x_, qx, n); UPLOAD_ARRAY(quat_y_, qy, n);
