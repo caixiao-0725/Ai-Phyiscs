@@ -134,7 +134,6 @@ int BroadphaseGPU::query(
 
     bvh_.build(n_bodies, max_pairs_);
     bvh_.refit_full(aabbs_.gpu_data(), centers_.gpu_data());
-
     bvh_.query_self_aabb_full(aabbs_.gpu_data(), mass_.gpu_data());
 
     int count_host = 0;

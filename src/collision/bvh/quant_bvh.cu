@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -199,7 +200,12 @@ __global__ void calc_split_metric(int n,
                                   int*                 __restrict__ metric) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
-    metric[idx] = (idx != n - 1) ? (32 - __clz(codes[idx] ^ codes[idx + 1])) : 33;
+    if (idx == n - 1) { metric[idx] = 64 * n + idx; return; }
+    const std::uint32_t xor_val = codes[idx] ^ codes[idx + 1];
+    int primary = (xor_val != 0u)
+        ? (32 - __clz(xor_val)) + 31
+        : (-__clz(static_cast<std::uint32_t>(idx) ^ static_cast<std::uint32_t>(idx + 1))) + 31;
+    metric[idx] = primary * n + idx;
 }
 
 // ============================================================================
@@ -264,6 +270,7 @@ __global__ void build_int_nodes_kernel(
         atomicOr(&int_mark[cur], 0x00000001u);
         ext_mark[idx] = 0x00000003u;
     }
+    __threadfence();
 
     while (atomicAdd(&flag[cur], 1u) == 1u) {
         // Second arrival: merge child AABBs into `cur`.
@@ -540,14 +547,12 @@ __global__ void query_self_aabb_full_kernel(
     if (threadIdx.x == 0) s_counter = 0;
 
     int st = 0;
-    int visit_budget = 2 * (n_leaves + int_size);
 
     while (true) {
         __syncthreads();
 
         if (active) {
             while (st != -1) {
-                if (--visit_budget < 0) { st = -1; break; }
                 const FullBvhNode node = nodes[st];
 
                 bool hit = !(node.mx_x < bv.mn.x || node.mn_x > bv.mx.x ||
@@ -865,14 +870,12 @@ __global__ void query_self_aabb_kernel(
     if (threadIdx.x == 0) s_counter = 0;
 
     std::uint32_t st = 0u;
-    int visit_budget = 2 * (n_leaves + int_size);
 
     while (true) {
         __syncthreads();
 
         if (active) {
             while (st != QuantBvh::max_index) {
-                if (--visit_budget < 0) { st = QuantBvh::max_index; break; }
                 Ull2 node = nodes[st];
                 const std::uint32_t lc     = (std::uint32_t)(node.x >> QuantBvh::offset3);
                 const std::uint32_t escape = (std::uint32_t)(node.y >> QuantBvh::offset3);
@@ -1400,6 +1403,10 @@ void QuantBvh::refit_full(const Aabb*        leaf_aabbs,
         flag_.gpu_data(), 0u, N - 1);
     memset_uint_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
         int_mark_.gpu_data(), 0u, N - 1);
+    memset_int_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        int_lc_.gpu_data(), -1, N - 1);
+    memset_int_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        int_rc_.gpu_data(), -1, N - 1);
 
     build_int_nodes_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
         N, count_.gpu_data(), ext_lca_.gpu_data(), metric_.gpu_data(),

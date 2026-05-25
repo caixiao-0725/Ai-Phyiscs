@@ -576,7 +576,7 @@ void setupPyramid(Solver* s) {
             for (int y = 0; y < SIZE; y++)
                 for (int x = 0; x < SIZE - y; x++) {
                     new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
-                        { x * 1.01f + y * 0.5f - SIZE / 2.0f + i * 60.f, -4.0f*j, y * 0.5f });
+                        { x * 1.01f + y * 0.5f - SIZE / 2.0f + i * 55.f, -4.0f*j, y * 0.5f });
 
                 }
         }
