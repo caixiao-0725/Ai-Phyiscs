@@ -569,20 +569,18 @@ void setupPyramid(Solver* s) {
     s->clear();
     s->set_ground_plane(0.0f, 0.5f);
     float rho = 0.01f;
-    for (int y = 0; y < SIZE; y++)
-        for (int x = 0; x < SIZE - y; x++) {
-            new Rigid(s, { 1, 0.5f, 0.5f }, 0.01f + 0.001*(SIZE-y), 0.5f,
-                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 0.0f, y * 0.499f + 0.00f });
-            //new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
-            //    { x * 1.01f + y * 0.5f - SIZE / 2.0f, 2.0f, y * 0.5f + 0.01f });
-            //new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
-            //    { x * 1.01f + y * 0.5f - SIZE / 2.0f, -2.0f, y * 0.5f + 0.01f });
-            //new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
-            //    { x * 1.01f + y * 0.5f - SIZE / 2.0f, -4.0f, y * 0.5f + 0.01f });
-            //new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
-            //    { x * 1.01f + y * 0.5f - SIZE / 2.0f, 4.0f, y * 0.5f + 0.01f });
-        }
+    int SIZE_I = 1;
+    int SIZE_J = 40;
+    for(int i = 0; i < SIZE_I; i++){
+        for(int j = 0; j < SIZE_J; j++){
+            for (int y = 0; y < SIZE; y++)
+                for (int x = 0; x < SIZE - y; x++) {
+                    new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
+                        { x * 1.01f + y * 0.5f - SIZE / 2.0f + i * 60.f, -4.0f*j, y * 0.5f });
 
+                }
+        }
+    }
 }
 
 void setupRope(Solver* s) {

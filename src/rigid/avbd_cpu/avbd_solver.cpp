@@ -148,7 +148,7 @@ void Solver::clear() {
 void Solver::defaultParams() {
     dt = 1.0f / 60.0f;
     gravity = -10.0f;
-    iterations = 4;
+    iterations = 10;
     betaLin = 10000.0f;
     betaAng = 100.0f;
     alpha = 0.95f;

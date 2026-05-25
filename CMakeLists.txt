@@ -74,6 +74,7 @@ endif()
 
 set_target_properties(chysx_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
 )
 
@@ -102,6 +103,7 @@ target_link_libraries(chysx_scenes PUBLIC chysx_core)
 
 set_target_properties(chysx_scenes PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
 )
 
@@ -157,8 +159,6 @@ if(CHYSX_BUILD_SCENES)
     target_link_libraries(chysx_scene PRIVATE chysx_scenes)
 
     set_target_properties(chysx_scene PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
         LINKER_LANGUAGE CUDA
     )
 
@@ -213,8 +213,6 @@ if(CHYSX_BUILD_VIEWER)
     target_link_libraries(chysx_viewer PRIVATE OpenGL::GL)
 
     set_target_properties(chysx_viewer PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON
-        CUDA_RESOLVE_DEVICE_SYMBOLS ON
         LINKER_LANGUAGE CUDA
     )
 
