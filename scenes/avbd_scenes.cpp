@@ -17,6 +17,7 @@
 #include "rigid/avbd_cpu/avbd_gpu_solver.h"
 #include "rigid/avbd_cpu/avbd_gpu_renderer.h"
 
+#define _USE_MATH_DEFINES
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -160,6 +161,57 @@ public:
         glEnd();
     }
 
+    void drawSphereCollider() {
+        if (!solver_->has_sphere_collider) return;
+        float R = solver_->sphere_radius;
+        float spx, spy, spz, sqx, sqy, sqz, sqw;
+        int idx = solver_->soa_.count - 1;
+
+        if (solver_->gpu_state_valid_ && solver_->gpu_solver()) {
+            solver_->gpu_solver()->download_body_pose(
+                idx, spx, spy, spz, sqx, sqy, sqz, sqw);
+        } else {
+            Rigid* b = solver_->bodies;
+            while (b && b->next) b = b->next;
+            if (!b) return;
+            spx = b->positionLin.x; spy = b->positionLin.y; spz = b->positionLin.z;
+            sqx = b->positionAng.x; sqy = b->positionAng.y;
+            sqz = b->positionAng.z; sqw = b->positionAng.w;
+        }
+
+        constexpr int SLICES = 24, STACKS = 16;
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glColor4f(0.9f, 0.3f, 0.2f, 0.6f);
+        glEnable(GL_LIGHTING);
+
+        glBegin(GL_TRIANGLES);
+        for (int j = 0; j < STACKS; j++) {
+            float phi0  = M_PI * (float)j / STACKS - M_PI * 0.5f;
+            float phi1  = M_PI * (float)(j+1) / STACKS - M_PI * 0.5f;
+            float cp0 = cosf(phi0), sp0 = sinf(phi0);
+            float cp1 = cosf(phi1), sp1 = sinf(phi1);
+            for (int i = 0; i < SLICES; i++) {
+                float th0 = 2.0f * M_PI * (float)i / SLICES;
+                float th1 = 2.0f * M_PI * (float)(i+1) / SLICES;
+                float ct0 = cosf(th0), st0 = sinf(th0);
+                float ct1 = cosf(th1), st1 = sinf(th1);
+                float3 v00 = {cp0*ct0, cp0*st0, sp0};
+                float3 v10 = {cp1*ct0, cp1*st0, sp1};
+                float3 v01 = {cp0*ct1, cp0*st1, sp0};
+                float3 v11 = {cp1*ct1, cp1*st1, sp1};
+                auto emit = [&](float3 n) {
+                    glNormal3f(n.x, n.y, n.z);
+                    glVertex3f(spx + n.x*R, spy + n.y*R, spz + n.z*R);
+                };
+                emit(v00); emit(v10); emit(v11);
+                emit(v00); emit(v11); emit(v01);
+            }
+        }
+        glEnd();
+        glDisable(GL_BLEND);
+    }
+
     void draw_custom() override {
         // GPU path: all bodies rendered via VBO from CUDA-GL interop
         if (gpu_renderer_ && solver_->gpu_state_valid_ && gpu_renderer_->n_bodies() > 0) {
@@ -189,6 +241,7 @@ public:
 
             renderer->draw_triangles();
             drawGroundPlane();
+            drawSphereCollider();
             glDisable(GL_LIGHTING);
             glDisable(GL_POLYGON_OFFSET_FILL);
 
@@ -220,6 +273,7 @@ public:
             glDisable(GL_CULL_FACE);
 
             drawGroundPlane();
+            drawSphereCollider();
 
             for (const Rigid* body = solver_->bodies; body; body = body->next)
                 if (body->mass <= 0.0f)
@@ -329,13 +383,15 @@ private:
         if (!solver_->gpu_state_valid_ || !solver_->gpu_solver()) return;
         if (!gpu_renderer_)
             gpu_renderer_ = new GpuRenderer();
+        int render_count = solver_->soa_.count;
+        if (solver_->has_sphere_collider) render_count--;
         gpu_renderer_->update(
             *solver_->gpu_solver(),
             solver_->gpu_solver()->half_x_dev(),
             solver_->gpu_solver()->half_y_dev(),
             solver_->gpu_solver()->half_z_dev(),
             solver_->gpu_solver()->mass_dev(),
-            solver_->soa_.count);
+            render_count);
     }
 
     void releaseDrag() {
@@ -433,13 +489,15 @@ private:
         makeShadowMatrix(shadowMat, light, plane);
 
         // Update shadow VBO on GPU
+        int shadow_count = solver_->soa_.count;
+        if (solver_->has_sphere_collider) shadow_count--;
         renderer->update_shadows(
             *solver_->gpu_solver(),
             solver_->gpu_solver()->half_x_dev(),
             solver_->gpu_solver()->half_y_dev(),
             solver_->gpu_solver()->half_z_dev(),
             solver_->gpu_solver()->mass_dev(),
-            solver_->soa_.count, shadowMat);
+            shadow_count, shadowMat);
 
         GLboolean lightingWas = glIsEnabled(GL_LIGHTING);
         GLboolean polyOffWas  = glIsEnabled(GL_POLYGON_OFFSET_FILL);
@@ -568,7 +626,19 @@ void setupPyramid(Solver* s) {
     const int SIZE = 50;
     s->clear();
     s->set_ground_plane(0.0f, 0.5f);
-    float rho = 0.01f;
+
+    // Sphere collider (created FIRST so it ends up at SoA index = body_count-1)
+    const float R = 5.0f;
+    const float sphereDensity = 500.0f;
+    Rigid* sphere = new Rigid(s, {2*R, 2*R, 2*R}, sphereDensity, 0.5f,
+                              {-40.0f, 0.0f, R + 5.0f}, {15.0f, 0.0f, 0.0f});
+    float I = 0.4f * sphere->mass * R * R;
+    sphere->moment = {I, I, I};
+    s->has_sphere_collider = true;
+    s->sphere_radius = R;
+    s->sphere_friction = 0.5f;
+
+    float rho = 0.1f;
     int SIZE_I = 10;
     int SIZE_J = 40;
     for(int i = 0; i < SIZE_I; i++){
@@ -581,6 +651,21 @@ void setupPyramid(Solver* s) {
                 }
         }
     }
+}
+
+void setupPyramid2(Solver* s) {
+    const int SIZE = 20;
+    s->clear();
+    s->set_ground_plane(0.0f, 0.5f);
+
+    float rho = 1.0f;
+
+    for (int y = 0; y < SIZE; y++)
+        for (int x = 0; x < SIZE - y; x++) {
+            new Rigid(s, { 1, 0.5f, 0.5f }, rho, 0.5f,
+                { x * 1.01f + y * 0.5f - SIZE / 2.0f, 0.0f, y * 0.5f });
+        }
+
 }
 
 void setupRope(Solver* s) {
@@ -737,6 +822,7 @@ void setupSpring(Solver* s) {
 
 extern "C" void chysx_register_avbd_scenes() {
     register_scene("AVBD: Pyramid",    []() -> Scene* { return new AVBDScene("AVBD: Pyramid",    setupPyramid); });
+    register_scene("AVBD: Pyramid 2",  []() -> Scene* { return new AVBDScene("AVBD: Pyramid 2",  setupPyramid2); });
     register_scene("AVBD: Rope",       []() -> Scene* { return new AVBDScene("AVBD: Rope",       setupRope); });
     register_scene("AVBD: Heavy Rope", []() -> Scene* { return new AVBDScene("AVBD: Heavy Rope", setupHeavyRope); });
     register_scene("AVBD: Stack",      []() -> Scene* { return new AVBDScene("AVBD: Stack",      setupStack); });

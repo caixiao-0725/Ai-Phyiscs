@@ -16,7 +16,7 @@ namespace avbd {
 
 namespace {
 
-constexpr int kBlock = 128;
+constexpr int kBlock = 256;
 inline int grid(int n) { return (n + kBlock - 1) / kBlock; }
 
 inline void check(cudaError_t e, const char* w) {
@@ -728,6 +728,17 @@ void GpuSolver::download_positions(
     DOWNLOAD_ARRAY(vax, velang_x_, n); DOWNLOAD_ARRAY(vay, velang_y_, n); DOWNLOAD_ARRAY(vaz, velang_z_, n);
 }
 #undef DOWNLOAD_ARRAY
+
+void GpuSolver::download_body_pose(int idx,
+                                   float& px, float& py, float& pz,
+                                   float& qx, float& qy, float& qz, float& qw)
+{
+    auto d1 = [&](float& dst, CudaArray<float>& src) {
+        cudaMemcpy(&dst, src.gpu_data() + idx, sizeof(float), cudaMemcpyDeviceToHost);
+    };
+    d1(px, pos_x_); d1(py, pos_y_); d1(pz, pos_z_);
+    d1(qx, quat_x_); d1(qy, quat_y_); d1(qz, quat_z_); d1(qw, quat_w_);
+}
 
 }  // namespace avbd
 }  // namespace chysx

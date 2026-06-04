@@ -142,6 +142,9 @@ void Solver::clear() {
     while (forces) delete forces;
     while (bodies) delete bodies;
     has_ground_plane = false;
+    has_sphere_collider = false;
+    sphere_radius = 0.0f;
+    sphere_friction = 0.5f;
     gpu_state_valid_ = false;
     gpu_state_valid_prev_ = false;
     prev_body_count_ = 0;
@@ -219,6 +222,14 @@ void Solver::step() {
     }
 #endif
 
+    // Sphere body sits at the end of the SoA array; exclude from broadphase.
+    int broadphase_count = body_count;
+    int sphere_body_idx = -1;
+    if (has_sphere_collider) {
+        broadphase_count = body_count - 1;
+        sphere_body_idx = body_count - 1;
+    }
+
     // Set up ground body at index body_count (virtual n+1th body)
     int ground_body_idx = body_count;
     int n_bodies_for_solver = body_count;
@@ -234,7 +245,7 @@ void Solver::step() {
         gpu_solver_->quat_z_dev(), gpu_solver_->quat_w_dev(),
         gpu_solver_->half_x_dev(), gpu_solver_->half_y_dev(), gpu_solver_->half_z_dev(),
         gpu_solver_->mass_dev(),
-                body_count);
+                broadphase_count);
 
     {
         int n_manifolds = 0, total_contacts = 0;
@@ -269,8 +280,21 @@ void Solver::step() {
                 gpu_solver_->quat_z_dev(), gpu_solver_->quat_w_dev(),
                 gpu_solver_->half_x_dev(), gpu_solver_->half_y_dev(), gpu_solver_->half_z_dev(),
                 gpu_solver_->friction_dev(), gpu_solver_->mass_dev(),
-                body_count, ground_z, ground_friction,
+                broadphase_count, ground_z, ground_friction,
                 ground_body_idx,
+                n_manifolds, total_contacts);
+        }
+
+        // Append sphere-collider contacts (box-sphere + sphere-ground)
+        if (has_sphere_collider) {
+            narrowphase_gpu_->append_sphere_gpu(
+                gpu_solver_->pos_x_dev(), gpu_solver_->pos_y_dev(), gpu_solver_->pos_z_dev(),
+                gpu_solver_->quat_x_dev(), gpu_solver_->quat_y_dev(),
+                gpu_solver_->quat_z_dev(), gpu_solver_->quat_w_dev(),
+                gpu_solver_->half_x_dev(), gpu_solver_->half_y_dev(), gpu_solver_->half_z_dev(),
+                gpu_solver_->friction_dev(), gpu_solver_->mass_dev(),
+                broadphase_count, sphere_body_idx, sphere_radius, sphere_friction,
+                has_ground_plane, ground_z, ground_friction, ground_body_idx,
                 n_manifolds, total_contacts);
         }
 

@@ -54,7 +54,7 @@ namespace avbd {
 
 namespace {
 
-constexpr int kBlock = 128;
+constexpr int kBlock = 256;
 inline int grid(int n) { return (n + kBlock - 1) / kBlock; }
 
 inline void check(cudaError_t e, const char* w) {

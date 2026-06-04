@@ -17,7 +17,7 @@ namespace avbd {
 
 namespace {
 
-constexpr int kBlock = 128;
+constexpr int kBlock = 256;
 inline int grid(int n) { return (n + kBlock - 1) / kBlock; }
 
 inline void check(cudaError_t e, const char* w) {
@@ -571,6 +571,203 @@ __global__ void ground_plane_narrowphase_kernel(
 }
 
 // ---------------------------------------------------------------------------
+// Sphere narrowphase: one thread per box body tests box-sphere overlap.
+// Thread 0 also handles sphere-ground if enabled.
+// Feature key prefix: (4 << 24) for box-sphere, (5 << 24) for sphere-ground.
+// ---------------------------------------------------------------------------
+
+__global__ void sphere_narrowphase_kernel(
+    const float* __restrict__ px, const float* __restrict__ py, const float* __restrict__ pz,
+    const float* __restrict__ qx, const float* __restrict__ qy, const float* __restrict__ qz,
+    const float* __restrict__ qw,
+    const float* __restrict__ hx, const float* __restrict__ hy, const float* __restrict__ hz,
+    const float* __restrict__ fric,
+    const float* __restrict__ mass,
+    int n_box_bodies,
+    int sphere_body_idx,
+    float sphere_radius,
+    float sphere_friction,
+    bool has_ground,
+    float ground_z,
+    float ground_friction,
+    int ground_body_idx,
+    GpuManifold* __restrict__ manifolds,
+    GpuContact*  __restrict__ contacts,
+    int* __restrict__ manifold_count,
+    int* __restrict__ contact_count,
+    int max_contacts,
+    int* __restrict__ vtx_counts,
+    VertexEntry* __restrict__ vtx_table,
+    int vtx_stride)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    // Thread 0 handles sphere-ground contact
+    if (i == 0 && has_ground) {
+        F3 sc = {px[sphere_body_idx], py[sphere_body_idx], pz[sphere_body_idx]};
+        Q4 sq = {qx[sphere_body_idx], qy[sphere_body_idx], qz[sphere_body_idx], qw[sphere_body_idx]};
+        constexpr float kMargin = 0.02f;
+        float dist = sc.z - sphere_radius - ground_z;
+        if (dist < kMargin) {
+            F3 normal = f3(0, 0, 1);
+            F3 contactOnSphere = f3(sc.x, sc.y, sc.z - sphere_radius);
+            F3 contactOnGround = f3(sc.x, sc.y, ground_z);
+
+            Q4 invSQ = qconj(sq);
+            F3 rA = qrot(invSQ, contactOnSphere - sc);
+            F3 rB = contactOnGround - f3(0, 0, ground_z);
+
+            GpuContact ct;
+            ct.feature_key = (5 << 24);
+            ct.rA_x = rA.x; ct.rA_y = rA.y; ct.rA_z = rA.z;
+            ct.rB_x = rB.x; ct.rB_y = rB.y; ct.rB_z = rB.z;
+            ct.lambda_x = 0; ct.lambda_y = 0; ct.lambda_z = 0;
+            ct.penalty_x = 1; ct.penalty_y = 1; ct.penalty_z = 1;
+            ct.C0_x = 0; ct.C0_y = 0; ct.C0_z = 0;
+            ct.stick = 0;
+
+            int coff = atomicAdd(contact_count, 1);
+            if (coff < max_contacts) {
+                int midx = atomicAdd(manifold_count, 1);
+                if (midx < max_contacts / MAX_CONTACTS) {
+                    contacts[coff] = ct;
+                    GpuManifold& m = manifolds[midx];
+                    m.body_a = sphere_body_idx;
+                    m.body_b = ground_body_idx;
+                    m.num_contacts = 1;
+                    m.contact_offset = coff;
+                    m.friction = sqrtf(sphere_friction * ground_friction);
+                    orthonormalBasis(normal, m.basis);
+
+                    int slotA = atomicAdd(&vtx_counts[sphere_body_idx], 1);
+                    if (slotA < vtx_stride) {
+                        vtx_table[sphere_body_idx * vtx_stride + slotA].other_body = ground_body_idx;
+                        vtx_table[sphere_body_idx * vtx_stride + slotA].manifold_idx = midx;
+                    }
+                    int slotB = atomicAdd(&vtx_counts[ground_body_idx], 1);
+                    if (slotB < vtx_stride) {
+                        vtx_table[ground_body_idx * vtx_stride + slotB].other_body = sphere_body_idx;
+                        vtx_table[ground_body_idx * vtx_stride + slotB].manifold_idx = midx;
+                    }
+                } else {
+                    atomicAdd(contact_count, -1);
+                }
+            }
+        }
+    }
+
+    // Each thread handles one box body vs the sphere
+    if (i >= n_box_bodies) return;
+    if (mass[i] <= 0.0f) return;
+
+    F3 sc = {px[sphere_body_idx], py[sphere_body_idx], pz[sphere_body_idx]};
+    Q4 sq = {qx[sphere_body_idx], qy[sphere_body_idx], qz[sphere_body_idx], qw[sphere_body_idx]};
+
+    F3 boxCen = {px[i], py[i], pz[i]};
+    Q4 boxQ   = {qx[i], qy[i], qz[i], qw[i]};
+    F3 half   = {hx[i], hy[i], hz[i]};
+
+    Q4 invBoxQ = qconj(boxQ);
+    F3 sLocal = qrot(invBoxQ, sc - boxCen);
+
+    F3 closest;
+    closest.x = clampf(sLocal.x, -half.x, half.x);
+    closest.y = clampf(sLocal.y, -half.y, half.y);
+    closest.z = clampf(sLocal.z, -half.z, half.z);
+
+    F3 delta = sLocal - closest;
+    float distSq = lengthSq(delta);
+
+    constexpr float kMargin = 0.02f;
+    float threshold = sphere_radius + kMargin;
+
+    F3 normalWorld;
+    float penetration;
+    F3 contactOnBox_world;
+    F3 contactOnSphere_world;
+
+    if (distSq < 1e-8f) {
+        // Sphere center inside box: find shallowest penetration axis
+        float minPen = 1e30f;
+        int bestAxis = 0;
+        float bestSign = 1.0f;
+        for (int a = 0; a < 3; a++) {
+            float dplus  = half[a] - sLocal[a];
+            float dminus = half[a] + sLocal[a];
+            if (dplus < minPen) { minPen = dplus;  bestAxis = a; bestSign =  1.0f; }
+            if (dminus < minPen) { minPen = dminus; bestAxis = a; bestSign = -1.0f; }
+        }
+        F3 normalLocal = f3(0, 0, 0);
+        normalLocal[bestAxis] = bestSign;
+        normalWorld = qrot(boxQ, normalLocal);
+        penetration = minPen + sphere_radius;
+
+        F3 facePoint = sLocal;
+        facePoint[bestAxis] = bestSign * half[bestAxis];
+        contactOnBox_world = boxCen + qrot(boxQ, facePoint);
+        contactOnSphere_world = sc - normalWorld * sphere_radius;
+    } else {
+        float dist = sqrtf(distSq);
+        if (dist >= threshold) return;
+
+        F3 normalLocal = delta * (1.0f / dist);
+        normalWorld = qrot(boxQ, normalLocal);
+        penetration = sphere_radius - dist;
+
+        contactOnBox_world = boxCen + qrot(boxQ, closest);
+        contactOnSphere_world = sc - normalWorld * sphere_radius;
+    }
+
+    if (penetration < -kMargin) return;
+
+    Q4 invBoxQ2 = qconj(boxQ);
+    Q4 invSQ = qconj(sq);
+    F3 rA = qrot(invBoxQ2, contactOnBox_world - boxCen);
+    F3 rB = qrot(invSQ, contactOnSphere_world - sc);
+
+    GpuContact ct;
+    ct.feature_key = (4 << 24) | (i & 0xFFFFFF);
+    ct.rA_x = rA.x; ct.rA_y = rA.y; ct.rA_z = rA.z;
+    ct.rB_x = rB.x; ct.rB_y = rB.y; ct.rB_z = rB.z;
+    ct.lambda_x = 0; ct.lambda_y = 0; ct.lambda_z = 0;
+    ct.penalty_x = 1; ct.penalty_y = 1; ct.penalty_z = 1;
+    ct.C0_x = 0; ct.C0_y = 0; ct.C0_z = 0;
+    ct.stick = 0;
+
+    int coff = atomicAdd(contact_count, 1);
+    if (coff >= max_contacts) return;
+
+    int midx = atomicAdd(manifold_count, 1);
+    if (midx >= max_contacts / MAX_CONTACTS) {
+        atomicAdd(contact_count, -1);
+        return;
+    }
+
+    contacts[coff] = ct;
+
+    GpuManifold& m = manifolds[midx];
+    m.body_a = i;
+    m.body_b = sphere_body_idx;
+    m.num_contacts = 1;
+    m.contact_offset = coff;
+    m.friction = sqrtf(fric[i] * sphere_friction);
+
+    // Normal points from box (A) toward sphere (B)
+    orthonormalBasis(-normalWorld, m.basis);
+
+    int slotA = atomicAdd(&vtx_counts[i], 1);
+    if (slotA < vtx_stride) {
+        vtx_table[i * vtx_stride + slotA].other_body = sphere_body_idx;
+        vtx_table[i * vtx_stride + slotA].manifold_idx = midx;
+    }
+    int slotB = atomicAdd(&vtx_counts[sphere_body_idx], 1);
+    if (slotB < vtx_stride) {
+        vtx_table[sphere_body_idx * vtx_stride + slotB].other_body = i;
+        vtx_table[sphere_body_idx * vtx_stride + slotB].manifold_idx = midx;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Warm-start kernel: match current contacts against previous frame
 // ---------------------------------------------------------------------------
 
@@ -881,6 +1078,55 @@ void NarrowphaseGPU::append_ground_plane_gpu(
                      cudaMemcpyDeviceToHost), "manifold_count D2H (ground)");
     check(cudaMemcpy(&n_contacts, contact_count_.gpu_data(), sizeof(int),
                      cudaMemcpyDeviceToHost), "contact_count D2H (ground)");
+
+    n_manifolds_inout = min(n_manifolds, max_pairs_);
+    n_contacts_inout = min(n_contacts, max_contacts);
+}
+
+void NarrowphaseGPU::append_sphere_gpu(
+    const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+    const float* quat_x_dev, const float* quat_y_dev,
+    const float* quat_z_dev, const float* quat_w_dev,
+    const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+    const float* friction_dev, const float* mass_dev,
+    int n_box_bodies, int sphere_body_idx,
+    float sphere_radius, float sphere_friction,
+    bool has_ground, float ground_z, float ground_friction,
+    int ground_body_idx,
+    int& n_manifolds_inout, int& n_contacts_inout)
+{
+    if (n_box_bodies <= 0) return;
+
+    int max_contacts = max_pairs_ * MAX_CONTACTS;
+
+    sphere_narrowphase_kernel<<<grid(n_box_bodies), kBlock>>>(
+        pos_x_dev, pos_y_dev, pos_z_dev,
+        quat_x_dev, quat_y_dev, quat_z_dev, quat_w_dev,
+        half_x_dev, half_y_dev, half_z_dev,
+        friction_dev, mass_dev,
+        n_box_bodies,
+        sphere_body_idx,
+        sphere_radius,
+        sphere_friction,
+        has_ground,
+        ground_z,
+        ground_friction,
+        ground_body_idx,
+        manifolds_.gpu_data(),
+        contacts_.gpu_data(),
+        manifold_count_.gpu_data(),
+        contact_count_.gpu_data(),
+        max_contacts,
+        vtx_counts_.gpu_data(),
+        vtx_table_.gpu_data(),
+        VERTEX_TABLE_MAX_NEIGHBORS);
+    check(cudaGetLastError(), "sphere_narrowphase_kernel launch");
+
+    int n_manifolds = 0, n_contacts = 0;
+    check(cudaMemcpy(&n_manifolds, manifold_count_.gpu_data(), sizeof(int),
+                     cudaMemcpyDeviceToHost), "manifold_count D2H (sphere)");
+    check(cudaMemcpy(&n_contacts, contact_count_.gpu_data(), sizeof(int),
+                     cudaMemcpyDeviceToHost), "contact_count D2H (sphere)");
 
     n_manifolds_inout = min(n_manifolds, max_pairs_);
     n_contacts_inout = min(n_contacts, max_contacts);

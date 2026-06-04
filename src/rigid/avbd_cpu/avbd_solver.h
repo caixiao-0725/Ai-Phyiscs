@@ -192,6 +192,13 @@ struct Solver {
         ground_friction = friction;
     }
 
+    // Sphere collider: a dynamic body that bypasses broadphase.
+    // The sphere Rigid must be created FIRST so it sits at the end of
+    // the packed SoA (index = body_count - 1).
+    bool  has_sphere_collider = false;
+    float sphere_radius = 0.0f;
+    float sphere_friction = 0.5f;
+
     Rigid* bodies;
     Force* forces;
 

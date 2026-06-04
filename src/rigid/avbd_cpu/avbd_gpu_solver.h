@@ -83,6 +83,11 @@ public:
     float* friction_dev() { return friction_.gpu_data(); }
     int body_count() const { return n_bodies_; }
 
+    /// Download position and quaternion of a single body from the GPU.
+    void download_body_pose(int idx,
+                            float& px, float& py, float& pz,
+                            float& qx, float& qy, float& qz, float& qw);
+
     /// Set up the ground body at slot n_bodies (the virtual n+1th body).
     /// Must be called after upload_bodies or after solve() leaves state valid.
     /// Ensures capacity includes the extra slot, writes mass=0, pos=(0,0,ground_z),

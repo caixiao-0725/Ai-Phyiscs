@@ -1,4 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
+
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures")
+endif()
+
 project(chysx LANGUAGES CXX CUDA)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -18,6 +23,7 @@ add_library(chysx_core STATIC
     src/memory/cuda_array.cu
     src/sparse/block_csr.cu
     src/solver/pcg_solver.cu
+    src/solver/vbd_solver.cu
 
     src/collision/bvh/lbvh.cu
     src/collision/bvh/quant_bvh.cu
@@ -29,6 +35,7 @@ add_library(chysx_core STATIC
     src/collision/mesh_contact.cu
     src/collision/sdf/sdf_volume.cu
     src/collision/sdf/sdf_contact.cu
+    src/collision/collision_pipeline.cu
 
     src/constraint/cloth/pin_constraint.cu
     src/constraint/cloth/spring_constraint.cu
@@ -36,6 +43,7 @@ add_library(chysx_core STATIC
     src/constraint/cloth/bending_constraint.cu
     src/constraint/collision/self_collision_constraint.cu
     src/constraint/collision/untangle_constraint.cu
+    src/constraint/softbody/tet_fem_constraint.cu
 
     src/rigid/newton_avbd/avbd_kernels.cu
     src/rigid/newton_avbd/contact_matching.cu
@@ -56,7 +64,12 @@ add_library(chysx_core STATIC
     src/rigid/avbd_cpu/avbd_graph_coloring.cu
     src/rigid/avbd_cpu/avbd_gpu_solver.cu
 
+    src/rigid/featherstone/featherstone_solver.cu
+
+    src/ik/ik_solver.cu
+
     src/cloth/cloth_simulator.cu
+    src/coupled/coupled_simulator.cu
 )
 
 target_include_directories(chysx_core PUBLIC src)

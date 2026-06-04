@@ -98,6 +98,22 @@ public:
         int ground_body_idx,
         int& n_manifolds_inout, int& n_contacts_inout);
 
+    /// Append sphere-collider contacts to existing narrowphase results.
+    /// Must be called after query_gpu() (and optionally after append_ground_plane_gpu)
+    /// and before warmstart.  Generates box-sphere contacts for all n_box_bodies,
+    /// plus an optional sphere-ground contact.
+    void append_sphere_gpu(
+        const float* pos_x_dev, const float* pos_y_dev, const float* pos_z_dev,
+        const float* quat_x_dev, const float* quat_y_dev,
+        const float* quat_z_dev, const float* quat_w_dev,
+        const float* half_x_dev, const float* half_y_dev, const float* half_z_dev,
+        const float* friction_dev, const float* mass_dev,
+        int n_box_bodies, int sphere_body_idx,
+        float sphere_radius, float sphere_friction,
+        bool has_ground, float ground_z, float ground_friction,
+        int ground_body_idx,
+        int& n_manifolds_inout, int& n_contacts_inout);
+
     /// Save current frame's GPU data as "previous frame" for next frame's warm-start.
     /// Call this AFTER the solver loop, with final contact state uploaded.
     void snapshot_for_next_frame(int n_manifolds, int n_contacts, int n_bodies);
