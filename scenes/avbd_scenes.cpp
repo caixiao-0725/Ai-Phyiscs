@@ -630,13 +630,13 @@ void setupPyramid(Solver* s) {
     // Sphere collider (created FIRST so it ends up at SoA index = body_count-1)
     const float R = 5.0f;
     const float sphereDensity = 500.0f;
-    Rigid* sphere = new Rigid(s, {2*R, 2*R, 2*R}, sphereDensity, 0.5f,
-                              {-40.0f, 0.0f, R + 5.0f}, {15.0f, 0.0f, 0.0f});
-    float I = 0.4f * sphere->mass * R * R;
-    sphere->moment = {I, I, I};
-    s->has_sphere_collider = true;
-    s->sphere_radius = R;
-    s->sphere_friction = 0.5f;
+    //Rigid* sphere = new Rigid(s, {2*R, 2*R, 2*R}, sphereDensity, 0.5f,
+    //                          {-40.0f, 0.0f, R + 5.0f}, {15.0f, 0.0f, 0.0f});
+    //float I = 0.4f * sphere->mass * R * R;
+    //sphere->moment = {I, I, I};
+    //s->has_sphere_collider = true;
+    //s->sphere_radius = R;
+    //s->sphere_friction = 0.5f;
 
     float rho = 0.1f;
     int SIZE_I = 10;
