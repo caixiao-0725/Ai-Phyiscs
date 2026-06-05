@@ -13,13 +13,12 @@ Manifold::Manifold(Solver* solver, Rigid* bodyA, Rigid* bodyB)
 
 bool Manifold::initialize() {
     friction = std::sqrt(bodyA->friction * bodyB->friction);
+    RotationMode rmode = solver->rotation_mode;
 
     Contact newContacts[8] = {};
     int newNumContacts;
 
     if (gpu_num_contacts_ >= 0) {
-        // GPU path: contacts have warm-start data from GPU warmstart kernel
-        // (raw post-solver values from prev frame, matched by feature_key).
         newNumContacts = gpu_num_contacts_;
         for (int i = 0; i < newNumContacts; i++)
             newContacts[i] = gpu_new_contacts_[i];
@@ -28,7 +27,6 @@ bool Manifold::initialize() {
     } else {
         newNumContacts = collide(bodyA, bodyB, newContacts, basis);
 
-        // CPU warm-start matching (only for CPU narrowphase path)
         for (int i = 0; i < newNumContacts; i++) {
             for (int j = 0; j < numContacts; j++) {
                 if (newContacts[i].feature.key == contacts[j].feature.key) {
@@ -50,11 +48,10 @@ bool Manifold::initialize() {
         contacts[i] = newContacts[i];
 
     for (int i = 0; i < numContacts; i++) {
-        float3 xA = transform(bodyA->positionLin, bodyA->positionAng, contacts[i].rA);
-        float3 xB = transform(bodyB->positionLin, bodyB->positionAng, contacts[i].rB);
+        float3 xA = bodyA->transformVec(contacts[i].rA, rmode);
+        float3 xB = bodyB->transformVec(contacts[i].rB, rmode);
         contacts[i].C0 = basis * (xA - xB) + float3{AVBD_COLLISION_MARGIN, 0, 0};
 
-        // Scale lambda and penalty (both CPU and GPU paths transfer raw values)
         contacts[i].lambda = contacts[i].lambda * solver->alpha * solver->gamma;
         contacts[i].penalty = clamp(contacts[i].penalty * solver->gamma, AVBD_PENALTY_MIN, AVBD_PENALTY_MAX);
     }
@@ -65,14 +62,24 @@ bool Manifold::initialize() {
 void Manifold::updatePrimal(Rigid* body, float alpha,
                             float3x3& lhsLin, float3x3& lhsAng, float3x3& lhsCross,
                             float3& rhsLin, float3& rhsAng) {
+    RotationMode rmode = solver->rotation_mode;
+
     float3 dqALin = bodyA->positionLin - bodyA->initialLin;
-    float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
     float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
-    float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
+
+    // Angular displacement depends on rotation mode
+    float3 dqAAng, dqBAng;
+    if (rmode == RotationMode::Affine) {
+        dqAAng = mat_to_angular(bodyA->affine, bodyA->initialAff);
+        dqBAng = mat_to_angular(bodyB->affine, bodyB->initialAff);
+    } else {
+        dqAAng = bodyA->positionAng - bodyA->initialAng;
+        dqBAng = bodyB->positionAng - bodyB->initialAng;
+    }
 
     for (int i = 0; i < numContacts; i++) {
-        float3 rAWorld = rotate(bodyA->positionAng, contacts[i].rA);
-        float3 rBWorld = rotate(bodyB->positionAng, contacts[i].rB);
+        float3 rAWorld = bodyA->rotateVec(contacts[i].rA, rmode);
+        float3 rBWorld = bodyB->rotateVec(contacts[i].rB, rmode);
 
         float3x3 jALin = basis;
         float3x3 jBLin = -basis;
@@ -109,14 +116,23 @@ void Manifold::updatePrimal(Rigid* body, float alpha,
 }
 
 void Manifold::updateDual(float alpha) {
+    RotationMode rmode = solver->rotation_mode;
+
     float3 dqALin = bodyA->positionLin - bodyA->initialLin;
-    float3 dqAAng = bodyA->positionAng - bodyA->initialAng;
     float3 dqBLin = bodyB->positionLin - bodyB->initialLin;
-    float3 dqBAng = bodyB->positionAng - bodyB->initialAng;
+
+    float3 dqAAng, dqBAng;
+    if (rmode == RotationMode::Affine) {
+        dqAAng = mat_to_angular(bodyA->affine, bodyA->initialAff);
+        dqBAng = mat_to_angular(bodyB->affine, bodyB->initialAff);
+    } else {
+        dqAAng = bodyA->positionAng - bodyA->initialAng;
+        dqBAng = bodyB->positionAng - bodyB->initialAng;
+    }
 
     for (int i = 0; i < numContacts; i++) {
-        float3 rAWorld = rotate(bodyA->positionAng, contacts[i].rA);
-        float3 rBWorld = rotate(bodyB->positionAng, contacts[i].rB);
+        float3 rAWorld = bodyA->rotateVec(contacts[i].rA, rmode);
+        float3 rBWorld = bodyB->rotateVec(contacts[i].rB, rmode);
 
         float3x3 jALin = basis;
         float3x3 jBLin = -basis;

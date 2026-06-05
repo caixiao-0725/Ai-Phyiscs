@@ -261,5 +261,157 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross,
     xLin[0] = z1 - L21 * xLin[1] - L31 * xLin[2] - L41 * xAng[0] - L51 * xAng[1] - L61 * xAng[2];
 }
 
+// ---- Affine rotation mode utilities ----
+
+enum class RotationMode { AxisAngle, Affine };
+
+inline float3x3 identity3x3() {
+    return float3x3{1, 0, 0, 0, 1, 0, 0, 0, 1};
+}
+
+inline float frobenius_sq(float3x3 m) {
+    float s = 0;
+    for (int i = 0; i < 3; i++)
+        for (int j = 0; j < 3; j++)
+            s += m[i][j] * m[i][j];
+    return s;
+}
+
+inline float determinant(float3x3 m) {
+    return m[0][0] * (m[1][1]*m[2][2] - m[1][2]*m[2][1])
+         - m[0][1] * (m[1][0]*m[2][2] - m[1][2]*m[2][0])
+         + m[0][2] * (m[1][0]*m[2][1] - m[1][1]*m[2][0]);
+}
+
+inline float3x3 inverse3x3(float3x3 m) {
+    float d = determinant(m);
+    if (std::fabs(d) < 1e-12f) return identity3x3();
+    float invd = 1.0f / d;
+    float3x3 r;
+    r[0][0] = (m[1][1]*m[2][2] - m[1][2]*m[2][1]) * invd;
+    r[0][1] = (m[0][2]*m[2][1] - m[0][1]*m[2][2]) * invd;
+    r[0][2] = (m[0][1]*m[1][2] - m[0][2]*m[1][1]) * invd;
+    r[1][0] = (m[1][2]*m[2][0] - m[1][0]*m[2][2]) * invd;
+    r[1][1] = (m[0][0]*m[2][2] - m[0][2]*m[2][0]) * invd;
+    r[1][2] = (m[0][2]*m[1][0] - m[0][0]*m[1][2]) * invd;
+    r[2][0] = (m[1][0]*m[2][1] - m[1][1]*m[2][0]) * invd;
+    r[2][1] = (m[0][1]*m[2][0] - m[0][0]*m[2][1]) * invd;
+    r[2][2] = (m[0][0]*m[1][1] - m[0][1]*m[1][0]) * invd;
+    return r;
+}
+
+// Polar decomposition: extract rotation R from general matrix M = R * S.
+// Uses iterative averaging: R_{k+1} = 0.5 * (R_k + R_k^{-T}).
+inline float3x3 polar_rotation(float3x3 m, int max_iter = 20, float tol = 1e-6f) {
+    float3x3 R = m;
+    for (int i = 0; i < max_iter; i++) {
+        float3x3 Rit = transpose(inverse3x3(R));
+        float3x3 Rnew = (R + Rit) * 0.5f;
+        float diff = frobenius_sq(Rnew - R);
+        R = Rnew;
+        if (diff < tol * tol) break;
+    }
+    if (determinant(R) < 0) R = -R;
+    return R;
+}
+
+// Matrix → angular velocity via antisymmetric part: ω = vee(R_new * R_old^T - I)
+inline float3 mat_to_angular(float3x3 Rnew, float3x3 Rold) {
+    float3x3 dR = Rnew * transpose(Rold);
+    return float3{
+        0.5f * (dR[2][1] - dR[1][2]),
+        0.5f * (dR[0][2] - dR[2][0]),
+        0.5f * (dR[1][0] - dR[0][1])
+    };
+}
+
+// Matrix difference (9D flattened difference for Hessian RHS)
+inline float3x3 mat_diff(float3x3 a, float3x3 b) {
+    return a - b;
+}
+
+// quat → rotation matrix (already defined as rotation())
+// rotation matrix → quat
+inline quat mat_to_quat(float3x3 R) {
+    float tr = R[0][0] + R[1][1] + R[2][2];
+    quat q;
+    if (tr > 0) {
+        float s = std::sqrt(tr + 1.0f) * 2.0f;
+        q.w = 0.25f * s;
+        q.x = (R[2][1] - R[1][2]) / s;
+        q.y = (R[0][2] - R[2][0]) / s;
+        q.z = (R[1][0] - R[0][1]) / s;
+    } else if (R[0][0] > R[1][1] && R[0][0] > R[2][2]) {
+        float s = std::sqrt(1.0f + R[0][0] - R[1][1] - R[2][2]) * 2.0f;
+        q.w = (R[2][1] - R[1][2]) / s;
+        q.x = 0.25f * s;
+        q.y = (R[0][1] + R[1][0]) / s;
+        q.z = (R[0][2] + R[2][0]) / s;
+    } else if (R[1][1] > R[2][2]) {
+        float s = std::sqrt(1.0f + R[1][1] - R[0][0] - R[2][2]) * 2.0f;
+        q.w = (R[0][2] - R[2][0]) / s;
+        q.x = (R[0][1] + R[1][0]) / s;
+        q.y = 0.25f * s;
+        q.z = (R[1][2] + R[2][1]) / s;
+    } else {
+        float s = std::sqrt(1.0f + R[2][2] - R[0][0] - R[1][1]) * 2.0f;
+        q.w = (R[1][0] - R[0][1]) / s;
+        q.x = (R[0][2] + R[2][0]) / s;
+        q.y = (R[1][2] + R[2][1]) / s;
+        q.z = 0.25f * s;
+    }
+    return normalize(q);
+}
+
+// 12×12 solver via Schur complement for affine mode.
+// The system is [A B; C D] [x_c; x_A] = [b_c; b_A]
+// where x_c ∈ R³ (translation), x_A ∈ R⁹ (matrix rows flattened).
+// In practice we use the sum-based approach from PABD.
+struct AffineSchurSolver {
+    float sum0;         // scalar sum of alpha
+    float3 sumB, sumC;  // 3D sum vectors
+    float3x3 sumD;      // 3×3 sum outer-product matrix
+
+    float mat1A;
+    float3 mat1B, mat1C;
+    float3x3 mat1D;
+
+    void reset() {
+        sum0 = 0;
+        sumB = sumC = float3{0,0,0};
+        sumD = float3x3{0,0,0, 0,0,0, 0,0,0};
+    }
+
+    // Accumulate constraint contribution to Schur complement.
+    // alpha_c = h^2 * stiffness weight, r = body-local lever arm
+    void accumulate(float alpha_c, float3 r) {
+        sum0 += alpha_c;
+        float3 ar = r * alpha_c;
+        sumB = sumB + ar;
+        sumC = sumC + ar;
+        sumD += outer(r, r) * alpha_c;
+    }
+
+    // Factor the Schur complement inverse: M^{-1} = [a b^T; c D]
+    void factor(float mass, float3x3 inertia) {
+        float k = mass + sum0;
+        if (k < 1e-12f) k = 1e-12f;
+        float3 B = sumB / k;
+        float3 C = sumC / k;
+        float3x3 S = (inertia + sumD) / k - outer(C, B);
+        float3x3 Sinv = inverse3x3(S * k) * k;
+        mat1D = Sinv / k;
+        mat1C = Sinv * C * (-1.0f / k);
+        mat1B = transpose(Sinv) * B * (-1.0f / k);
+        mat1A = (1.0f + dot(B, Sinv * C)) / k;
+    }
+
+    // Solve: given RHS source (srcC ∈ R³, srcA ∈ R^{3×3}), compute update
+    void solve_update(float3 srcC, float3x3 srcA, float3& dxLin, float3x3& dxAff) {
+        dxLin = srcC * mat1A + srcA * mat1B;
+        dxAff = outer(srcC, mat1C) + srcA * transpose(mat1D);
+    }
+};
+
 }  // namespace avbd
 }  // namespace chysx

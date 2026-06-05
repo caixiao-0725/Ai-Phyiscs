@@ -30,9 +30,18 @@ Joint::Joint(Solver* solver, Rigid* bodyA, Rigid* bodyB,
 }
 
 bool Joint::initialize() {
-    C0Lin = (bodyA ? transform(bodyA->positionLin, bodyA->positionAng, rA) : rA) -
-            transform(bodyB->positionLin, bodyB->positionAng, rB);
-    C0Ang = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+    RotationMode rmode = solver->rotation_mode;
+
+    C0Lin = (bodyA ? bodyA->transformVec(rA, rmode) : rA) -
+            bodyB->transformVec(rB, rmode);
+
+    if (rmode == RotationMode::Affine) {
+        float3x3 qA = bodyA ? bodyA->affine : identity3x3();
+        float3x3 qB = bodyB->affine;
+        C0Ang = mat_to_angular(qA, qB) * torqueArm;
+    } else {
+        C0Ang = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+    }
 
     lambdaLin = lambdaLin * solver->alpha * solver->gamma;
     lambdaAng = lambdaAng * solver->alpha * solver->gamma;
@@ -48,10 +57,12 @@ bool Joint::initialize() {
 void Joint::updatePrimal(Rigid* body, float alpha,
                          float3x3& lhsLin, float3x3& lhsAng, float3x3& lhsCross,
                          float3& rhsLin, float3& rhsAng) {
+    RotationMode rmode = solver->rotation_mode;
+
     if (lengthSq(penaltyLin) > 0) {
         float3x3 K = diagonal(penaltyLin.x, penaltyLin.y, penaltyLin.z);
-        float3 C = (bodyA ? transform(bodyA->positionLin, bodyA->positionAng, rA) : rA) -
-                   transform(bodyB->positionLin, bodyB->positionAng, rB);
+        float3 C = (bodyA ? bodyA->transformVec(rA, rmode) : rA) -
+                   bodyB->transformVec(rB, rmode);
 
         if (std::isinf(stiffnessLin))
             C -= C0Lin * alpha;
@@ -60,8 +71,8 @@ void Joint::updatePrimal(Rigid* body, float alpha,
 
         float3x3 jLin = body == bodyA ?
             float3x3{1, 0, 0, 0, 1, 0, 0, 0, 1} : float3x3{-1, 0, 0, 0, -1, 0, 0, 0, -1};
-        float3x3 jAng = body == bodyA ?
-            skew(-rotate(bodyA->positionAng, rA)) : skew(rotate(bodyB->positionAng, rB));
+        float3 rWorld = body == bodyA ? bodyA->rotateVec(rA, rmode) : bodyB->rotateVec(rB, rmode);
+        float3x3 jAng = body == bodyA ? skew(-rWorld) : skew(rWorld);
 
         float3x3 jLinT = transpose(jLin);
         float3x3 jAngT = transpose(jAng);
@@ -71,7 +82,7 @@ void Joint::updatePrimal(Rigid* body, float alpha,
         lhsAng += jAngTk * jAng;
         lhsCross += jAngTk * jLin;
 
-        float3 r = body == bodyA ? rotate(bodyA->positionAng, rA) : -rotate(bodyB->positionAng, rB);
+        float3 r = body == bodyA ? bodyA->rotateVec(rA, rmode) : bodyB->rotateVec(rB, rmode) * (-1.0f);
         float3x3 H =
             geometricStiffnessBallSocket(0, r) * F[0] +
             geometricStiffnessBallSocket(1, r) * F[1] +
@@ -84,7 +95,14 @@ void Joint::updatePrimal(Rigid* body, float alpha,
 
     if (lengthSq(penaltyAng) > 0) {
         float3x3 K = diagonal(penaltyAng.x, penaltyAng.y, penaltyAng.z);
-        float3 C = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+        float3 C;
+        if (rmode == RotationMode::Affine) {
+            float3x3 qA = bodyA ? bodyA->affine : identity3x3();
+            float3x3 qB = bodyB->affine;
+            C = mat_to_angular(qA, qB) * torqueArm;
+        } else {
+            C = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+        }
 
         if (std::isinf(stiffnessAng))
             C -= C0Ang * alpha;
@@ -100,10 +118,12 @@ void Joint::updatePrimal(Rigid* body, float alpha,
 }
 
 void Joint::updateDual(float alpha) {
+    RotationMode rmode = solver->rotation_mode;
+
     if (lengthSq(penaltyLin) > 0) {
         float3x3 K = diagonal(penaltyLin.x, penaltyLin.y, penaltyLin.z);
-        float3 C = (bodyA ? transform(bodyA->positionLin, bodyA->positionAng, rA) : rA) -
-                   transform(bodyB->positionLin, bodyB->positionAng, rB);
+        float3 C = (bodyA ? bodyA->transformVec(rA, rmode) : rA) -
+                   bodyB->transformVec(rB, rmode);
 
         if (std::isinf(stiffnessLin)) {
             C -= C0Lin * alpha;
@@ -116,7 +136,14 @@ void Joint::updateDual(float alpha) {
 
     if (lengthSq(penaltyAng) > 0) {
         float3x3 K = diagonal(penaltyAng.x, penaltyAng.y, penaltyAng.z);
-        float3 C = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+        float3 C;
+        if (rmode == RotationMode::Affine) {
+            float3x3 qA = bodyA ? bodyA->affine : identity3x3();
+            float3x3 qB = bodyB->affine;
+            C = mat_to_angular(qA, qB) * torqueArm;
+        } else {
+            C = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+        }
 
         if (std::isinf(stiffnessAng)) {
             C -= C0Ang * alpha;

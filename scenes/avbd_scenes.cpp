@@ -818,9 +818,17 @@ void setupSpring(Solver* s) {
     new Spring(s, anchor, block, {0,0,0}, {0,0,0}, 100.0f, 4.0f);
 }
 
+void setupABDFreeFall(Solver* s) {
+    s->clear();
+    s->rotation_mode = RotationMode::Affine;
+    s->set_ground_plane(0.0f, 0.5f);
+    new Rigid(s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 10.0f});
+}
+
 }  // anonymous namespace
 
 extern "C" void chysx_register_avbd_scenes() {
+    register_scene("ABD: Free Fall", []() -> Scene* { return new AVBDScene("ABD: Free Fall", setupABDFreeFall); });
     register_scene("AVBD: Pyramid",    []() -> Scene* { return new AVBDScene("AVBD: Pyramid",    setupPyramid); });
     register_scene("AVBD: Pyramid 2",  []() -> Scene* { return new AVBDScene("AVBD: Pyramid 2",  setupPyramid2); });
     register_scene("AVBD: Rope",       []() -> Scene* { return new AVBDScene("AVBD: Rope",       setupRope); });

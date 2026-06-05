@@ -11,8 +11,9 @@ Spring::Spring(Solver* solver, Rigid* bodyA, Rigid* bodyB,
     : Force(solver, bodyA, bodyB), rA(rA), rB(rB),
       rest(rest), stiffness(stiffness) {
     if (this->rest < 0.0f) {
-        float3 pA = transform(bodyA->positionLin, bodyA->positionAng, this->rA);
-        float3 pB = transform(bodyB->positionLin, bodyB->positionAng, this->rB);
+        RotationMode rmode = solver->rotation_mode;
+        float3 pA = bodyA->transformVec(this->rA, rmode);
+        float3 pB = bodyB->transformVec(this->rB, rmode);
         this->rest = length(pA - pB);
     }
 }
@@ -20,8 +21,9 @@ Spring::Spring(Solver* solver, Rigid* bodyA, Rigid* bodyB,
 void Spring::updatePrimal(Rigid* body, float /*alpha*/,
                           float3x3& lhsLin, float3x3& lhsAng, float3x3& lhsCross,
                           float3& rhsLin, float3& rhsAng) {
-    float3 pA = transform(bodyA->positionLin, bodyA->positionAng, rA);
-    float3 pB = transform(bodyB->positionLin, bodyB->positionAng, rB);
+    RotationMode rmode = solver->rotation_mode;
+    float3 pA = bodyA->transformVec(rA, rmode);
+    float3 pB = bodyB->transformVec(rB, rmode);
     float3 d = pA - pB;
     float dLen = length(d);
     if (dLen <= 1.0e-6f) return;
@@ -34,11 +36,11 @@ void Spring::updatePrimal(Rigid* body, float /*alpha*/,
     float3 jLin;
     float3 jAng;
     if (body == bodyA) {
-        rWorld = rotate(bodyA->positionAng, rA);
+        rWorld = bodyA->rotateVec(rA, rmode);
         jLin = n;
         jAng = cross(rWorld, n);
     } else {
-        rWorld = rotate(bodyB->positionAng, rB);
+        rWorld = bodyB->rotateVec(rB, rmode);
         jLin = -n;
         jAng = -cross(rWorld, n);
     }

@@ -47,7 +47,7 @@ struct FaceFrame {
 inline OBB makeOBB(const Rigid* body) {
     OBB box{};
     box.center = body->positionLin;
-    box.rotation = body->positionAng;
+    box.rotation = body->positionAng;  // always valid; affine mode syncs to quat
     box.half = body->size * 0.5f;
     return box;
 }

@@ -64,11 +64,29 @@ struct Rigid {
     float friction;
     float radius;
 
+    // Affine rotation mode: 3×3 rotation matrix stored alongside quaternion
+    float3x3 affine;
+    float3x3 initialAff;
+    float3x3 inertialAff;
+    float3x3 inertiaMatrix;  // full 3×3 initial inertia (body frame)
+
     Rigid(Solver* solver, float3 size, float density, float friction,
           float3 position, float3 velocity = float3{0, 0, 0});
     ~Rigid();
 
     bool constrainedTo(Rigid* other) const;
+
+    // Sync affine ↔ quaternion based on current rotation mode
+    void syncFromQuat() { affine = rotation(positionAng); }
+    void syncFromAffine() { positionAng = mat_to_quat(affine); }
+
+    // Transform a body-local vector to world using current mode
+    float3 rotateVec(float3 v, RotationMode mode) const {
+        return mode == RotationMode::Affine ? affine * v : rotate(positionAng, v);
+    }
+    float3 transformVec(float3 v, RotationMode mode) const {
+        return positionLin + rotateVec(v, mode);
+    }
 };
 
 struct Force {
@@ -180,6 +198,8 @@ struct Solver {
     float betaAng;
     float gamma;
 
+    RotationMode rotation_mode = RotationMode::AxisAngle;
+
     // Ground plane: z = ground_z, normal = +Z.
     // When enabled, bodies are prevented from penetrating below this plane.
     bool  has_ground_plane = false;
@@ -225,6 +245,7 @@ struct Solver {
     void clear();
     void defaultParams();
     void step();
+    void stepCpuAffine();
 
     GpuSolver* gpu_solver() { return gpu_solver_; }
 };

@@ -21,6 +21,11 @@ Rigid::Rigid(Solver* solver, float3 size, float density, float friction,
         (size.x * size.x + size.z * size.z) / 12.0f * mass,
         (size.x * size.x + size.y * size.y) / 12.0f * mass};
     radius = length(size * 0.5f);
+
+    affine = identity3x3();
+    initialAff = identity3x3();
+    inertialAff = identity3x3();
+    inertiaMatrix = diagonal(moment.x, moment.y, moment.z);
 }
 
 Rigid::~Rigid() {
