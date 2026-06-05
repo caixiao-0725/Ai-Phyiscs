@@ -515,12 +515,13 @@ void Solver::step() {
     prev_body_count_ = body_count;
 }
 
-// Ground-plane contact point for PABD affine solver.
+// Ground-plane contact point for PABD affine solver (augmented Lagrangian).
 struct GroundContact {
     Rigid* body;
-    float3 rLocal;      // contact point in body-local frame
-    float3 rWorld;      // contact point in world frame (A * rLocal)
-    float  penetration; // negative = penetrating
+    float3 rLocal;
+    int    vertIdx;
+    float  lambda;      // dual variable (Lagrange multiplier)
+    float  penalty;     // adaptive penalty weight
 };
 
 void Solver::stepCpuAffine() {
@@ -551,15 +552,19 @@ void Solver::stepCpuAffine() {
         body->syncFromAffine();
     }
 
-    // ---- Phase 2: Ground-plane collision detection ----
-    // Detect box vertices penetrating the ground plane (z = ground_z, normal = +Z).
+    // ---- Phase 2: Ground collision detection + warm start ----
     static const float kLocalVerts[8][3] = {
         {-0.5f,-0.5f,-0.5f}, {+0.5f,-0.5f,-0.5f},
         {+0.5f,+0.5f,-0.5f}, {-0.5f,+0.5f,-0.5f},
         {-0.5f,-0.5f,+0.5f}, {+0.5f,-0.5f,+0.5f},
         {+0.5f,+0.5f,+0.5f}, {-0.5f,+0.5f,+0.5f}};
 
-    std::vector<GroundContact> groundContacts;
+    // Persistent contacts across frames for warm start
+    static std::vector<GroundContact> groundContacts;
+    std::vector<GroundContact> prevContacts;
+    prevContacts.swap(groundContacts);
+    groundContacts.clear();
+
     if (has_ground_plane) {
         for (Rigid* body = bodies; body != nullptr; body = body->next) {
             if (body->mass <= 0) continue;
@@ -568,17 +573,25 @@ void Solver::stepCpuAffine() {
                     kLocalVerts[v][0] * body->size.x,
                     kLocalVerts[v][1] * body->size.y,
                     kLocalVerts[v][2] * body->size.z};
-                float3 rWorld = body->affine * rLocal;
-                float3 worldPos = body->positionLin + rWorld;
-                float pen = worldPos.z - ground_z;
-                if (pen < 0.0f) {
-                    groundContacts.push_back({body, rLocal, rWorld, pen});
+                float3 worldPos = body->positionLin + body->affine * rLocal;
+                if (worldPos.z - ground_z >= 0.0f) continue;
+
+                // Warm start: find matching contact from previous frame
+                float lam = 0.0f;
+                float pen = AVBD_PENALTY_MIN;
+                for (auto& pc : prevContacts) {
+                    if (pc.body == body && pc.vertIdx == v) {
+                        lam = pc.lambda * alpha * gamma;
+                        pen = clamp(pc.penalty * gamma,
+                                    AVBD_PENALTY_MIN, AVBD_PENALTY_MAX);
+                        break;
+                    }
                 }
+                groundContacts.push_back({body, rLocal, v, lam, pen});
             }
         }
     }
 
-    // Also process existing Force constraints (joints, springs, etc.)
     for (Force* force = forces; force != nullptr;) {
         if (!force->initialize()) {
             Force* next = force->next;
@@ -589,35 +602,25 @@ void Solver::stepCpuAffine() {
         }
     }
 
-    // ---- Phase 3: PABD 12×12 Schur complement solve ----
+    // ---- Phase 3: Augmented Lagrangian + PABD 12×12 Schur solve ----
     //
-    // Generalized coordinates (local frame): q_L = (c_L, A_L) ∈ R^12
-    //   Global: c = c̃ + Ã·c_L,  A = Ã·A_L
-    //   Inertial target in local frame: q_0 = (0, I)
+    // Augmented Lagrangian per contact:
+    //   L_c = λ_c · d_c  +  ½ k_c · d_c²
     //
-    // 3D point-to-point penalty:
-    //   Ψ_c = ½ k ‖x_i - x_j‖²
-    //   where x_i = c + A·r  (body contact point)
-    //         x_j = ground projection (fixed target)
+    // In the Schur solve framework:
+    //   Hessian:  H_c = k_c · J^T J           (penalty part, same structure)
+    //   RHS adds: k_c · J^T x_j  +  λ_c · J^T (dual multiplier force)
     //
-    // In local frame, the contact point is:
-    //   x_i^L = c_L + A_L · r
-    //
-    // The target point in local frame:
-    //   x_j^L = Ã^T · (x_j^W - c̃)
-    //
-    // Hessian of ‖x_i^L‖² w.r.t. q_L = (c_L, A_L):
-    //   H = k · [I₃, r^T; r, r·r^T]   (same structure as AffineSchurSolver)
-    //
-    // KKT:  (M + Σ H_c) q_L = M·q_0 + Σ k_c · J_c^T · x_j^L
-    //
-    //   src_c = m·0 + Σ k · x_j^{local}
-    //   src_A = I₀·I + Σ k · (x_j^{local} ⊗ r)
-
-    float contactStiffness = betaLin;
+    // After primal solve, dual update:
+    //   F = k_c · d + λ_c    →  F = min(F, 0)  (unilateral)
+    //   λ_c ← F
+    //   k_c ← k_c + β |d|   (adaptive penalty)
 
     for (int it = 0; it < iterations; it++) {
+        // Re-detect contacts each iteration (carry lambda/penalty forward)
         if (has_ground_plane && it > 0) {
+            std::vector<GroundContact> iterPrev;
+            iterPrev.swap(groundContacts);
             groundContacts.clear();
             for (Rigid* body = bodies; body != nullptr; body = body->next) {
                 if (body->mass <= 0) continue;
@@ -626,39 +629,42 @@ void Solver::stepCpuAffine() {
                         kLocalVerts[v][0] * body->size.x,
                         kLocalVerts[v][1] * body->size.y,
                         kLocalVerts[v][2] * body->size.z};
-                    float3 rWorld = body->affine * rLocal;
-                    float3 worldPos = body->positionLin + rWorld;
-                    if (worldPos.z - ground_z < 0.0f)
-                        groundContacts.push_back({body, rLocal, rWorld,
-                                                  worldPos.z - ground_z});
+                    float3 worldPos = body->positionLin + body->affine * rLocal;
+                    if (worldPos.z - ground_z >= 0.0f) continue;
+
+                    float lam = 0.0f;
+                    float pen = AVBD_PENALTY_MIN;
+                    for (auto& pc : iterPrev) {
+                        if (pc.body == body && pc.vertIdx == v) {
+                            lam = pc.lambda;
+                            pen = pc.penalty;
+                            break;
+                        }
+                    }
+                    groundContacts.push_back({body, rLocal, v, lam, pen});
                 }
             }
         }
 
+        // ---- Primal update per body ----
         for (Rigid* body = bodies; body != nullptr; body = body->next) {
             if (body->mass <= 0) continue;
 
-            float k = contactStiffness;
             float3 cTilde = body->inertialLin;
             float3x3 ATilde = body->inertialAff;
             float3x3 ATildeT = transpose(ATilde);
+            float3 n_local = ATildeT * float3{0, 0, 1};
 
-            // ---- Step A: Accumulate Hessian ----
+            // Accumulate Hessian (uses per-contact adaptive penalty)
             AffineSchurSolver schur;
             schur.reset();
-
             for (auto& gc : groundContacts) {
                 if (gc.body != body) continue;
-                float3 rWorld = body->affine * gc.rLocal;
-                float3 worldPos = body->positionLin + rWorld;
-                if (worldPos.z - ground_z >= 0.0f) continue;
-                schur.accumulate(k, gc.rLocal);
+                schur.accumulate(gc.penalty, gc.rLocal);
             }
-
-            // ---- Step B: Factor Schur complement ----
             schur.factor(body->mass, body->inertiaMatrix);
 
-            // ---- Step C: Build RHS in local frame ----
+            // Build RHS = inertial + penalty target + lambda force
             float3 srcC = {0, 0, 0};
             float3x3 srcA = body->inertiaMatrix;
 
@@ -666,58 +672,73 @@ void Solver::stepCpuAffine() {
                 if (gc.body != body) continue;
                 float3 rWorld = body->affine * gc.rLocal;
                 float3 worldPos = body->positionLin + rWorld;
-                if (worldPos.z - ground_z >= 0.0f) continue;
 
                 float3 xj_world = {worldPos.x, worldPos.y, ground_z};
                 float3 xj_local = ATildeT * (xj_world - cTilde);
 
-                srcC = srcC + xj_local * k;
-                srcA += outer(xj_local, gc.rLocal) * k;
+                // Penalty target contribution: k · J^T x_j
+                srcC = srcC + xj_local * gc.penalty;
+                srcA += outer(xj_local, gc.rLocal) * gc.penalty;
+
+                // Dual multiplier contribution: -λ · J^T
+                // (λ < 0 for compression, so -λ > 0 pushes body upward)
+                srcC = srcC + n_local * (-gc.lambda);
+                srcA += outer(n_local, gc.rLocal) * (-gc.lambda);
             }
 
-            // ---- Step D: Solve q_L = M^{-1} · src ----
+            // Solve q_L = M^{-1} · src
             float3 cL;
             float3x3 AL;
             schur.solve_update(srcC, srcA, cL, AL);
 
-            // ---- Step E: Local → Global ----
+            // Local → Global
             body->positionLin = cTilde + ATilde * cL;
             body->affine = ATilde * AL;
             body->affine = polar_rotation(body->affine);
             body->syncFromAffine();
         }
 
+        // ---- Dual update (ground contacts) ----
+        for (auto& gc : groundContacts) {
+            float3 worldPos = gc.body->positionLin + gc.body->affine * gc.rLocal;
+            float d = worldPos.z - ground_z;
+
+            float F = gc.penalty * d + gc.lambda;
+            F = std::min(F, 0.0f);
+            gc.lambda = F;
+
+            if (F < 0.0f)
+                gc.penalty = std::min(gc.penalty + betaLin * std::fabs(d),
+                                      AVBD_PENALTY_MAX);
+        }
+
+        // Other constraints (joints, springs)
         for (Force* force = forces; force != nullptr; force = force->next)
             force->updateDual(alpha);
     }
 
-    // ---- Phase 4: Velocity recovery + contact damping ----
+    // ---- Phase 4: Velocity recovery ----
     for (Rigid* body = bodies; body != nullptr; body = body->next) {
         if (body->mass <= 0) continue;
         body->prevVelocityLin = body->velocityLin;
         body->velocityLin = (body->positionLin - body->initialLin) / dt;
         body->velocityAng = mat_to_angular(body->affine, body->initialAff) / dt;
-
-        // bool inContact = false;
-        // for (auto& gc : groundContacts)
-        //     if (gc.body == body) { inContact = true; break; }
-
-        // if (inContact) {
-        //     body->velocityLin = body->velocityLin * gamma;
-        //     body->velocityAng = body->velocityAng * gamma;
-        // }
     }
 
     if (frame <= 5 || frame % 60 == 0) {
         for (Rigid* body = bodies; body != nullptr; body = body->next) {
             if (body->mass <= 0) continue;
-            int nContacts = 0;
-            for (auto& gc : groundContacts)
-                if (gc.body == body) nContacts++;
-            std::printf("[ABD %d] pos=(%.4f,%.4f,%.4f) vel=(%.4f,%.4f,%.4f) contacts=%d\n",
+            int nC = 0;
+            float maxLam = 0;
+            for (auto& gc : groundContacts) {
+                if (gc.body != body) continue;
+                nC++;
+                maxLam = std::min(maxLam, gc.lambda);
+            }
+            std::printf("[ABD %d] pos=(%.4f,%.4f,%.4f) vel=(%.4f,%.4f,%.4f) c=%d lam=%.1f\n",
                         frame, body->positionLin.x, body->positionLin.y, body->positionLin.z,
                         body->velocityLin.x, body->velocityLin.y, body->velocityLin.z,
-                        nContacts);
+                        nC, maxLam);
         }
     }
 
