@@ -845,7 +845,7 @@ void setupABDStacking(Solver* s) {
     // Bottom box: center z=1, half-height 1, sits on ground z=0
     new Rigid(s, {2, 2, 2}, 1.0f, 0.8f, {0, 0, 1.0f});
     // Top box: slightly above to let gravity bring it into contact
-    new Rigid(s, {1, 1, 1}, 1.0f, 0.8f, {0, 1, 3.2f});
+    new Rigid(s, {2, 2, 2}, 1.0f, 0.8f, {0, 0.0f, 3.2f});
 }
 
 }  // anonymous namespace

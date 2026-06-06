@@ -157,7 +157,7 @@ void Solver::defaultParams() {
     dt = 1.0f / 60.0f;
     gravity = -10.0f;
     iterations = 10;
-    betaLin = 100.0f;
+    betaLin = 1000.0f;
     betaAng = 100.0f;
     alpha = 0.95f;
     gamma = 0.99f;
@@ -637,11 +637,34 @@ void Solver::stepCpuAffine() {
                 bc.lambda = 0;
                 bc.penalty = AVBD_PENALTY_MIN;
 
+                // Warm start: try exact featureKey match first
+                bool matched = false;
                 for (auto& pc : prevBoxContacts) {
                     if (pc.bodyA == a && pc.bodyB == b && pc.featureKey == bc.featureKey) {
                         bc.lambda = pc.lambda * (alpha * gamma);
                         bc.penalty = clamp(pc.penalty * gamma, AVBD_PENALTY_MIN, AVBD_PENALTY_MAX);
+                        matched = true;
                         break;
+                    }
+                }
+
+                // Fallback: body-local nearest-neighbor match when featureKey changes
+                // (e.g. SAT reference face flips between FACE_A/FACE_B at edges).
+                // rA/rB are body-local so they are invariant to rigid motion.
+                if (!matched) {
+                    float bestDistSq = 0.04f;
+                    const BoxContact* bestPC = nullptr;
+                    for (auto& pc : prevBoxContacts) {
+                        if (pc.bodyA != a || pc.bodyB != b) continue;
+                        float dSq = lengthSq(bc.rA - pc.rA) + lengthSq(bc.rB - pc.rB);
+                        if (dSq < bestDistSq) {
+                            bestDistSq = dSq;
+                            bestPC = &pc;
+                        }
+                    }
+                    if (bestPC) {
+                        bc.lambda = bestPC->lambda * (alpha * gamma);
+                        bc.penalty = clamp(bestPC->penalty * gamma, AVBD_PENALTY_MIN, AVBD_PENALTY_MAX);
                     }
                 }
                 boxContacts.push_back(bc);
@@ -714,11 +737,29 @@ void Solver::stepCpuAffine() {
                         bc.featureKey = tmpContacts[i].feature.key;
                         bc.lambda = 0;
                         bc.penalty = AVBD_PENALTY_MIN;
+                        bool matched = false;
                         for (auto& pc : iterPrev) {
                             if (pc.bodyA == a && pc.bodyB == b && pc.featureKey == bc.featureKey) {
                                 bc.lambda = pc.lambda;
                                 bc.penalty = pc.penalty;
+                                matched = true;
                                 break;
+                            }
+                        }
+                        if (!matched) {
+                            float bestDistSq = 0.04f;
+                            const BoxContact* bestPC = nullptr;
+                            for (auto& pc : iterPrev) {
+                                if (pc.bodyA != a || pc.bodyB != b) continue;
+                                float dSq = lengthSq(bc.rA - pc.rA) + lengthSq(bc.rB - pc.rB);
+                                if (dSq < bestDistSq) {
+                                    bestDistSq = dSq;
+                                    bestPC = &pc;
+                                }
+                            }
+                            if (bestPC) {
+                                bc.lambda = bestPC->lambda;
+                                bc.penalty = bestPC->penalty;
                             }
                         }
                         boxContacts.push_back(bc);
@@ -745,12 +786,20 @@ void Solver::stepCpuAffine() {
                 schur.accumulate(gc.penalty, gc.rLocal);
             }
 
-            // Box-box contacts
+            // Box-box contacts (only active ones contribute to Hessian)
             for (auto& bc : boxContacts) {
                 bool isA = (bc.bodyA == body);
                 bool isB = (bc.bodyB == body);
                 if (!isA && !isB) continue;
+                // Check if constraint is active (penetrating)
                 float3 rLocal = isA ? bc.rA : bc.rB;
+                float3 rOther = isA ? bc.rB : bc.rA;
+                Rigid* other = isA ? bc.bodyB : bc.bodyA;
+                float3 xSelf = body->positionLin + body->affine * rLocal;
+                float3 xOther = other->positionLin + other->affine * rOther;
+                float sign = isA ? 1.0f : -1.0f;
+                float gap = dot(xSelf - xOther, bc.normal) * sign + AVBD_COLLISION_MARGIN;
+                if (gap >= 0 && bc.lambda >= 0) continue;
                 schur.accumulate(bc.penalty, rLocal);
             }
 
@@ -775,7 +824,7 @@ void Solver::stepCpuAffine() {
                 srcA += outer(n_local, gc.rLocal) * (-gc.lambda);
             }
 
-            // Box-box contact RHS
+            // Box-box contact RHS (only active constraints)
             for (auto& bc : boxContacts) {
                 bool isA = (bc.bodyA == body);
                 bool isB = (bc.bodyB == body);
@@ -788,10 +837,10 @@ void Solver::stepCpuAffine() {
                 float3 xSelf = body->positionLin + body->affine * rLocal;
                 float3 xOther = other->positionLin + other->affine * rOther;
 
-                // Project along normal only, keep tangential from self.
-                // Like ground contact: xTarget.tangential = xSelf, xTarget.normal = desired surface.
                 float sign = isA ? 1.0f : -1.0f;
                 float gap = dot(xSelf - xOther, bc.normal) * sign + AVBD_COLLISION_MARGIN;
+                if (gap >= 0 && bc.lambda >= 0) continue;
+
                 float3 xTarget = xSelf + bc.normal * (-gap * sign);
 
                 float3 xTarget_local = ATildeT * (xTarget - cTilde);
@@ -886,8 +935,13 @@ void Solver::stepCpuAffine() {
             float3 diff = bc.bodyA->positionLin + bc.bodyA->affine * bc.rA
                         - bc.bodyB->positionLin - bc.bodyB->affine * bc.rB;
             float normalGap = dot(diff, bc.normal) + AVBD_COLLISION_MARGIN;
-            std::printf("  bc[%d] gap=%.5f lam=%.3f pen=%.1f\n",
-                        ci, normalGap, bc.lambda, bc.penalty);
+            float3 pA = bc.bodyA->positionLin + bc.bodyA->affine * bc.rA;
+            float3 pB = bc.bodyB->positionLin + bc.bodyB->affine * bc.rB;
+            std::printf("  bc[%d] gap=%.5f lam=%.3f pen=%.1f n=(%.3f,%.3f,%.3f) "
+                        "pA=(%.3f,%.3f,%.3f) pB=(%.3f,%.3f,%.3f) key=%08x\n",
+                        ci, normalGap, bc.lambda, bc.penalty,
+                        bc.normal.x, bc.normal.y, bc.normal.z,
+                        pA.x, pA.y, pA.z, pB.x, pB.y, pB.z, bc.featureKey);
         }
     }
 
