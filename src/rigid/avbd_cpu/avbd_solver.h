@@ -238,6 +238,9 @@ struct Solver {
     bool gpu_state_valid_prev_ = false;
     int prev_body_count_ = 0;
 
+    // ABD affine mode: contact points for visualization (world-space)
+    std::vector<float3> abd_contact_points;
+
     Solver();
     ~Solver();
 

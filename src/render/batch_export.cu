@@ -16,10 +16,10 @@
 #define ASSET_PATH "./"
 #endif
 
-static constexpr int N_FRAMES = 120;
+static constexpr int DEFAULT_FRAMES = 120;
 static constexpr float DT = 1.0f / 60.0f;
 
-int main() {
+int main(int argc, char* argv[]) {
     chysx::render::register_all_scenes();
     const auto& reg = chysx::render::scene_registry();
     if (reg.empty()) {
@@ -27,7 +27,22 @@ int main() {
         return 1;
     }
 
-    auto* scene = reg[0].create();
+    std::string target_scene;
+    int N_FRAMES = DEFAULT_FRAMES;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--scene" && i + 1 < argc)
+            target_scene = argv[++i];
+        else if (std::string(argv[i]) == "--frames" && i + 1 < argc)
+            N_FRAMES = std::atoi(argv[++i]);
+    }
+
+    chysx::render::Scene* scene = nullptr;
+    if (!target_scene.empty()) {
+        for (auto& entry : reg) {
+            if (target_scene == entry.name) { scene = entry.create(); break; }
+        }
+    }
+    if (!scene) scene = reg[0].create();
     scene->setup();
 
     std::string out_dir = std::string(ASSET_PATH) + "output/";

@@ -293,6 +293,16 @@ public:
                 else if (const Manifold* m = dynamic_cast<const Manifold*>(f))
                     drawManifold(m);
             }
+
+            // ABD affine mode: draw contact points
+            if (showContacts_ && !solver_->abd_contact_points.empty()) {
+                glPointSize(8.0f);
+                glColor3f(1.0f, 0.0f, 0.0f);
+                glBegin(GL_POINTS);
+                for (auto& p : solver_->abd_contact_points)
+                    glVertex3f(p.x, p.y, p.z);
+                glEnd();
+            }
         }
     }
 
@@ -823,11 +833,25 @@ void setupABDFreeFall(Solver* s) {
     s->rotation_mode = RotationMode::Affine;
     s->set_ground_plane(0.0f, 0.5f);
     new Rigid(s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, 10.0f});
+    new Rigid(s, {1, 1, 1}, 1.0f, 0.5f, {10, 0, 10.0f});
+    new Rigid(s, {1, 1, 1}, 1.0f, 0.5f, {0, 10, 10.0f});
+}
+
+void setupABDStacking(Solver* s) {
+    s->clear();
+    s->rotation_mode = RotationMode::Affine;
+    s->set_ground_plane(0.0f, 0.8f);
+    //s->iterations = 30;
+    // Bottom box: center z=1, half-height 1, sits on ground z=0
+    new Rigid(s, {2, 2, 2}, 1.0f, 0.8f, {0, 0, 1.0f});
+    // Top box: slightly above to let gravity bring it into contact
+    new Rigid(s, {1, 1, 1}, 1.0f, 0.8f, {0, 1, 3.2f});
 }
 
 }  // anonymous namespace
 
 extern "C" void chysx_register_avbd_scenes() {
+    register_scene("ABD: Stacking", []() -> Scene* { return new AVBDScene("ABD: Stacking", setupABDStacking); });
     register_scene("ABD: Free Fall", []() -> Scene* { return new AVBDScene("ABD: Free Fall", setupABDFreeFall); });
     register_scene("AVBD: Pyramid",    []() -> Scene* { return new AVBDScene("AVBD: Pyramid",    setupPyramid); });
     register_scene("AVBD: Pyramid 2",  []() -> Scene* { return new AVBDScene("AVBD: Pyramid 2",  setupPyramid2); });

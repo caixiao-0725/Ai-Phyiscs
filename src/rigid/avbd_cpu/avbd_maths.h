@@ -382,8 +382,7 @@ struct AffineSchurSolver {
         sumD = float3x3{0,0,0, 0,0,0, 0,0,0};
     }
 
-    // Accumulate constraint contribution to Schur complement.
-    // alpha_c = h^2 * stiffness weight, r = body-local lever arm
+    // Accumulate isotropic constraint (3D point-to-point).
     void accumulate(float alpha_c, float3 r) {
         sum0 += alpha_c;
         float3 ar = r * alpha_c;
