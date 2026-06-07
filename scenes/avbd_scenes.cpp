@@ -840,12 +840,11 @@ void setupABDFreeFall(Solver* s) {
 void setupABDStacking(Solver* s) {
     s->clear();
     s->rotation_mode = RotationMode::Affine;
-    s->set_ground_plane(0.0f, 0.8f);
-    //s->iterations = 30;
-    // Bottom box: center z=1, half-height 1, sits on ground z=0
-    new Rigid(s, {2, 2, 2}, 1.0f, 0.8f, {0, 0, 1.0f});
-    // Top box: slightly above to let gravity bring it into contact
-    new Rigid(s, {2, 2, 2}, 1.0f, 0.8f, {0, 0.0f, 3.2f});
+    s->set_ground_plane(0.0f, 0.0f);
+    const int n = 20;
+    //s->iterations = 2 * n;
+    for (int i = 0; i < n; i++)
+        new Rigid(s, {1, 1, 1}, 1.0f, 0.0f, {0, 0, 0.5f + i * 1.0f});
 }
 
 }  // anonymous namespace

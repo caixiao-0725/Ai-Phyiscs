@@ -157,7 +157,7 @@ void Solver::defaultParams() {
     dt = 1.0f / 60.0f;
     gravity = -10.0f;
     iterations = 10;
-    betaLin = 1000.0f;
+    betaLin = 10000.0f;
     betaAng = 100.0f;
     alpha = 0.95f;
     gamma = 0.99f;
@@ -835,8 +835,8 @@ void Solver::stepCpuAffine() {
                 float3 xSelf = body->positionLin + body->affine * rLocal;
                 float3 xOther = other->positionLin + other->affine * rOther;
                 float sign = isA ? 1.0f : -1.0f;
-                float gap = dot(xSelf - xOther, bc.basis[0]) * sign + AVBD_COLLISION_MARGIN;
-                if (gap >= 0 && bc.lambda.x >= 0) continue;
+                float rawGap = dot(xSelf - xOther, bc.basis[0]) * sign;
+                if (rawGap >= AVBD_COLLISION_MARGIN && bc.lambda.x >= 0) continue;
                 for (int d = 0; d < 3; d++) {
                     float3 nd_local = ATildeT * (bc.basis[d] * sign);
                     schur.accumulate_dir(bc.penalty[d], nd_local, rLocal);
@@ -911,8 +911,8 @@ void Solver::stepCpuAffine() {
                 float sign = isA ? 1.0f : -1.0f;
 
                 float3 diff = xSelf - xOther;
-                float normalGap = dot(diff, bc.basis[0]) * sign + AVBD_COLLISION_MARGIN;
-                if (normalGap >= 0 && bc.lambda.x >= 0) continue;
+                float rawGap = dot(diff, bc.basis[0]) * sign;
+                if (rawGap >= AVBD_COLLISION_MARGIN && bc.lambda.x >= 0) continue;
 
                 // xRef: contact point at inertial prediction
                 float3 xRef = cTilde + ATilde * rLocal;
@@ -949,6 +949,7 @@ void Solver::stepCpuAffine() {
             float3x3 AL;
             schur.solve_update(srcC, srcA, cL, AL);
 
+            // --- Diagnostic: polar projection analysis ---
 
             body->positionLin = cTilde + ATilde * cL;
             body->affine = ATilde * AL;
@@ -1029,6 +1030,7 @@ void Solver::stepCpuAffine() {
         // Other constraints (joints, springs)
         for (Force* force = forces; force != nullptr; force = force->next)
             force->updateDual(alpha);
+
     }
 
     // ---- Phase 4: Velocity recovery ----
