@@ -516,12 +516,15 @@ void Solver::step() {
 }
 
 // Ground-plane contact point for PABD affine solver (augmented Lagrangian).
+// Ground basis is fixed: row0=normal(0,0,1), row1=tangent(1,0,0), row2=tangent(0,1,0).
 struct GroundContact {
     Rigid* body;
     float3 rLocal;
     int    vertIdx;
-    float  lambda;
-    float  penalty;
+    float3 lambda;      // (normal_z, tangent_x, tangent_y)
+    float3 penalty;
+    float  friction;
+    float3 C0;          // initial constraint value at frame start
 };
 
 // Box-box contact for PABD affine solver (augmented Lagrangian).
@@ -530,9 +533,11 @@ struct BoxContact {
     Rigid* bodyB;
     float3 rA;
     float3 rB;
-    float3 normal;      // collision normal (A→B)
-    float  lambda;      // scalar dual variable (normal only)
-    float  penalty;     // scalar adaptive penalty
+    float3x3 basis;     // row 0 = normal (A→B), rows 1-2 = tangents
+    float3 lambda;      // 3D: (normal, tangent1, tangent2)
+    float3 penalty;     // 3D: per-direction adaptive penalty
+    float  friction;    // μ = sqrt(bodyA->friction * bodyB->friction)
+    float3 C0;          // initial constraint value at frame start
     int featureKey;
 };
 
@@ -586,19 +591,25 @@ void Solver::stepCpuAffine() {
                     kLocalVerts[v][1] * body->size.y,
                     kLocalVerts[v][2] * body->size.z};
                 float3 worldPos = body->positionLin + body->affine * rLocal;
-                if (worldPos.z - ground_z >= 0.0f) continue;
+                if (worldPos.z - ground_z >= AVBD_GC_TOL) continue;
 
-                float lam = 0.0f;
-                float pen = AVBD_PENALTY_MIN;
+                float3 lam = {0, 0, 0};
+                float3 pen = {AVBD_PENALTY_MIN, AVBD_PENALTY_MIN, AVBD_PENALTY_MIN};
                 for (auto& pc : prevContacts) {
                     if (pc.body == body && pc.vertIdx == v) {
-                        lam = pc.lambda * alpha * gamma;
+                        lam = pc.lambda * (alpha * gamma);
                         pen = clamp(pc.penalty * gamma,
                                     AVBD_PENALTY_MIN, AVBD_PENALTY_MAX);
                         break;
                     }
                 }
-                groundContacts.push_back({body, rLocal, v, lam, pen});
+                float mu = std::sqrt(body->friction * ground_friction);
+                // C0: initial constraint value (normal gap, tangent x, tangent y)
+                float3 C0;
+                C0.x = worldPos.z - ground_z;
+                C0.y = 0;  // tangent slip starts at zero each frame
+                C0.z = 0;
+                groundContacts.push_back({body, rLocal, v, lam, pen, mu, C0});
             }
         }
     }
@@ -626,16 +637,18 @@ void Solver::stepCpuAffine() {
             int nc = Manifold::collide(a, b, tmpContacts, basis);
             if (nc <= 0) continue;
 
+            float mu = std::sqrt(a->friction * b->friction);
             for (int i = 0; i < nc; i++) {
                 BoxContact bc;
                 bc.bodyA = a;
                 bc.bodyB = b;
                 bc.rA = tmpContacts[i].rA;
                 bc.rB = tmpContacts[i].rB;
-                bc.normal = basis[0];
+                bc.basis = basis;
                 bc.featureKey = tmpContacts[i].feature.key;
-                bc.lambda = 0;
-                bc.penalty = AVBD_PENALTY_MIN;
+                bc.lambda = {0, 0, 0};
+                bc.penalty = {AVBD_PENALTY_MIN, AVBD_PENALTY_MIN, AVBD_PENALTY_MIN};
+                bc.friction = mu;
 
                 // Warm start: try exact featureKey match first
                 bool matched = false;
@@ -649,8 +662,6 @@ void Solver::stepCpuAffine() {
                 }
 
                 // Fallback: body-local nearest-neighbor match when featureKey changes
-                // (e.g. SAT reference face flips between FACE_A/FACE_B at edges).
-                // rA/rB are body-local so they are invariant to rigid motion.
                 if (!matched) {
                     float bestDistSq = 0.04f;
                     const BoxContact* bestPC = nullptr;
@@ -667,6 +678,13 @@ void Solver::stepCpuAffine() {
                         bc.penalty = clamp(bestPC->penalty * gamma, AVBD_PENALTY_MIN, AVBD_PENALTY_MAX);
                     }
                 }
+                // C0: initial 3D constraint value at frame start
+                float3 xA = a->positionLin + a->affine * bc.rA;
+                float3 xB = b->positionLin + b->affine * bc.rB;
+                float3 diffInit = xA - xB;
+                bc.C0.x = dot(diffInit, basis[0]) + AVBD_COLLISION_MARGIN;
+                bc.C0.y = dot(diffInit, basis[1]);
+                bc.C0.z = dot(diffInit, basis[2]);
                 boxContacts.push_back(bc);
             }
         }
@@ -697,18 +715,23 @@ void Solver::stepCpuAffine() {
                         kLocalVerts[v][1] * body->size.y,
                         kLocalVerts[v][2] * body->size.z};
                     float3 worldPos = body->positionLin + body->affine * rLocal;
-                    if (worldPos.z - ground_z >= 0.0f) continue;
+                    if (worldPos.z - ground_z >= AVBD_GC_TOL) continue;
 
-                    float lam = 0.0f;
-                    float pen = AVBD_PENALTY_MIN;
+                    float3 lam = {0, 0, 0};
+                    float3 pen = {AVBD_PENALTY_MIN, AVBD_PENALTY_MIN, AVBD_PENALTY_MIN};
+                    float mu = 0;
+                    float3 c0 = {worldPos.z - ground_z, 0, 0};
                     for (auto& pc : iterPrev) {
                         if (pc.body == body && pc.vertIdx == v) {
                             lam = pc.lambda;
                             pen = pc.penalty;
+                            mu = pc.friction;
+                            c0 = pc.C0;  // preserve C0 across iterations
                             break;
                         }
                     }
-                    groundContacts.push_back({body, rLocal, v, lam, pen});
+                    if (mu == 0) mu = std::sqrt(body->friction * ground_friction);
+                    groundContacts.push_back({body, rLocal, v, lam, pen, mu, c0});
                 }
             }
         }
@@ -728,15 +751,17 @@ void Solver::stepCpuAffine() {
                     Manifold::Contact tmpContacts[8];
                     float3x3 basis;
                     int nc = Manifold::collide(a, b, tmpContacts, basis);
+                    float mu = std::sqrt(a->friction * b->friction);
                     for (int i = 0; i < nc; i++) {
                         BoxContact bc;
                         bc.bodyA = a; bc.bodyB = b;
                         bc.rA = tmpContacts[i].rA;
                         bc.rB = tmpContacts[i].rB;
-                        bc.normal = basis[0];
+                        bc.basis = basis;
                         bc.featureKey = tmpContacts[i].feature.key;
-                        bc.lambda = 0;
-                        bc.penalty = AVBD_PENALTY_MIN;
+                        bc.lambda = {0, 0, 0};
+                        bc.penalty = {AVBD_PENALTY_MIN, AVBD_PENALTY_MIN, AVBD_PENALTY_MIN};
+                        bc.friction = mu;
                         bool matched = false;
                         for (auto& pc : iterPrev) {
                             if (pc.bodyA == a && pc.bodyB == b && pc.featureKey == bc.featureKey) {
@@ -762,6 +787,15 @@ void Solver::stepCpuAffine() {
                                 bc.penalty = bestPC->penalty;
                             }
                         }
+                        // Preserve C0 from matched contact or compute fresh
+                        bc.C0 = {0, 0, 0};
+                        // Try to inherit C0 from the featureKey or spatial match
+                        for (auto& pc : iterPrev) {
+                            if (pc.bodyA == a && pc.bodyB == b && pc.featureKey == bc.featureKey) {
+                                bc.C0 = pc.C0;
+                                break;
+                            }
+                        }
                         boxContacts.push_back(bc);
                     }
                 }
@@ -780,51 +814,89 @@ void Solver::stepCpuAffine() {
             AffineSchurSolver schur;
             schur.reset();
 
-            // Ground contacts
+            // Ground contacts — exact directional Hessian per constraint direction
             for (auto& gc : groundContacts) {
                 if (gc.body != body) continue;
-                schur.accumulate(gc.penalty, gc.rLocal);
+                float3 dirs[3] = {{0,0,1}, {1,0,0}, {0,1,0}};
+                for (int d = 0; d < 3; d++) {
+                    float3 nd_local = ATildeT * dirs[d];
+                    schur.accumulate_dir(gc.penalty[d], nd_local, gc.rLocal);
+                }
             }
 
-            // Box-box contacts (only active ones contribute to Hessian)
+            // Box-box contacts — exact directional Hessian per active contact
             for (auto& bc : boxContacts) {
                 bool isA = (bc.bodyA == body);
                 bool isB = (bc.bodyB == body);
                 if (!isA && !isB) continue;
-                // Check if constraint is active (penetrating)
                 float3 rLocal = isA ? bc.rA : bc.rB;
                 float3 rOther = isA ? bc.rB : bc.rA;
                 Rigid* other = isA ? bc.bodyB : bc.bodyA;
                 float3 xSelf = body->positionLin + body->affine * rLocal;
                 float3 xOther = other->positionLin + other->affine * rOther;
                 float sign = isA ? 1.0f : -1.0f;
-                float gap = dot(xSelf - xOther, bc.normal) * sign + AVBD_COLLISION_MARGIN;
-                if (gap >= 0 && bc.lambda >= 0) continue;
-                schur.accumulate(bc.penalty, rLocal);
+                float gap = dot(xSelf - xOther, bc.basis[0]) * sign + AVBD_COLLISION_MARGIN;
+                if (gap >= 0 && bc.lambda.x >= 0) continue;
+                for (int d = 0; d < 3; d++) {
+                    float3 nd_local = ATildeT * (bc.basis[d] * sign);
+                    schur.accumulate_dir(bc.penalty[d], nd_local, rLocal);
+                }
             }
 
             schur.factor(body->mass, body->inertiaMatrix);
 
-            // Build RHS
+
+            // Build RHS — b = H·q_target - external_forces
+            // q_target = (c_L=0, A_L=I). H·(0,I) contributes inertia (J·e_j)
+            // plus sumD/sumB penalty terms at target.
             float3 srcC = {0, 0, 0};
             float3x3 srcA = body->inertiaMatrix;
 
-            // Ground contact RHS
-            float3 n_local = ATildeT * float3{0, 0, 1};
+            // Penalty Hessian at A_L=I target: srcA[j] += Σ_k sumD[j][k]·e_k
+            for (int j = 0; j < 3; j++)
+                for (int k = 0; k < 3; k++)
+                    srcA[j] = srcA[j] + schur.sumD[j][k].col(k);
+            // Cross-coupling B at c_L=0: srcC += Σ_j sumB[j]·e_j
+            for (int j = 0; j < 3; j++)
+                srcC = srcC + schur.sumB[j].col(j);
+
+            // Ground contact RHS: F_d = κ_d·e_d + λ_d per direction, Coulomb projected
             for (auto& gc : groundContacts) {
                 if (gc.body != body) continue;
-                float3 rWorld = body->affine * gc.rLocal;
-                float3 worldPos = body->positionLin + rWorld;
-                float3 xj_world = {worldPos.x, worldPos.y, ground_z};
-                float3 xj_local = ATildeT * (xj_world - cTilde);
+                float3 initPos = body->initialLin + body->initialAff * gc.rLocal;
+                float3 targets[3] = {
+                    {0, 0, ground_z},    // normal target: z = ground
+                    {initPos.x, 0, 0},   // tangent-x target: anchored x
+                    {0, initPos.y, 0}    // tangent-y target: anchored y
+                };
+                float3 xRef = cTilde + ATilde * gc.rLocal;
+                float3 dirs[3] = {{0,0,1}, {1,0,0}, {0,1,0}};
 
-                srcC = srcC + xj_local * gc.penalty;
-                srcA += outer(xj_local, gc.rLocal) * gc.penalty;
-                srcC = srcC + n_local * (-gc.lambda);
-                srcA += outer(n_local, gc.rLocal) * (-gc.lambda);
+                // Compute F_d = κ_d · e_d + λ_d for each direction
+                float3 F;
+                for (int d = 0; d < 3; d++) {
+                    float e_d = dot(dirs[d], xRef) - dot(dirs[d], targets[d]);
+                    F[d] = gc.penalty[d] * e_d + gc.lambda[d];
+                }
+                // Unilateral: normal force must be compressive
+                F.x = std::min(F.x, 0.0f);
+                // Coulomb friction projection
+                float bounds = std::fabs(F.x) * gc.friction;
+                float tangMag = length(float2{F.y, F.z});
+                if (tangMag > bounds && tangMag > 0) {
+                    F.y *= bounds / tangMag;
+                    F.z *= bounds / tangMag;
+                }
+
+                for (int d = 0; d < 3; d++) {
+                    float3 nd_local = ATildeT * dirs[d];
+                    srcC = srcC - nd_local * F[d];
+                    for (int j = 0; j < 3; j++)
+                        srcA[j] = srcA[j] - nd_local * (F[d] * gc.rLocal[j]);
+                }
             }
 
-            // Box-box contact RHS (only active constraints)
+            // Box-box contact RHS: F_d = κ_d·e_d + λ_d per direction, Coulomb projected
             for (auto& bc : boxContacts) {
                 bool isA = (bc.bodyA == body);
                 bool isB = (bc.bodyB == body);
@@ -836,21 +908,40 @@ void Solver::stepCpuAffine() {
 
                 float3 xSelf = body->positionLin + body->affine * rLocal;
                 float3 xOther = other->positionLin + other->affine * rOther;
-
                 float sign = isA ? 1.0f : -1.0f;
-                float gap = dot(xSelf - xOther, bc.normal) * sign + AVBD_COLLISION_MARGIN;
-                if (gap >= 0 && bc.lambda >= 0) continue;
 
-                float3 xTarget = xSelf + bc.normal * (-gap * sign);
+                float3 diff = xSelf - xOther;
+                float normalGap = dot(diff, bc.basis[0]) * sign + AVBD_COLLISION_MARGIN;
+                if (normalGap >= 0 && bc.lambda.x >= 0) continue;
 
-                float3 xTarget_local = ATildeT * (xTarget - cTilde);
-                srcC = srcC + xTarget_local * bc.penalty;
-                srcA += outer(xTarget_local, rLocal) * bc.penalty;
+                // xRef: contact point at inertial prediction
+                float3 xRef = cTilde + ATilde * rLocal;
+                // other body's current contact point (treated as fixed for this body's solve)
+                float3 xOtherCur = other->positionLin + other->affine * rOther;
 
-                // Dual multiplier (normal direction only)
-                float3 n_local = ATildeT * (bc.normal * sign);
-                srcC = srcC + n_local * (-bc.lambda);
-                srcA += outer(n_local, rLocal) * (-bc.lambda);
+                // e_d at (c_L=0, A_L=I): constraint values at inertial reference
+                float3 diffRef = xRef - xOtherCur;
+                float3 F;
+                for (int d = 0; d < 3; d++) {
+                    float3 bd = bc.basis[d] * sign;
+                    float e_d = dot(diffRef, bd);
+                    if (d == 0) e_d += AVBD_COLLISION_MARGIN;
+                    F[d] = bc.penalty[d] * e_d + bc.lambda[d];
+                }
+                F.x = std::min(F.x, 0.0f);
+                float bounds = std::fabs(F.x) * bc.friction;
+                float tangMag = length(float2{F.y, F.z});
+                if (tangMag > bounds && tangMag > 0) {
+                    F.y *= bounds / tangMag;
+                    F.z *= bounds / tangMag;
+                }
+
+                for (int d = 0; d < 3; d++) {
+                    float3 nd_local = ATildeT * (bc.basis[d] * sign);
+                    srcC = srcC - nd_local * F[d];
+                    for (int j = 0; j < 3; j++)
+                        srcA[j] = srcA[j] - nd_local * (F[d] * rLocal[j]);
+                }
             }
 
             // Solve
@@ -858,39 +949,81 @@ void Solver::stepCpuAffine() {
             float3x3 AL;
             schur.solve_update(srcC, srcA, cL, AL);
 
+
             body->positionLin = cTilde + ATilde * cL;
             body->affine = ATilde * AL;
             body->affine = polar_rotation(body->affine);
             body->syncFromAffine();
         }
 
-        // ---- Dual update (ground contacts) ----
+        // ---- Dual update (ground contacts, 3D with friction) ----
         for (auto& gc : groundContacts) {
             float3 worldPos = gc.body->positionLin + gc.body->affine * gc.rLocal;
-            float d = worldPos.z - ground_z;
+            // Initial-frame contact point xy
+            float3 initPos = gc.body->initialLin + gc.body->initialAff * gc.rLocal;
 
-            float F = gc.penalty * d + gc.lambda;
-            F = std::min(F, 0.0f);
+            float3 C;
+            C.x = worldPos.z - ground_z;               // normal gap
+            C.y = worldPos.x - initPos.x;              // tangent slip x (relative to frame start)
+            C.z = worldPos.y - initPos.y;              // tangent slip y (relative to frame start)
+
+            float3 F;
+            for (int d = 0; d < 3; d++)
+                F[d] = gc.penalty[d] * C[d] + gc.lambda[d];
+            F.x = std::min(F.x, 0.0f);
+
+            float bounds = std::fabs(F.x) * gc.friction;
+            float tangMag = length(float2{F.y, F.z});
+            bool isStatic = tangMag <= bounds;
+            if (!isStatic && tangMag > 0) {
+                F.y *= bounds / tangMag;
+                F.z *= bounds / tangMag;
+            }
             gc.lambda = F;
 
-            if (F < 0.0f)
-                gc.penalty = std::min(gc.penalty + betaLin * std::fabs(d),
-                                      AVBD_PENALTY_MAX);
+            if (F.x < 0)
+                gc.penalty.x = std::min(gc.penalty.x + betaLin * std::fabs(C.x),
+                                        AVBD_PENALTY_MAX);
+            if (isStatic) {
+                gc.penalty.y = std::min(gc.penalty.y + betaLin * std::fabs(C.y),
+                                        AVBD_PENALTY_MAX);
+                gc.penalty.z = std::min(gc.penalty.z + betaLin * std::fabs(C.z),
+                                        AVBD_PENALTY_MAX);
+            }
         }
 
-        // ---- Dual update (box-box contacts) ----
+        // ---- Dual update (box-box contacts, 3D with friction) ----
         for (auto& bc : boxContacts) {
             float3 diff = bc.bodyA->positionLin + bc.bodyA->affine * bc.rA
                         - bc.bodyB->positionLin - bc.bodyB->affine * bc.rB;
-            float C = dot(diff, bc.normal) + AVBD_COLLISION_MARGIN;
+            float3 C;
+            C.x = dot(diff, bc.basis[0]) + AVBD_COLLISION_MARGIN;
+            C.y = dot(diff, bc.basis[1]);
+            C.z = dot(diff, bc.basis[2]);
 
-            float F = bc.penalty * C + bc.lambda;
-            F = std::min(F, 0.0f);
+            float3 F;
+            for (int d = 0; d < 3; d++)
+                F[d] = bc.penalty[d] * C[d] + bc.lambda[d];
+            F.x = std::min(F.x, 0.0f);
+
+            float bounds = std::fabs(F.x) * bc.friction;
+            float tangMag = length(float2{F.y, F.z});
+            bool isStatic = tangMag <= bounds;
+            if (!isStatic && tangMag > 0) {
+                F.y *= bounds / tangMag;
+                F.z *= bounds / tangMag;
+            }
             bc.lambda = F;
 
-            if (F < 0.0f)
-                bc.penalty = std::min(bc.penalty + betaLin * std::fabs(C),
-                                      AVBD_PENALTY_MAX);
+            if (F.x < 0)
+                bc.penalty.x = std::min(bc.penalty.x + betaLin * std::fabs(C.x),
+                                        AVBD_PENALTY_MAX);
+            if (isStatic) {
+                bc.penalty.y = std::min(bc.penalty.y + betaLin * std::fabs(C.y),
+                                        AVBD_PENALTY_MAX);
+                bc.penalty.z = std::min(bc.penalty.z + betaLin * std::fabs(C.z),
+                                        AVBD_PENALTY_MAX);
+            }
         }
 
         // Other constraints (joints, springs)
@@ -915,7 +1048,7 @@ void Solver::stepCpuAffine() {
             for (auto& gc : groundContacts) {
                 if (gc.body != body) continue;
                 nGC++;
-                sumGCLam += gc.lambda;
+                sumGCLam += gc.lambda.x;
             }
             for (auto& bc : boxContacts) {
                 if (bc.bodyA == body || bc.bodyB == body) nBC++;
@@ -934,14 +1067,14 @@ void Solver::stepCpuAffine() {
             auto& bc = boxContacts[ci];
             float3 diff = bc.bodyA->positionLin + bc.bodyA->affine * bc.rA
                         - bc.bodyB->positionLin - bc.bodyB->affine * bc.rB;
-            float normalGap = dot(diff, bc.normal) + AVBD_COLLISION_MARGIN;
-            float3 pA = bc.bodyA->positionLin + bc.bodyA->affine * bc.rA;
-            float3 pB = bc.bodyB->positionLin + bc.bodyB->affine * bc.rB;
-            std::printf("  bc[%d] gap=%.5f lam=%.3f pen=%.1f n=(%.3f,%.3f,%.3f) "
-                        "pA=(%.3f,%.3f,%.3f) pB=(%.3f,%.3f,%.3f) key=%08x\n",
-                        ci, normalGap, bc.lambda, bc.penalty,
-                        bc.normal.x, bc.normal.y, bc.normal.z,
-                        pA.x, pA.y, pA.z, pB.x, pB.y, pB.z, bc.featureKey);
+            float normalGap = dot(diff, bc.basis[0]) + AVBD_COLLISION_MARGIN;
+            std::printf("  bc[%d] gap=%.5f lam=(%.3f,%.3f,%.3f) pen=(%.1f,%.1f,%.1f) "
+                        "n=(%.3f,%.3f,%.3f) key=%08x\n",
+                        ci, normalGap,
+                        bc.lambda.x, bc.lambda.y, bc.lambda.z,
+                        bc.penalty.x, bc.penalty.y, bc.penalty.z,
+                        bc.basis[0].x, bc.basis[0].y, bc.basis[0].z,
+                        bc.featureKey);
         }
     }
 

@@ -363,52 +363,275 @@ inline quat mat_to_quat(float3x3 R) {
     return normalize(q);
 }
 
-// 12×12 solver via Schur complement for affine mode.
-// The system is [A B; C D] [x_c; x_A] = [b_c; b_A]
-// where x_c ∈ R³ (translation), x_A ∈ R⁹ (matrix rows flattened).
-// In practice we use the sum-based approach from PABD.
-struct AffineSchurSolver {
-    float sum0;         // scalar sum of alpha
-    float3 sumB, sumC;  // 3D sum vectors
-    float3x3 sumD;      // 3×3 sum outer-product matrix
-
-    float mat1A;
-    float3 mat1B, mat1C;
-    float3x3 mat1D;
+// 12×12 direct solver for affine mode with anisotropic contact Hessian.
+// Accumulates the full 12×12 symmetric positive-definite system, then
+// solves via in-place Cholesky factorization. Supports directional
+// (friction) constraints that couple A's row blocks.
+struct AffineDirectSolver {
+    double H[12][12];
+    double L[12][12];
 
     void reset() {
-        sum0 = 0;
-        sumB = sumC = float3{0,0,0};
-        sumD = float3x3{0,0,0, 0,0,0, 0,0,0};
+        for (int i = 0; i < 12; i++)
+            for (int j = 0; j < 12; j++) {
+                H[i][j] = 0;
+                L[i][j] = 0;
+            }
     }
 
-    // Accumulate isotropic constraint (3D point-to-point).
-    void accumulate(float alpha_c, float3 r) {
-        sum0 += alpha_c;
-        float3 ar = r * alpha_c;
-        sumB = sumB + ar;
-        sumC = sumC + ar;
-        sumD += outer(r, r) * alpha_c;
+    void accumulate(float kappa, float3 r) {
+        double k = kappa;
+        for (int i = 0; i < 3; i++) {
+            H[i][i] += k;
+            for (int j = 0; j < 3; j++) {
+                int aj = 3 + 3 * j + i;
+                double v = k * (double)r[j];
+                H[i][aj] += v;
+                H[aj][i] += v;
+                for (int m = 0; m < 3; m++) {
+                    int am = 3 + 3 * m + i;
+                    H[aj][am] += k * (double)r[j] * (double)r[m];
+                }
+            }
+        }
     }
 
-    // Factor the Schur complement inverse: M^{-1} = [a b^T; c D]
+    void accumulate_dir(float kappa, float3 n, float3 r) {
+        double J[12];
+        for (int i = 0; i < 3; i++) J[i] = n[i];
+        for (int j = 0; j < 3; j++)
+            for (int i = 0; i < 3; i++)
+                J[3 + 3 * j + i] = (double)n[i] * (double)r[j];
+
+        for (int a = 0; a < 12; a++)
+            for (int b = a; b < 12; b++) {
+                double v = (double)kappa * J[a] * J[b];
+                H[a][b] += v;
+                if (a != b) H[b][a] += v;
+            }
+    }
+
     void factor(float mass, float3x3 inertia) {
-        float k = mass + sum0;
-        if (k < 1e-12f) k = 1e-12f;
-        float3 B = sumB / k;
-        float3 C = sumC / k;
-        float3x3 S = (inertia + sumD) / k - outer(C, B);
-        float3x3 Sinv = inverse3x3(S * k) * k;
-        mat1D = Sinv / k;
-        mat1C = Sinv * C * (-1.0f / k);
-        mat1B = transpose(Sinv) * B * (-1.0f / k);
-        mat1A = (1.0f + dot(B, Sinv * C)) / k;
+        for (int i = 0; i < 3; i++)
+            H[i][i] += (double)mass;
+        for (int k = 0; k < 3; k++)
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    H[3 + 3*k + i][3 + 3*k + j] += (double)inertia[i][j];
+
+        for (int i = 0; i < 12; i++) {
+            for (int j = 0; j <= i; j++) {
+                double s = H[i][j];
+                for (int k = 0; k < j; k++)
+                    s -= L[i][k] * L[j][k];
+                if (i == j)
+                    L[i][j] = std::sqrt(s > 1e-20 ? s : 1e-20);
+                else
+                    L[i][j] = s / L[j][j];
+            }
+        }
     }
 
-    // Solve: given RHS source (srcC ∈ R³, srcA ∈ R^{3×3}), compute update
     void solve_update(float3 srcC, float3x3 srcA, float3& dxLin, float3x3& dxAff) {
-        dxLin = srcC * mat1A + srcA * mat1B;
-        dxAff = outer(srcC, mat1C) + srcA * transpose(mat1D);
+        double rhs[12], sol[12], y[12];
+        for (int i = 0; i < 3; i++) rhs[i] = srcC[i];
+        for (int j = 0; j < 3; j++)
+            for (int i = 0; i < 3; i++)
+                rhs[3 + 3*j + i] = srcA[j][i];
+
+        for (int i = 0; i < 12; i++) {
+            double s = rhs[i];
+            for (int k = 0; k < i; k++)
+                s -= L[i][k] * y[k];
+            y[i] = s / L[i][i];
+        }
+        for (int i = 11; i >= 0; i--) {
+            double s = y[i];
+            for (int k = i + 1; k < 12; k++)
+                s -= L[k][i] * sol[k];
+            sol[i] = s / L[i][i];
+        }
+
+        dxLin = {(float)sol[0], (float)sol[1], (float)sol[2]};
+        for (int j = 0; j < 3; j++)
+            dxAff[j] = {(float)sol[3+3*j], (float)sol[3+3*j+1], (float)sol[3+3*j+2]};
+    }
+};
+
+// 12×12 anisotropic Schur complement solver for affine mode.
+//
+// Solves [K  B] [c_L]   [b_c]     where K (3×3), B (3×9), D (9×9)
+//        [Bᵀ D] [A_L] = [b_A]
+//
+// Directional constraints contribute κ·(ñ⊗ñ) to K (not κ·I₃),
+// so K is a general 3×3 SPD matrix. D is a 3×3 block matrix where
+// each block is 3×3. Schur complement out c_L, solve 9×9 via
+// 3×3-block Cholesky.
+struct AffineSchurSolver {
+    // Accumulated constraint contributions (set by accumulate_dir)
+    float3x3 sumK;          // Σ κ·(ñ⊗ñ)  — replaces scalar sum0
+    float3x3 sumB[3];       // sumB[j] = Σ κ·(ñ⊗ñ)·r[j]  — 3 blocks of B (3×3 each)
+    float3x3 sumD[3][3];    // sumD[j1][j2] = Σ κ·(ñ⊗ñ)·r[j1]·r[j2]  — symmetric
+
+    // Factored solve data (set by factor)
+    float3x3 Kinv;          // inverse of K = m·I + sumK
+    float3x3 Bblk[3];       // B sub-blocks (copy of sumB for solve)
+    float3x3 Lblk[3][3];    // 3×3-block lower-triangular Cholesky of S
+
+    void reset() {
+        float3x3 Z = {0,0,0, 0,0,0, 0,0,0};
+        sumK = Z;
+        for (int j = 0; j < 3; j++) {
+            sumB[j] = Z;
+            for (int k = 0; k < 3; k++)
+                sumD[j][k] = Z;
+        }
+    }
+
+    // Accumulate a single directional constraint κ·(ñᵀ(c_L + A_L·r))².
+    // ñ = ÃᵀTn_world is the direction in the local frame.
+    void accumulate_dir(float kappa, float3 n, float3 r) {
+        float3x3 M = outer(n, n) * kappa;   // κ·(ñ⊗ñ), 3×3
+        sumK += M;
+        for (int j = 0; j < 3; j++) {
+            float3x3 Mr = M * r[j];
+            sumB[j] += Mr;
+            for (int k = j; k < 3; k++) {
+                float3x3 Mrr = Mr * r[k];
+                sumD[j][k] += Mrr;
+                if (k != j) sumD[k][j] += Mrr;
+            }
+        }
+    }
+
+    // Convenience: accumulate isotropic constraint κ·‖c_L + A_L·r‖².
+    // Equivalent to 3 calls to accumulate_dir along x, y, z.
+    void accumulate(float kappa, float3 r) {
+        float3x3 M = identity3x3() * kappa;
+        sumK += M;
+        for (int j = 0; j < 3; j++) {
+            float3x3 Mr = M * r[j];
+            sumB[j] += Mr;
+            for (int k = j; k < 3; k++) {
+                float3x3 Mrr = Mr * r[k];
+                sumD[j][k] += Mrr;
+                if (k != j) sumD[k][j] += Mrr;
+            }
+        }
+    }
+
+    // 3×3-block Cholesky: factor S (3×3 blocks, symmetric PD) into L·Lᵀ
+    // S[i][j] are 3×3 blocks. L is lower-triangular in blocks.
+    void block_cholesky(float3x3 S[3][3]) {
+        // L[0][0] = cholesky(S[0][0])
+        Lblk[0][0] = cholesky3x3(S[0][0]);
+        float3x3 L00inv = inverse3x3(Lblk[0][0]);
+
+        // L[1][0] = S[1][0] · L[0][0]^{-T}
+        Lblk[1][0] = S[1][0] * transpose(L00inv);
+        // L[2][0] = S[2][0] · L[0][0]^{-T}
+        Lblk[2][0] = S[2][0] * transpose(L00inv);
+
+        // S11' = S[1][1] - L[1][0]·L[1][0]^T
+        float3x3 S11p = S[1][1] - Lblk[1][0] * transpose(Lblk[1][0]);
+        Lblk[1][1] = cholesky3x3(S11p);
+        float3x3 L11inv = inverse3x3(Lblk[1][1]);
+
+        // L[2][1] = (S[2][1] - L[2][0]·L[1][0]^T) · L[1][1]^{-T}
+        float3x3 temp = S[2][1] - Lblk[2][0] * transpose(Lblk[1][0]);
+        Lblk[2][1] = temp * transpose(L11inv);
+
+        // S22' = S[2][2] - L[2][0]·L[2][0]^T - L[2][1]·L[2][1]^T
+        float3x3 S22p = S[2][2] - Lblk[2][0] * transpose(Lblk[2][0])
+                                 - Lblk[2][1] * transpose(Lblk[2][1]);
+        Lblk[2][2] = cholesky3x3(S22p);
+    }
+
+    // Cholesky factorization of a 3×3 SPD matrix: A = L·Lᵀ
+    static float3x3 cholesky3x3(float3x3 A) {
+        float3x3 L = {0,0,0, 0,0,0, 0,0,0};
+        L[0][0] = std::sqrt(A[0][0] > 1e-12f ? A[0][0] : 1e-12f);
+        L[1][0] = A[1][0] / L[0][0];
+        L[2][0] = A[2][0] / L[0][0];
+        float d = A[1][1] - L[1][0]*L[1][0];
+        L[1][1] = std::sqrt(d > 1e-12f ? d : 1e-12f);
+        L[2][1] = (A[2][1] - L[2][0]*L[1][0]) / L[1][1];
+        d = A[2][2] - L[2][0]*L[2][0] - L[2][1]*L[2][1];
+        L[2][2] = std::sqrt(d > 1e-12f ? d : 1e-12f);
+        return L;
+    }
+
+    // Factor: build K, compute block Schur complement, block Cholesky.
+    void factor(float mass, float3x3 inertia) {
+        // K = m·I + sumK
+        float3x3 K = identity3x3() * mass + sumK;
+        Kinv = inverse3x3(K);
+
+        // Copy B blocks
+        for (int j = 0; j < 3; j++)
+            Bblk[j] = sumB[j];
+
+        // Build Schur complement S[j1][j2] = D[j1][j2] + δ·J - Bᵀ[j1]·Kinv·B[j2]
+        float3x3 S[3][3];
+        for (int j1 = 0; j1 < 3; j1++) {
+            for (int j2 = j1; j2 < 3; j2++) {
+                float3x3 Dblk = sumD[j1][j2];
+                if (j1 == j2) Dblk += inertia;
+                S[j1][j2] = Dblk - transpose(Bblk[j1]) * Kinv * Bblk[j2];
+                if (j2 != j1) S[j2][j1] = transpose(S[j1][j2]);
+            }
+        }
+
+        block_cholesky(S);
+    }
+
+    // Block forward substitution: L·y = b, where L is lower-triangular 3×3-block
+    void block_forward(float3 b[3], float3 y[3]) const {
+        float3x3 L00inv = inverse3x3(Lblk[0][0]);
+        y[0] = L00inv * b[0];
+
+        float3x3 L11inv = inverse3x3(Lblk[1][1]);
+        y[1] = L11inv * (b[1] - Lblk[1][0] * y[0]);
+
+        float3x3 L22inv = inverse3x3(Lblk[2][2]);
+        y[2] = L22inv * (b[2] - Lblk[2][0] * y[0] - Lblk[2][1] * y[1]);
+    }
+
+    // Block backward substitution: Lᵀ·x = y
+    void block_backward(float3 y[3], float3 x[3]) const {
+        float3x3 L22Tinv = inverse3x3(transpose(Lblk[2][2]));
+        x[2] = L22Tinv * y[2];
+
+        float3x3 L11Tinv = inverse3x3(transpose(Lblk[1][1]));
+        x[1] = L11Tinv * (y[1] - transpose(Lblk[2][1]) * x[2]);
+
+        float3x3 L00Tinv = inverse3x3(transpose(Lblk[0][0]));
+        x[0] = L00Tinv * (y[0] - transpose(Lblk[1][0]) * x[1] - transpose(Lblk[2][0]) * x[2]);
+    }
+
+    // Solve: given RHS (srcC ∈ R³, srcA ∈ R^{3×3}), compute update.
+    // srcA[j] is the RHS for A_L row j.
+    void solve_update(float3 srcC, float3x3 srcA, float3& dxLin, float3x3& dxAff) {
+        // Schur-modified RHS for A_L: rhs_A[j] = srcA[j] - Bᵀ[j]·Kinv·srcC
+        float3 Kinv_bc = Kinv * srcC;
+        float3 rhs_A[3];
+        for (int j = 0; j < 3; j++)
+            rhs_A[j] = srcA[j] - transpose(Bblk[j]) * Kinv_bc;
+
+        // Solve S · A_L_cols = rhs_A via block Cholesky
+        float3 y[3], A_cols[3];
+        block_forward(rhs_A, y);
+        block_backward(y, A_cols);
+
+        // Back-substitute for c_L: c_L = Kinv · (srcC - Σ_j B[j]·A_col[j])
+        float3 Bx = {0,0,0};
+        for (int j = 0; j < 3; j++)
+            Bx = Bx + Bblk[j] * A_cols[j];
+        dxLin = Kinv * (srcC - Bx);
+
+        // Pack A_cols into dxAff rows: dxAff[j][i] = A_cols[j][i]
+        for (int j = 0; j < 3; j++)
+            dxAff[j] = A_cols[j];
     }
 };
 

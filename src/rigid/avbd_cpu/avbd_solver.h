@@ -15,6 +15,7 @@ namespace avbd {
 #define AVBD_PENALTY_MAX 10000000000.0f
 #define AVBD_COLLISION_MARGIN 0.01f
 #define AVBD_STICK_THRESH 0.00001f
+#define AVBD_GC_TOL 1e-4f
 
 struct Rigid;
 struct Force;
