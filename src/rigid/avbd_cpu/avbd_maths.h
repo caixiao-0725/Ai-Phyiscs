@@ -263,7 +263,7 @@ inline void solve(float3x3 aLin, float3x3 aAng, float3x3 aCross,
 
 // ---- Affine rotation mode utilities ----
 
-enum class RotationMode { AxisAngle, Affine };
+enum class RotationMode { AxisAngle, Affine, PABD };
 
 inline float3x3 identity3x3() {
     return float3x3{1, 0, 0, 0, 1, 0, 0, 0, 1};
@@ -548,20 +548,27 @@ struct AffineSchurSolver {
     }
 
     // Cholesky factorization of a 3×3 SPD matrix: A = L·Lᵀ
+    // Uses adaptive regularization to handle near-singular matrices
     static float3x3 cholesky3x3(float3x3 A) {
+        float trace = std::fabs(A[0][0]) + std::fabs(A[1][1]) + std::fabs(A[2][2]);
+        float eps = trace * 1e-4f;
+        if (eps < 1e-6f) eps = 1e-6f;
+
         float3x3 L = {0,0,0, 0,0,0, 0,0,0};
-        L[0][0] = std::sqrt(A[0][0] > 1e-12f ? A[0][0] : 1e-12f);
+        L[0][0] = std::sqrt(A[0][0] > eps ? A[0][0] : eps);
         L[1][0] = A[1][0] / L[0][0];
         L[2][0] = A[2][0] / L[0][0];
         float d = A[1][1] - L[1][0]*L[1][0];
-        L[1][1] = std::sqrt(d > 1e-12f ? d : 1e-12f);
+        L[1][1] = std::sqrt(d > eps ? d : eps);
         L[2][1] = (A[2][1] - L[2][0]*L[1][0]) / L[1][1];
         d = A[2][2] - L[2][0]*L[2][0] - L[2][1]*L[2][1];
-        L[2][2] = std::sqrt(d > 1e-12f ? d : 1e-12f);
+        L[2][2] = std::sqrt(d > eps ? d : eps);
         return L;
     }
 
     // Factor: build K, compute block Schur complement, block Cholesky.
+    // Uses diagonal scaling to handle ill-conditioned Schur complements.
+    float3x3 scale_diag;  // inverse diagonal scaling factors
     void factor(float mass, float3x3 inertia) {
         // K = m·I + sumK
         float3x3 K = identity3x3() * mass + sumK;
@@ -582,7 +589,32 @@ struct AffineSchurSolver {
             }
         }
 
+        // Diagonal scaling (Jacobi preconditioner): D^{-1/2} S D^{-1/2}
+        // Compute scaling factors from 3x3 block diagonals
+        for (int j = 0; j < 3; j++) {
+            for (int i = 0; i < 3; i++) {
+                float d = std::fabs(S[j][j][i][i]);
+                scale_diag[j][i] = d > 1e-10f ? 1.0f / std::sqrt(d) : 1.0f;
+            }
+        }
+
+        // Apply scaling: S_scaled[j1][j2][r][c] = scale[j1][r] * S[j1][j2][r][c] * scale[j2][c]
+        for (int j1 = 0; j1 < 3; j1++) {
+            for (int j2 = 0; j2 < 3; j2++) {
+                for (int r = 0; r < 3; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        S[j1][j2][r][c] *= scale_diag[j1][r] * scale_diag[j2][c];
+                    }
+                }
+            }
+        }
+
+        // Tikhonov regularization on the scaled system
+        for (int j = 0; j < 3; j++)
+            S[j][j] += identity3x3() * 1e-6f;
+
         block_cholesky(S);
+
     }
 
     // Block forward substitution: L·y = b, where L is lower-triangular 3×3-block
@@ -618,10 +650,21 @@ struct AffineSchurSolver {
         for (int j = 0; j < 3; j++)
             rhs_A[j] = srcA[j] - transpose(Bblk[j]) * Kinv_bc;
 
-        // Solve S · A_L_cols = rhs_A via block Cholesky
-        float3 y[3], A_cols[3];
+        // Apply row scaling to RHS: rhs_scaled[j][i] = scale[j][i] * rhs[j][i]
+        for (int j = 0; j < 3; j++)
+            for (int i = 0; i < 3; i++)
+                rhs_A[j][i] *= scale_diag[j][i];
+
+        // Solve scaled_S · x_scaled = rhs_scaled via block Cholesky
+        float3 y[3], x_scaled[3];
         block_forward(rhs_A, y);
-        block_backward(y, A_cols);
+        block_backward(y, x_scaled);
+
+        // Un-scale: A_cols[j][i] = scale[j][i] * x_scaled[j][i]
+        float3 A_cols[3];
+        for (int j = 0; j < 3; j++)
+            for (int i = 0; i < 3; i++)
+                A_cols[j][i] = scale_diag[j][i] * x_scaled[j][i];
 
         // Back-substitute for c_L: c_L = Kinv · (srcC - Σ_j B[j]·A_col[j])
         float3 Bx = {0,0,0};
@@ -632,6 +675,22 @@ struct AffineSchurSolver {
         // Pack A_cols into dxAff rows: dxAff[j][i] = A_cols[j][i]
         for (int j = 0; j < 3; j++)
             dxAff[j] = A_cols[j];
+
+        // Safeguard: if solve produced NaN/inf/extreme values, fall back to identity
+        bool bad = false;
+        for (int i = 0; i < 3 && !bad; i++) {
+            if (std::isnan(dxLin[i]) || std::isinf(dxLin[i]) || std::fabs(dxLin[i]) > 1e6f)
+                bad = true;
+            for (int j = 0; j < 3 && !bad; j++) {
+                float v = dxAff[i][j];
+                if (std::isnan(v) || std::isinf(v) || std::fabs(v) > 1e6f)
+                    bad = true;
+            }
+        }
+        if (bad) {
+            dxLin = {0, 0, 0};
+            dxAff = identity3x3();
+        }
     }
 };
 

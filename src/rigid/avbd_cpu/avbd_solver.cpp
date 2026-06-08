@@ -172,6 +172,12 @@ void Solver::step() {
         return;
     }
 
+    // PABD: IPC-barrier position solver with optional velocity pre-phase
+    if (rotation_mode == RotationMode::PABD) {
+        stepCpuPABD();
+        return;
+    }
+
     // Detect whether any Joint/Spring forces exist
     bool has_joint_spring = false;
     for (Force* f = forces; f != nullptr; f = f->next) {
@@ -562,11 +568,12 @@ void Solver::stepCpuAffine() {
         body->inertialLin = newPos;
         body->positionLin = newPos;
 
-        body->inertialAff = body->affine;
         float3x3 dR_skew = skew(body->velocityAng * dt);
         body->affine = (identity3x3() + dR_skew) * body->affine;
         body->affine = polar_rotation(body->affine);
         body->syncFromAffine();
+        body->inertialAff = body->affine;
+        body->inertialAng = body->positionAng;
     }
 
     // ---- Phase 2: Ground collision detection + warm start ----
@@ -949,11 +956,87 @@ void Solver::stepCpuAffine() {
             float3x3 AL;
             schur.solve_update(srcC, srcA, cL, AL);
 
-            // --- Diagnostic: polar projection analysis ---
+            // Clamp cL and AL to prevent explosion from ill-conditioned solves
+            float cL_len = length(cL);
+            float cL_max = length(body->size) * 2.0f;
+            if (cL_len > cL_max) cL = cL * (cL_max / cL_len);
+
+            // Clamp AL: ensure eigenvalues stay in [0.5, 2.0] by clamping towards I
+            float al_max = 0.0f;
+            for (int r = 0; r < 3; r++)
+                for (int c = 0; c < 3; c++) {
+                    float v = std::fabs(AL[r][c] - (r==c ? 1.0f : 0.0f));
+                    if (v > al_max) al_max = v;
+                }
+            if (al_max > 0.5f) {
+                float s = 0.5f / al_max;
+                for (int r = 0; r < 3; r++)
+                    for (int c = 0; c < 3; c++)
+                        AL[r][c] = (r==c ? 1.0f : 0.0f) + (AL[r][c] - (r==c ? 1.0f : 0.0f)) * s;
+            }
 
             body->positionLin = cTilde + ATilde * cL;
-            body->affine = ATilde * AL;
+            float3x3 A_pre_polar = ATilde * AL;
+            body->affine = A_pre_polar;
+
+            // NaN guard: detect and report (first 10 occurrences)
+            static int nan_count = 0;
+            bool cL_nan = std::isnan(cL.x) || std::isnan(cL.y) || std::isnan(cL.z);
+            bool AL_nan = std::isnan(AL[0][0]);
+            bool A_nan = std::isnan(A_pre_polar[0][0]);
+            if (body_count <= 3 && (cL_nan || AL_nan || A_nan) && nan_count < 10) {
+                nan_count++;
+                int nGC = 0;
+                for (auto& g : groundContacts) { if (g.body == body) nGC++; }
+                std::printf("[ABD NaN f%d it%d] gc=%d cL=(%.6f,%.6f,%.6f) srcC=(%.6f,%.6f,%.6f)\n",
+                    frame, it, nGC, cL.x, cL.y, cL.z, srcC.x, srcC.y, srcC.z);
+                std::printf("  cTilde=(%.6f,%.6f,%.6f)\n", cTilde.x, cTilde.y, cTilde.z);
+                std::printf("  ATilde=[%.6f %.6f %.6f][%.6f %.6f %.6f][%.6f %.6f %.6f]\n",
+                    ATilde[0][0],ATilde[0][1],ATilde[0][2],
+                    ATilde[1][0],ATilde[1][1],ATilde[1][2],
+                    ATilde[2][0],ATilde[2][1],ATilde[2][2]);
+                std::printf("  AL=[%.6f %.6f %.6f][%.6f %.6f %.6f][%.6f %.6f %.6f]\n",
+                    AL[0][0],AL[0][1],AL[0][2],
+                    AL[1][0],AL[1][1],AL[1][2],
+                    AL[2][0],AL[2][1],AL[2][2]);
+                std::printf("  sumK=[%.4f %.4f %.4f][%.4f %.4f %.4f][%.4f %.4f %.4f]\n",
+                    schur.sumK[0][0],schur.sumK[0][1],schur.sumK[0][2],
+                    schur.sumK[1][0],schur.sumK[1][1],schur.sumK[1][2],
+                    schur.sumK[2][0],schur.sumK[2][1],schur.sumK[2][2]);
+                std::printf("  Kinv=[%.8f %.8f %.8f][%.8f %.8f %.8f][%.8f %.8f %.8f]\n",
+                    schur.Kinv[0][0],schur.Kinv[0][1],schur.Kinv[0][2],
+                    schur.Kinv[1][0],schur.Kinv[1][1],schur.Kinv[1][2],
+                    schur.Kinv[2][0],schur.Kinv[2][1],schur.Kinv[2][2]);
+                std::printf("  srcA[0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f) [2]=(%.4f,%.4f,%.4f)\n",
+                    srcA[0].x,srcA[0].y,srcA[0].z,
+                    srcA[1].x,srcA[1].y,srcA[1].z,
+                    srcA[2].x,srcA[2].y,srcA[2].z);
+                for (int jj = 0; jj < 3; jj++)
+                    std::printf("  Lblk[%d][%d]=[%.6f %.6f %.6f][%.6f %.6f %.6f][%.6f %.6f %.6f]\n",
+                        jj,jj,
+                        schur.Lblk[jj][jj][0][0],schur.Lblk[jj][jj][0][1],schur.Lblk[jj][jj][0][2],
+                        schur.Lblk[jj][jj][1][0],schur.Lblk[jj][jj][1][1],schur.Lblk[jj][jj][1][2],
+                        schur.Lblk[jj][jj][2][0],schur.Lblk[jj][jj][2][1],schur.Lblk[jj][jj][2][2]);
+                std::fflush(stdout);
+            }
+
+            // Trace all iterations for f58
+            if (body_count <= 3 && frame == 58) {
+                float det_A = A_pre_polar[0][0] * (A_pre_polar[1][1]*A_pre_polar[2][2] - A_pre_polar[1][2]*A_pre_polar[2][1])
+                            - A_pre_polar[0][1] * (A_pre_polar[1][0]*A_pre_polar[2][2] - A_pre_polar[1][2]*A_pre_polar[2][0])
+                            + A_pre_polar[0][2] * (A_pre_polar[1][0]*A_pre_polar[2][1] - A_pre_polar[1][1]*A_pre_polar[2][0]);
+                float max_elem = std::fabs(A_pre_polar[0][0]);
+                for (int r=0;r<3;r++) for (int c=0;c<3;c++) { float v = std::fabs(A_pre_polar[r][c]); if (v>max_elem) max_elem=v; }
+                std::printf("[ABD f58 it%d] pos=(%.4f,%.4f,%.4f) |A|max=%.4e det=%.4e\n",
+                    it, body->positionLin.x, body->positionLin.y, body->positionLin.z,
+                    max_elem, det_A);
+                std::printf("  cL=(%.4e,%.4e,%.4e) AL diag=(%.4e,%.4e,%.4e)\n",
+                    cL.x, cL.y, cL.z, AL[0][0], AL[1][1], AL[2][2]);
+                std::fflush(stdout);
+            }
+
             body->affine = polar_rotation(body->affine);
+
             body->syncFromAffine();
         }
 
@@ -1041,27 +1124,64 @@ void Solver::stepCpuAffine() {
         body->velocityAng = mat_to_angular(body->affine, body->initialAff) / dt;
     }
 
-    if (frame <= 10 || frame % 60 == 0) {
+    // ---- Phase 4b: Contact velocity damping ----
+    // For bodies with active ground contacts, limit velocity gain from
+    // collision processing and apply normal restitution damping.
+    if (has_ground_plane) {
+        for (Rigid* body = bodies; body != nullptr; body = body->next) {
+            if (body->mass <= 0) continue;
+            bool hasContact = false;
+            for (auto& gc : groundContacts) {
+                if (gc.body == body) { hasContact = true; break; }
+            }
+            if (!hasContact) continue;
+
+            // Restitution: zero out the rebounding normal velocity
+            if (body->velocityLin.z > 0 && body->prevVelocityLin.z < 0) {
+                body->velocityLin.z = 0;
+            }
+
+            // Clamp lateral velocity gain from collision solver
+            float3 dv = body->velocityLin - body->prevVelocityLin;
+            float dvLat = length(float2{dv.x, dv.y});
+            float maxLat = length(float2{body->prevVelocityLin.x, body->prevVelocityLin.y}) + 2.0f;
+            if (dvLat > maxLat) {
+                float scale = maxLat / dvLat;
+                body->velocityLin.x = body->prevVelocityLin.x + dv.x * scale;
+                body->velocityLin.y = body->prevVelocityLin.y + dv.y * scale;
+            }
+
+            // Clamp angular velocity gain from collision solver
+            float angNew = length(body->velocityAng);
+            float angMax = 10.0f;
+            if (angNew > angMax)
+                body->velocityAng = body->velocityAng * (angMax / angNew);
+        }
+    }
+
+    if (body_count <= 3 && (frame <= 10 || frame % 10 == 0 || (frame >= 55 && frame <= 120))) {
         int bodyIdx = 0;
         for (Rigid* body = bodies; body != nullptr; body = body->next) {
             if (body->mass <= 0) continue;
             int nGC = 0, nBC = 0;
             float sumGCLam = 0;
+            float maxGCPen = 0;
             for (auto& gc : groundContacts) {
                 if (gc.body != body) continue;
                 nGC++;
                 sumGCLam += gc.lambda.x;
+                maxGCPen = std::max(maxGCPen, std::max(gc.penalty.x, std::max(gc.penalty.y, gc.penalty.z)));
             }
             for (auto& bc : boxContacts) {
                 if (bc.bodyA == body || bc.bodyB == body) nBC++;
             }
             std::printf("[ABD f%d b%d] pos=(%.4f,%.4f,%.4f) vel=(%.4f,%.4f,%.4f) "
-                        "angvel=(%.4f,%.4f,%.4f) gc=%d bc=%d gcLam=%.2f\n",
+                        "angvel=(%.4f,%.4f,%.4f) gc=%d bc=%d gcLam=%.2f maxPen=%.1f\n",
                         frame, bodyIdx,
                         body->positionLin.x, body->positionLin.y, body->positionLin.z,
                         body->velocityLin.x, body->velocityLin.y, body->velocityLin.z,
                         body->velocityAng.x, body->velocityAng.y, body->velocityAng.z,
-                        nGC, nBC, sumGCLam);
+                        nGC, nBC, sumGCLam, maxGCPen);
             bodyIdx++;
         }
         // Box-box contact details
@@ -1089,6 +1209,21 @@ void Solver::stepCpuAffine() {
     for (auto& bc : boxContacts) {
         abd_contact_points.push_back(bc.bodyA->positionLin + bc.bodyA->affine * bc.rA);
         abd_contact_points.push_back(bc.bodyB->positionLin + bc.bodyB->affine * bc.rB);
+    }
+
+    // DIAG: print tilted-drop body state at key frames
+    if (body_count <= 3 && (frame <= 5 || frame % 100 == 0 || frame == 300 || frame == 600)) {
+        for (Rigid* b = bodies; b; b = b->next) {
+            float3x3& A = b->affine;
+            std::printf("[ABD f%d] pos=(%.4f, %.4f, %.4f) vel=(%.4f, %.4f, %.4f) angVel=(%.4f, %.4f, %.4f)\n",
+                frame, b->positionLin.x, b->positionLin.y, b->positionLin.z,
+                b->velocityLin.x, b->velocityLin.y, b->velocityLin.z,
+                b->velocityAng.x, b->velocityAng.y, b->velocityAng.z);
+            std::printf("  affine: [%.4f %.4f %.4f] [%.4f %.4f %.4f] [%.4f %.4f %.4f]\n",
+                A[0][0], A[0][1], A[0][2],
+                A[1][0], A[1][1], A[1][2],
+                A[2][0], A[2][1], A[2][2]);
+        }
     }
 
     // Upload to GPU for rendering (only needed when GPU context exists)

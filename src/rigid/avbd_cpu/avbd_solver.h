@@ -250,6 +250,7 @@ struct Solver {
     void defaultParams();
     void step();
     void stepCpuAffine();
+    void stepCpuPABD();
 
     GpuSolver* gpu_solver() { return gpu_solver_; }
 };

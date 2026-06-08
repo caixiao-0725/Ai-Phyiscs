@@ -847,11 +847,85 @@ void setupABDStacking(Solver* s) {
         new Rigid(s, {1, 1, 1}, 1.0f, 0.0f, {0, 0, 0.5f + i * 1.0f});
 }
 
+void setupPABDStacking(Solver* s) {
+    s->clear();
+    s->rotation_mode = RotationMode::PABD;
+    s->set_ground_plane(0.0f, 0.0f);
+
+    // Port of PeriDyno examples/Cuda/PABDRigidBody/PABD_BoxStack/main.cpp.
+    // PeriDyno is Y-up; these AVBD scenes are Z-up.
+    constexpr float dHat = 0.001f;
+    s->dt = 0.016f;
+    s->gravity = -9.8f;
+    s->iterations = 20;
+
+    const bool hasBall = false;
+    const int x = 1;
+    const int y = 1;
+    const int z = 50;
+    const float hl_x = 1.0f;
+    const float hl_z = 1.0f;
+    const float hl_y = 1.0f;
+    const float interval_x = 0.001f;
+    const float interval_y = 0.001f;
+    const float offset_x = 0.0f;
+    const float offset_y = 0.0f;
+    (void)hasBall;
+
+    const float3 boxSize = {2.0f * hl_x, 2.0f * hl_y, 2.0f * hl_z};
+    for (int i = 0; i < x; i++) {
+        for (int j = 0; j < z; j++) {
+            for (int k = 0; k < y; k++) {
+                const float pdX =
+                    2.0f * i * (hl_x + dHat + interval_x) -
+                    (hl_x + dHat + interval_x) * x +
+                    (j % 2 ? offset_x : 0.0f);
+                const float pdY = 2.0f * j * hl_z + hl_z;
+                const float pdZ =
+                    2.0f * k * (hl_y + dHat + interval_y) -
+                    (hl_y + dHat + interval_y) * y +
+                    (j % 2 ? offset_y : 0.0f);
+                new Rigid(s, boxSize, 1.0f, 0.0f, {pdX, pdZ, pdY});
+            }
+        }
+    }
+}
+
 }  // anonymous namespace
 
+void setupABDTiltedDrop(Solver* s) {
+    s->clear();
+    s->rotation_mode = RotationMode::Affine;
+    s->set_ground_plane(0.0f, 0.5f);
+    s->iterations = 20;
+
+    auto* b = new Rigid(s, {2, 2, 2}, 1.0f, 0.5f, {0, 0, 5.0f});
+
+    // Tilt 45 degrees around Y axis
+    float angle = 45.0f * 3.14159f / 180.0f;
+    float c = std::cos(angle), sn = std::sin(angle);
+    b->affine = {{{ c, 0, sn}, {0, 1, 0}, {-sn, 0, c}}};
+    b->syncFromAffine();
+}
+
+void setupAVBDTiltedDrop(Solver* s) {
+    s->clear();
+    s->rotation_mode = RotationMode::AxisAngle;
+    s->set_ground_plane(0.0f, 0.5f);
+    s->iterations = 20;
+
+    auto* b = new Rigid(s, {2, 2, 2}, 1.0f, 0.5f, {0, 0, 5.0f});
+    float angle = 30.0f * 3.14159f / 180.0f;
+    b->positionAng = {0, std::sin(angle / 2.0f), 0, std::cos(angle / 2.0f)};
+    b->syncFromQuat();
+}
+
 extern "C" void chysx_register_avbd_scenes() {
+    register_scene("PABD: Stacking", []() -> Scene* { return new AVBDScene("PABD: Stacking", setupPABDStacking); });
     register_scene("ABD: Stacking", []() -> Scene* { return new AVBDScene("ABD: Stacking", setupABDStacking); });
     register_scene("ABD: Free Fall", []() -> Scene* { return new AVBDScene("ABD: Free Fall", setupABDFreeFall); });
+    register_scene("ABD: Tilted Drop", []() -> Scene* { return new AVBDScene("ABD: Tilted Drop", setupABDTiltedDrop); });
+    register_scene("AVBD: Tilted Drop", []() -> Scene* { return new AVBDScene("AVBD: Tilted Drop", setupAVBDTiltedDrop); });
     register_scene("AVBD: Pyramid",    []() -> Scene* { return new AVBDScene("AVBD: Pyramid",    setupPyramid); });
     register_scene("AVBD: Pyramid 2",  []() -> Scene* { return new AVBDScene("AVBD: Pyramid 2",  setupPyramid2); });
     register_scene("AVBD: Rope",       []() -> Scene* { return new AVBDScene("AVBD: Rope",       setupRope); });
