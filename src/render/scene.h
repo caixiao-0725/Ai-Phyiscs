@@ -29,6 +29,16 @@ struct DrawMesh {
     bool wireframe = false;   // draw as wireframe overlay
 };
 
+struct SceneMetrics {
+    int bodies = 0;
+    float max_speed = 0.0f;
+    float max_upward_speed = 0.0f;
+    float max_angular_speed = 0.0f;
+    float min_z = 0.0f;
+    float max_pair_penetration = 0.0f;
+    bool has_nan = false;
+};
+
 // Abstract scene interface.
 class Scene {
 public:
@@ -49,8 +59,14 @@ public:
     // call to step() or setup().
     virtual void draw_meshes(std::vector<DrawMesh>& out) = 0;
 
+    // Optional: expose lightweight simulation metrics for batch experiments.
+    virtual bool metrics(SceneMetrics& out) { (void)out; return false; }
+
     // Optional: expose tunable parameters to ImGui.
     virtual void ui() {}
+
+    // Optional: inform scenes that no graphics context is available.
+    virtual void set_headless(bool headless) { (void)headless; }
 
     // Optional: reset to initial state without full re-setup.
     virtual void reset() { setup(); }

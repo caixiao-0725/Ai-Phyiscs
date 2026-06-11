@@ -161,6 +161,19 @@ void Solver::defaultParams() {
     betaAng = 100.0f;
     alpha = 0.95f;
     gamma = 0.99f;
+    force_cpu = false;
+    affine_incremental_velocity = false;
+    affine_so3_mu = 50.0f;
+    affine_so3_mu_ramp = false;
+    affine_so3_mu_start = 5.0f;
+    affine_so3_mu_end = 50.0f;
+    affine_ortho_al = false;
+    affine_ortho_beta = 100.0f;
+    affine_ortho_penalty_min = AVBD_PENALTY_MIN;
+    affine_ortho_penalty_max = 100000.0f;
+    affine_ortho_potential = false;
+    affine_ortho_stiffness = 10.0f;
+    affine_line_search = true;
 }
 
 void Solver::step() {
@@ -175,6 +188,11 @@ void Solver::step() {
     // PABD: IPC-barrier position solver with optional velocity pre-phase
     if (rotation_mode == RotationMode::PABD) {
         stepCpuPABD();
+        return;
+    }
+
+    if (force_cpu) {
+        stepCpuAVBD();
         return;
     }
 
@@ -521,6 +539,99 @@ void Solver::step() {
     prev_body_count_ = body_count;
 }
 
+void Solver::stepCpuAVBD() {
+    gpu_state_valid_ = false;
+    gpu_state_valid_prev_ = false;
+
+    int body_count = 0;
+    for (Rigid* b = bodies; b; b = b->next) body_count++;
+
+    // ---- Phase 1: Predict ----
+    for (Rigid* body = bodies; body != nullptr; body = body->next) {
+        body->inertialLin = body->positionLin + body->velocityLin * dt;
+        if (body->mass > 0.0f)
+            body->inertialLin += float3{0, 0, gravity} * (dt * dt);
+
+        float3 accel = (body->velocityLin - body->prevVelocityLin) / dt;
+        float accelExt = accel.z * sign(gravity);
+        float accelWeight = std::fabs(gravity) > 0.0f ? clamp(accelExt / std::fabs(gravity), 0.0f, 1.0f) : 0.0f;
+        if (!std::isfinite(accelWeight))
+            accelWeight = 0.0f;
+
+        body->inertialAng = body->positionAng + body->velocityAng * dt;
+        body->initialLin = body->positionLin;
+        body->initialAng = body->positionAng;
+
+        if (body->mass > 0.0f) {
+            body->positionLin = body->positionLin + body->velocityLin * dt +
+                                float3{0, 0, gravity} * (accelWeight * dt * dt);
+            body->positionAng = body->positionAng + body->velocityAng * dt;
+            body->syncFromQuat();
+        }
+    }
+
+    // ---- Phase 2: CPU broadphase + manifold creation ----
+    for (Rigid* a = bodies; a != nullptr; a = a->next) {
+        for (Rigid* b = a->next; b != nullptr; b = b->next) {
+            if (a->mass <= 0.0f && b->mass <= 0.0f) continue;
+            if (a->constrainedTo(b)) continue;
+            float3 dp = b->positionLin - a->positionLin;
+            float r = a->radius + b->radius;
+            if (dot(dp, dp) <= r * r)
+                new Manifold(this, a, b);
+        }
+    }
+
+    for (Force* force = forces; force != nullptr;) {
+        if (!force->initialize()) {
+            Force* next = force->next;
+            delete force;
+            force = next;
+        } else {
+            force = force->next;
+        }
+    }
+
+    // ---- Phase 3: CPU AVBD AL iterations ----
+    for (int it = 0; it < iterations; it++) {
+        for (Rigid* body = bodies; body != nullptr; body = body->next) {
+            if (body->mass <= 0.0f) continue;
+
+            float3x3 MLin = diagonal(body->mass, body->mass, body->mass);
+            float3x3 MAng = diagonal(body->moment.x, body->moment.y, body->moment.z);
+            float3x3 lhsLin = MLin / (dt * dt);
+            float3x3 lhsAng = MAng / (dt * dt);
+            float3x3 lhsCross = float3x3{0, 0, 0, 0, 0, 0, 0, 0, 0};
+            float3 rhsLin = lhsLin * (body->positionLin - body->inertialLin);
+            float3 rhsAng = lhsAng * (body->positionAng - body->inertialAng);
+
+            for (Force* force = body->forces; force != nullptr;
+                 force = (force->bodyA == body) ? force->nextA : force->nextB)
+                force->updatePrimal(body, alpha, lhsLin, lhsAng, lhsCross, rhsLin, rhsAng);
+
+            float3 dxLin, dxAng;
+            solve(lhsLin, lhsAng, lhsCross, -rhsLin, -rhsAng, dxLin, dxAng);
+            body->positionLin = body->positionLin + dxLin;
+            body->positionAng = body->positionAng + dxAng;
+            body->syncFromQuat();
+        }
+
+        for (Force* force = forces; force != nullptr; force = force->next)
+            force->updateDual(alpha);
+    }
+
+    // ---- Phase 4: Velocity recovery ----
+    for (Rigid* body = bodies; body != nullptr; body = body->next) {
+        body->prevVelocityLin = body->velocityLin;
+        if (body->mass > 0.0f) {
+            body->velocityLin = (body->positionLin - body->initialLin) / dt;
+            body->velocityAng = (body->positionAng - body->initialAng) / dt;
+        }
+    }
+
+    prev_body_count_ = body_count;
+}
+
 // Ground-plane contact point for PABD affine solver (augmented Lagrangian).
 // Ground basis is fixed: row0=normal(0,0,1), row1=tangent(1,0,0), row2=tangent(0,1,0).
 struct GroundContact {
@@ -565,6 +676,7 @@ void Solver::stepCpuAffine() {
         float3 gravDt = float3{0, 0, gravity} * dt;
         float3 newVel = body->velocityLin + gravDt;
         float3 newPos = body->positionLin + newVel * dt;
+        body->velocityLin = newVel;
         body->inertialLin = newPos;
         body->positionLin = newPos;
 
@@ -592,6 +704,7 @@ void Solver::stepCpuAffine() {
     if (has_ground_plane) {
         for (Rigid* body = bodies; body != nullptr; body = body->next) {
             if (body->mass <= 0) continue;
+            float mu = std::sqrt(body->friction * ground_friction);
             for (int v = 0; v < 8; v++) {
                 float3 rLocal = {
                     kLocalVerts[v][0] * body->size.x,
@@ -610,7 +723,6 @@ void Solver::stepCpuAffine() {
                         break;
                     }
                 }
-                float mu = std::sqrt(body->friction * ground_friction);
                 // C0: initial constraint value (normal gap, tangent x, tangent y)
                 float3 C0;
                 C0.x = worldPos.z - ground_z;
@@ -645,6 +757,20 @@ void Solver::stepCpuAffine() {
             if (nc <= 0) continue;
 
             float mu = std::sqrt(a->friction * b->friction);
+            if (mu == 0.0f && std::fabs(basis[0].z) < 0.9f)
+                continue;
+            if (mu == 0.0f && nc > 1) {
+                float3 avgA = {0, 0, 0};
+                float3 avgB = {0, 0, 0};
+                for (int i = 0; i < nc; i++) {
+                    avgA += tmpContacts[i].rA;
+                    avgB += tmpContacts[i].rB;
+                }
+                tmpContacts[0].rA = avgA / (float)nc;
+                tmpContacts[0].rB = avgB / (float)nc;
+                tmpContacts[0].feature.key &= 0xFFFFFF00;
+                nc = 1;
+            }
             for (int i = 0; i < nc; i++) {
                 BoxContact bc;
                 bc.bodyA = a;
@@ -716,6 +842,7 @@ void Solver::stepCpuAffine() {
             groundContacts.clear();
             for (Rigid* body = bodies; body != nullptr; body = body->next) {
                 if (body->mass <= 0) continue;
+                float mu = std::sqrt(body->friction * ground_friction);
                 for (int v = 0; v < 8; v++) {
                     float3 rLocal = {
                         kLocalVerts[v][0] * body->size.x,
@@ -726,19 +853,19 @@ void Solver::stepCpuAffine() {
 
                     float3 lam = {0, 0, 0};
                     float3 pen = {AVBD_PENALTY_MIN, AVBD_PENALTY_MIN, AVBD_PENALTY_MIN};
-                    float mu = 0;
+                    float contactMu = 0;
                     float3 c0 = {worldPos.z - ground_z, 0, 0};
                     for (auto& pc : iterPrev) {
                         if (pc.body == body && pc.vertIdx == v) {
                             lam = pc.lambda;
                             pen = pc.penalty;
-                            mu = pc.friction;
+                            contactMu = pc.friction;
                             c0 = pc.C0;  // preserve C0 across iterations
                             break;
                         }
                     }
-                    if (mu == 0) mu = std::sqrt(body->friction * ground_friction);
-                    groundContacts.push_back({body, rLocal, v, lam, pen, mu, c0});
+                    if (contactMu == 0) contactMu = mu;
+                    groundContacts.push_back({body, rLocal, v, lam, pen, contactMu, c0});
                 }
             }
         }
@@ -759,6 +886,20 @@ void Solver::stepCpuAffine() {
                     float3x3 basis;
                     int nc = Manifold::collide(a, b, tmpContacts, basis);
                     float mu = std::sqrt(a->friction * b->friction);
+                    if (mu == 0.0f && std::fabs(basis[0].z) < 0.9f)
+                        continue;
+                    if (mu == 0.0f && nc > 1) {
+                        float3 avgA = {0, 0, 0};
+                        float3 avgB = {0, 0, 0};
+                        for (int i = 0; i < nc; i++) {
+                            avgA += tmpContacts[i].rA;
+                            avgB += tmpContacts[i].rB;
+                        }
+                        tmpContacts[0].rA = avgA / (float)nc;
+                        tmpContacts[0].rB = avgB / (float)nc;
+                        tmpContacts[0].feature.key &= 0xFFFFFF00;
+                        nc = 1;
+                    }
                     for (int i = 0; i < nc; i++) {
                         BoxContact bc;
                         bc.bodyA = a; bc.bodyB = b;
@@ -792,15 +933,23 @@ void Solver::stepCpuAffine() {
                             if (bestPC) {
                                 bc.lambda = bestPC->lambda;
                                 bc.penalty = bestPC->penalty;
+                                bc.C0 = bestPC->C0;
+                                matched = true;
                             }
                         }
-                        // Preserve C0 from matched contact or compute fresh
-                        bc.C0 = {0, 0, 0};
-                        // Try to inherit C0 from the featureKey or spatial match
-                        for (auto& pc : iterPrev) {
-                            if (pc.bodyA == a && pc.bodyB == b && pc.featureKey == bc.featureKey) {
-                                bc.C0 = pc.C0;
-                                break;
+                        if (!matched) {
+                            float3 xA = a->positionLin + a->affine * bc.rA;
+                            float3 xB = b->positionLin + b->affine * bc.rB;
+                            float3 diffInit = xA - xB;
+                            bc.C0.x = dot(diffInit, basis[0]) + AVBD_COLLISION_MARGIN;
+                            bc.C0.y = dot(diffInit, basis[1]);
+                            bc.C0.z = dot(diffInit, basis[2]);
+                        } else {
+                            for (auto& pc : iterPrev) {
+                                if (pc.bodyA == a && pc.bodyB == b && pc.featureKey == bc.featureKey) {
+                                    bc.C0 = pc.C0;
+                                    break;
+                                }
                             }
                         }
                         boxContacts.push_back(bc);
@@ -825,7 +974,8 @@ void Solver::stepCpuAffine() {
             for (auto& gc : groundContacts) {
                 if (gc.body != body) continue;
                 float3 dirs[3] = {{0,0,1}, {1,0,0}, {0,1,0}};
-                for (int d = 0; d < 3; d++) {
+                const int dirCount = gc.friction > 0.0f ? 3 : 1;
+                for (int d = 0; d < dirCount; d++) {
                     float3 nd_local = ATildeT * dirs[d];
                     schur.accumulate_dir(gc.penalty[d], nd_local, gc.rLocal);
                 }
@@ -844,18 +994,92 @@ void Solver::stepCpuAffine() {
                 float sign = isA ? 1.0f : -1.0f;
                 float rawGap = dot(xSelf - xOther, bc.basis[0]) * sign;
                 if (rawGap >= AVBD_COLLISION_MARGIN && bc.lambda.x >= 0) continue;
-                for (int d = 0; d < 3; d++) {
+                const int dirCount = bc.friction > 0.0f ? 3 : 1;
+                for (int d = 0; d < dirCount; d++) {
                     float3 nd_local = ATildeT * (bc.basis[d] * sign);
                     schur.accumulate_dir(bc.penalty[d], nd_local, rLocal);
                 }
             }
 
+            float3x3 orthoSrcAdjust = {0,0,0, 0,0,0, 0,0,0};
+            if (affine_ortho_al) {
+                float3x3 A0 = ATildeT * body->affine;
+                float3 hI[3] = {{0,0,0}, {0,0,0}, {0,0,0}};
+                float3 rhs[3] = {{0,0,0}, {0,0,0}, {0,0,0}};
+                auto addOrtho = [&](int idx, int c0, int c1, bool diagonal) {
+                    float3 J[3] = {{0,0,0}, {0,0,0}, {0,0,0}};
+                    float3 a0 = A0.col(c0);
+                    float3 a1 = A0.col(c1);
+                    float C;
+                    if (diagonal) {
+                        J[c0] = a0;
+                        C = 0.5f * (dot(a0, a0) - 1.0f);
+                    } else {
+                        J[c0] = a1;
+                        J[c1] = a0;
+                        C = dot(a0, a1);
+                    }
+
+                    float k = body->orthoPenalty[idx];
+                    float s = k * C + body->orthoLambda[idx];
+                    for (int p = 0; p < 3; p++) {
+                        if (lengthSq(J[p]) == 0.0f) continue;
+                        rhs[p] = rhs[p] - J[p] * s;
+                        for (int q = 0; q < 3; q++) {
+                            if (lengthSq(J[q]) == 0.0f) continue;
+                            float3x3 Hpq = outer(J[p], J[q]) * k;
+                            schur.sumD[p][q] += Hpq;
+                            hI[p] += Hpq.col(q);
+                        }
+                    }
+                };
+
+                addOrtho(0, 0, 0, true);
+                addOrtho(1, 1, 1, true);
+                addOrtho(2, 2, 2, true);
+                addOrtho(3, 0, 1, false);
+                addOrtho(4, 0, 2, false);
+                addOrtho(5, 1, 2, false);
+
+                for (int p = 0; p < 3; p++)
+                    orthoSrcAdjust[p] = rhs[p] - hI[p];
+            }
+
+            if (affine_ortho_potential) {
+                float3x3 A0 = ATildeT * body->affine;
+                float3 a[3] = {A0.col(0), A0.col(1), A0.col(2)};
+                float S[3][3];
+                for (int p = 0; p < 3; p++)
+                    for (int q = 0; q < 3; q++)
+                        S[p][q] = dot(a[p], a[q]) - (p == q ? 1.0f : 0.0f);
+
+                float kOrtho = body->mass * affine_ortho_stiffness;
+                float3 grad[3] = {{0,0,0}, {0,0,0}, {0,0,0}};
+                for (int p = 0; p < 3; p++) {
+                    for (int q = 0; q < 3; q++)
+                        grad[p] += a[q] * (4.0f * kOrtho * S[p][q]);
+                }
+
+                float3 hA0[3] = {{0,0,0}, {0,0,0}, {0,0,0}};
+                float3 hI[3] = {{0,0,0}, {0,0,0}, {0,0,0}};
+                float3x3 sumOuter = outer(a[0], a[0]) + outer(a[1], a[1]) + outer(a[2], a[2]);
+                for (int p = 0; p < 3; p++) {
+                    for (int q = 0; q < 3; q++) {
+                        float3x3 Hpq = (outer(a[q], a[p]) + identity3x3() * S[p][q]) * (4.0f * kOrtho);
+                        if (p == q)
+                            Hpq += sumOuter * (4.0f * kOrtho);
+                        schur.sumD[p][q] += Hpq;
+                        hA0[p] += Hpq * a[q];
+                        hI[p] += Hpq.col(q);
+                    }
+                }
+                for (int p = 0; p < 3; p++)
+                    orthoSrcAdjust[p] += hA0[p] - grad[p] - hI[p];
+            }
+
             schur.factor(body->mass, body->inertiaMatrix);
 
-
             // Build RHS — b = H·q_target - external_forces
-            // q_target = (c_L=0, A_L=I). H·(0,I) contributes inertia (J·e_j)
-            // plus sumD/sumB penalty terms at target.
             float3 srcC = {0, 0, 0};
             float3x3 srcA = body->inertiaMatrix;
 
@@ -863,6 +1087,9 @@ void Solver::stepCpuAffine() {
             for (int j = 0; j < 3; j++)
                 for (int k = 0; k < 3; k++)
                     srcA[j] = srcA[j] + schur.sumD[j][k].col(k);
+            if (affine_ortho_al)
+                for (int j = 0; j < 3; j++)
+                    srcA[j] += orthoSrcAdjust[j];
             // Cross-coupling B at c_L=0: srcC += Σ_j sumB[j]·e_j
             for (int j = 0; j < 3; j++)
                 srcC = srcC + schur.sumB[j].col(j);
@@ -871,18 +1098,13 @@ void Solver::stepCpuAffine() {
             for (auto& gc : groundContacts) {
                 if (gc.body != body) continue;
                 float3 initPos = body->initialLin + body->initialAff * gc.rLocal;
-                float3 targets[3] = {
-                    {0, 0, ground_z},    // normal target: z = ground
-                    {initPos.x, 0, 0},   // tangent-x target: anchored x
-                    {0, initPos.y, 0}    // tangent-y target: anchored y
-                };
                 float3 xRef = cTilde + ATilde * gc.rLocal;
                 float3 dirs[3] = {{0,0,1}, {1,0,0}, {0,1,0}};
 
                 // Compute F_d = κ_d · e_d + λ_d for each direction
                 float3 F;
                 for (int d = 0; d < 3; d++) {
-                    float e_d = dot(dirs[d], xRef) - dot(dirs[d], targets[d]);
+                    float e_d = gc.C0[d] * (1.0f - alpha) + dot(dirs[d], xRef - initPos);
                     F[d] = gc.penalty[d] * e_d + gc.lambda[d];
                 }
                 // Unilateral: normal force must be compressive
@@ -895,7 +1117,8 @@ void Solver::stepCpuAffine() {
                     F.z *= bounds / tangMag;
                 }
 
-                for (int d = 0; d < 3; d++) {
+                const int dirCount = gc.friction > 0.0f ? 3 : 1;
+                for (int d = 0; d < dirCount; d++) {
                     float3 nd_local = ATildeT * dirs[d];
                     srcC = srcC - nd_local * F[d];
                     for (int j = 0; j < 3; j++)
@@ -928,11 +1151,13 @@ void Solver::stepCpuAffine() {
 
                 // e_d at (c_L=0, A_L=I): constraint values at inertial reference
                 float3 diffRef = xRef - xOtherCur;
+                float3 initSelf = body->initialLin + body->initialAff * rLocal;
+                float3 initOther = other->initialLin + other->initialAff * rOther;
+                float3 diffInit = initSelf - initOther;
                 float3 F;
                 for (int d = 0; d < 3; d++) {
                     float3 bd = bc.basis[d] * sign;
-                    float e_d = dot(diffRef, bd);
-                    if (d == 0) e_d += AVBD_COLLISION_MARGIN;
+                    float e_d = bc.C0[d] * (1.0f - alpha) + dot(diffRef - diffInit, bd);
                     F[d] = bc.penalty[d] * e_d + bc.lambda[d];
                 }
                 F.x = std::min(F.x, 0.0f);
@@ -943,7 +1168,8 @@ void Solver::stepCpuAffine() {
                     F.z *= bounds / tangMag;
                 }
 
-                for (int d = 0; d < 3; d++) {
+                const int dirCount = bc.friction > 0.0f ? 3 : 1;
+                for (int d = 0; d < dirCount; d++) {
                     float3 nd_local = ATildeT * (bc.basis[d] * sign);
                     srcC = srcC - nd_local * F[d];
                     for (int j = 0; j < 3; j++)
@@ -951,92 +1177,127 @@ void Solver::stepCpuAffine() {
                 }
             }
 
-            // Solve
+            // Solve once in affine space, then use its polar factor as the
+            // local SO(3) target for a projective local/global correction.
             float3 cL;
             float3x3 AL;
             schur.solve_update(srcC, srcA, cL, AL);
 
-            // Clamp cL and AL to prevent explosion from ill-conditioned solves
-            float cL_len = length(cL);
-            float cL_max = length(body->size) * 2.0f;
-            if (cL_len > cL_max) cL = cL * (cL_max / cL_len);
+            float muScale = affine_so3_mu;
+            if (affine_so3_mu_ramp) {
+                float t = iterations > 1 ? (float)it / (float)(iterations - 1) : 1.0f;
+                muScale = affine_so3_mu_start + (affine_so3_mu_end - affine_so3_mu_start) * t;
+            }
+            const float muSO3 = body->mass * muScale;
+            float3x3 RLocal = identity3x3();
+            if (muSO3 > 0.0f) {
+                const float3x3 inertiaSO3 = body->inertiaMatrix + identity3x3() * muSO3;
+                RLocal = ATildeT * polar_rotation(ATilde * AL);
+                for (int so3It = 0; so3It < 2; so3It++) {
+                    float3x3 srcASO3 = srcA;
+                    for (int col = 0; col < 3; col++)
+                        for (int row = 0; row < 3; row++)
+                            srcASO3[col][row] += muSO3 * RLocal[row][col];
 
-            // Clamp AL: ensure eigenvalues stay in [0.5, 2.0] by clamping towards I
-            float al_max = 0.0f;
-            for (int r = 0; r < 3; r++)
-                for (int c = 0; c < 3; c++) {
-                    float v = std::fabs(AL[r][c] - (r==c ? 1.0f : 0.0f));
-                    if (v > al_max) al_max = v;
+                    schur.factor(body->mass, inertiaSO3);
+                    schur.solve_update(srcC, srcASO3, cL, AL);
+                    RLocal = ATildeT * polar_rotation(ATilde * AL);
                 }
-            if (al_max > 0.5f) {
-                float s = 0.5f / al_max;
-                for (int r = 0; r < 3; r++)
-                    for (int c = 0; c < 3; c++)
-                        AL[r][c] = (r==c ? 1.0f : 0.0f) + (AL[r][c] - (r==c ? 1.0f : 0.0f)) * s;
+            }
+
+            float3 cRef = ATildeT * (body->positionLin - cTilde);
+            float3x3 ARef = ATildeT * body->affine;
+            auto localEnergy = [&](float3 c, float3x3 A) {
+                float E = 0.5f * body->mass * dot(c, c);
+                float3x3 dA = A - identity3x3();
+                for (int col = 0; col < 3; col++) {
+                    float3 dc = {dA[0][col], dA[1][col], dA[2][col]};
+                    E += 0.5f * dot(dc, body->inertiaMatrix * dc);
+                }
+
+                for (auto& gc : groundContacts) {
+                    if (gc.body != body) continue;
+                    float3 dirs[3] = {{0,0,1}, {1,0,0}, {0,1,0}};
+                    float3 initPos = body->initialLin + body->initialAff * gc.rLocal;
+                    float targets[3] = {ground_z, initPos.x, initPos.y};
+                    const int dirCount = gc.friction > 0.0f ? 3 : 1;
+                    for (int d = 0; d < dirCount; d++) {
+                        float C = gc.C0[d] * (1.0f - alpha)
+                            + dot(dirs[d], cTilde + ATilde * (c + A * gc.rLocal) - initPos);
+                        if (d == 0 && C > 0.0f && gc.lambda[d] >= 0.0f) continue;
+                        E += 0.5f * gc.penalty[d] * C * C + gc.lambda[d] * C;
+                    }
+                }
+
+                for (auto& bc : boxContacts) {
+                    bool isA = (bc.bodyA == body);
+                    bool isB = (bc.bodyB == body);
+                    if (!isA && !isB) continue;
+                    float3 rLocal = isA ? bc.rA : bc.rB;
+                    float3 rOther = isA ? bc.rB : bc.rA;
+                    Rigid* other = isA ? bc.bodyB : bc.bodyA;
+                    float sign = isA ? 1.0f : -1.0f;
+                    float3 xOtherCur = other->positionLin + other->affine * rOther;
+                    const int dirCount = bc.friction > 0.0f ? 3 : 1;
+                    for (int d = 0; d < dirCount; d++) {
+                        float3 bd = bc.basis[d] * sign;
+                        float3 initSelf = body->initialLin + body->initialAff * rLocal;
+                        float3 initOther = other->initialLin + other->initialAff * rOther;
+                        float C = bc.C0[d] * (1.0f - alpha)
+                                + dot(cTilde + ATilde * (c + A * rLocal) - xOtherCur - (initSelf - initOther), bd);
+                        if (d == 0 && C > 0.0f && bc.lambda[d] >= 0.0f) continue;
+                        E += 0.5f * bc.penalty[d] * C * C + bc.lambda[d] * C;
+                    }
+                }
+
+                if (affine_ortho_al) {
+                    float3 cols[3] = {A.col(0), A.col(1), A.col(2)};
+                    float C[6] = {
+                        0.5f * (dot(cols[0], cols[0]) - 1.0f),
+                        0.5f * (dot(cols[1], cols[1]) - 1.0f),
+                        0.5f * (dot(cols[2], cols[2]) - 1.0f),
+                        dot(cols[0], cols[1]),
+                        dot(cols[0], cols[2]),
+                        dot(cols[1], cols[2])
+                    };
+                    for (int q = 0; q < 6; q++)
+                        E += 0.5f * body->orthoPenalty[q] * C[q] * C[q] + body->orthoLambda[q] * C[q];
+                }
+
+                if (affine_ortho_potential) {
+                    float3 cols[3] = {A.col(0), A.col(1), A.col(2)};
+                    float e = 0.0f;
+                    for (int p = 0; p < 3; p++) {
+                        for (int q = 0; q < 3; q++) {
+                            float S = dot(cols[p], cols[q]) - (p == q ? 1.0f : 0.0f);
+                            e += S * S;
+                        }
+                    }
+                    E += body->mass * affine_ortho_stiffness * e;
+                }
+
+                if (muSO3 > 0.0f)
+                    E += 0.5f * muSO3 * frobenius_sq(A - RLocal);
+                return E;
+            };
+
+            if (affine_line_search) {
+                float E0 = localEnergy(cRef, ARef);
+                float step = 1.0f;
+                for (int ls = 0; ls < 8; ls++) {
+                    float3 cTry = cRef + (cL - cRef) * step;
+                    float3x3 ATry = ARef + (AL - ARef) * step;
+                    if (localEnergy(cTry, ATry) <= E0 || step <= 1.0f / 256.0f) {
+                        cL = cTry;
+                        AL = ATry;
+                        break;
+                    }
+                    step *= 0.5f;
+                }
             }
 
             body->positionLin = cTilde + ATilde * cL;
-            float3x3 A_pre_polar = ATilde * AL;
-            body->affine = A_pre_polar;
-
-            // NaN guard: detect and report (first 10 occurrences)
-            static int nan_count = 0;
-            bool cL_nan = std::isnan(cL.x) || std::isnan(cL.y) || std::isnan(cL.z);
-            bool AL_nan = std::isnan(AL[0][0]);
-            bool A_nan = std::isnan(A_pre_polar[0][0]);
-            if (body_count <= 3 && (cL_nan || AL_nan || A_nan) && nan_count < 10) {
-                nan_count++;
-                int nGC = 0;
-                for (auto& g : groundContacts) { if (g.body == body) nGC++; }
-                std::printf("[ABD NaN f%d it%d] gc=%d cL=(%.6f,%.6f,%.6f) srcC=(%.6f,%.6f,%.6f)\n",
-                    frame, it, nGC, cL.x, cL.y, cL.z, srcC.x, srcC.y, srcC.z);
-                std::printf("  cTilde=(%.6f,%.6f,%.6f)\n", cTilde.x, cTilde.y, cTilde.z);
-                std::printf("  ATilde=[%.6f %.6f %.6f][%.6f %.6f %.6f][%.6f %.6f %.6f]\n",
-                    ATilde[0][0],ATilde[0][1],ATilde[0][2],
-                    ATilde[1][0],ATilde[1][1],ATilde[1][2],
-                    ATilde[2][0],ATilde[2][1],ATilde[2][2]);
-                std::printf("  AL=[%.6f %.6f %.6f][%.6f %.6f %.6f][%.6f %.6f %.6f]\n",
-                    AL[0][0],AL[0][1],AL[0][2],
-                    AL[1][0],AL[1][1],AL[1][2],
-                    AL[2][0],AL[2][1],AL[2][2]);
-                std::printf("  sumK=[%.4f %.4f %.4f][%.4f %.4f %.4f][%.4f %.4f %.4f]\n",
-                    schur.sumK[0][0],schur.sumK[0][1],schur.sumK[0][2],
-                    schur.sumK[1][0],schur.sumK[1][1],schur.sumK[1][2],
-                    schur.sumK[2][0],schur.sumK[2][1],schur.sumK[2][2]);
-                std::printf("  Kinv=[%.8f %.8f %.8f][%.8f %.8f %.8f][%.8f %.8f %.8f]\n",
-                    schur.Kinv[0][0],schur.Kinv[0][1],schur.Kinv[0][2],
-                    schur.Kinv[1][0],schur.Kinv[1][1],schur.Kinv[1][2],
-                    schur.Kinv[2][0],schur.Kinv[2][1],schur.Kinv[2][2]);
-                std::printf("  srcA[0]=(%.4f,%.4f,%.4f) [1]=(%.4f,%.4f,%.4f) [2]=(%.4f,%.4f,%.4f)\n",
-                    srcA[0].x,srcA[0].y,srcA[0].z,
-                    srcA[1].x,srcA[1].y,srcA[1].z,
-                    srcA[2].x,srcA[2].y,srcA[2].z);
-                for (int jj = 0; jj < 3; jj++)
-                    std::printf("  Lblk[%d][%d]=[%.6f %.6f %.6f][%.6f %.6f %.6f][%.6f %.6f %.6f]\n",
-                        jj,jj,
-                        schur.Lblk[jj][jj][0][0],schur.Lblk[jj][jj][0][1],schur.Lblk[jj][jj][0][2],
-                        schur.Lblk[jj][jj][1][0],schur.Lblk[jj][jj][1][1],schur.Lblk[jj][jj][1][2],
-                        schur.Lblk[jj][jj][2][0],schur.Lblk[jj][jj][2][1],schur.Lblk[jj][jj][2][2]);
-                std::fflush(stdout);
-            }
-
-            // Trace all iterations for f58
-            if (body_count <= 3 && frame == 58) {
-                float det_A = A_pre_polar[0][0] * (A_pre_polar[1][1]*A_pre_polar[2][2] - A_pre_polar[1][2]*A_pre_polar[2][1])
-                            - A_pre_polar[0][1] * (A_pre_polar[1][0]*A_pre_polar[2][2] - A_pre_polar[1][2]*A_pre_polar[2][0])
-                            + A_pre_polar[0][2] * (A_pre_polar[1][0]*A_pre_polar[2][1] - A_pre_polar[1][1]*A_pre_polar[2][0]);
-                float max_elem = std::fabs(A_pre_polar[0][0]);
-                for (int r=0;r<3;r++) for (int c=0;c<3;c++) { float v = std::fabs(A_pre_polar[r][c]); if (v>max_elem) max_elem=v; }
-                std::printf("[ABD f58 it%d] pos=(%.4f,%.4f,%.4f) |A|max=%.4e det=%.4e\n",
-                    it, body->positionLin.x, body->positionLin.y, body->positionLin.z,
-                    max_elem, det_A);
-                std::printf("  cL=(%.4e,%.4e,%.4e) AL diag=(%.4e,%.4e,%.4e)\n",
-                    cL.x, cL.y, cL.z, AL[0][0], AL[1][1], AL[2][2]);
-                std::fflush(stdout);
-            }
-
-            body->affine = polar_rotation(body->affine);
-
+            body->affine = ATilde * AL;
             body->syncFromAffine();
         }
 
@@ -1047,9 +1308,9 @@ void Solver::stepCpuAffine() {
             float3 initPos = gc.body->initialLin + gc.body->initialAff * gc.rLocal;
 
             float3 C;
-            C.x = worldPos.z - ground_z;               // normal gap
-            C.y = worldPos.x - initPos.x;              // tangent slip x (relative to frame start)
-            C.z = worldPos.y - initPos.y;              // tangent slip y (relative to frame start)
+            C.x = gc.C0.x * (1.0f - alpha) + worldPos.z - initPos.z;
+            C.y = gc.C0.y * (1.0f - alpha) + worldPos.x - initPos.x;
+            C.z = gc.C0.z * (1.0f - alpha) + worldPos.y - initPos.y;
 
             float3 F;
             for (int d = 0; d < 3; d++)
@@ -1080,10 +1341,12 @@ void Solver::stepCpuAffine() {
         for (auto& bc : boxContacts) {
             float3 diff = bc.bodyA->positionLin + bc.bodyA->affine * bc.rA
                         - bc.bodyB->positionLin - bc.bodyB->affine * bc.rB;
+            float3 initDiff = bc.bodyA->initialLin + bc.bodyA->initialAff * bc.rA
+                            - bc.bodyB->initialLin - bc.bodyB->initialAff * bc.rB;
             float3 C;
-            C.x = dot(diff, bc.basis[0]) + AVBD_COLLISION_MARGIN;
-            C.y = dot(diff, bc.basis[1]);
-            C.z = dot(diff, bc.basis[2]);
+            C.x = bc.C0.x * (1.0f - alpha) + dot(diff - initDiff, bc.basis[0]);
+            C.y = bc.C0.y * (1.0f - alpha) + dot(diff - initDiff, bc.basis[1]);
+            C.z = bc.C0.z * (1.0f - alpha) + dot(diff - initDiff, bc.basis[2]);
 
             float3 F;
             for (int d = 0; d < 3; d++)
@@ -1110,6 +1373,30 @@ void Solver::stepCpuAffine() {
             }
         }
 
+        if (affine_ortho_al) {
+            for (Rigid* body = bodies; body != nullptr; body = body->next) {
+                if (body->mass <= 0) continue;
+                float3x3 ALocal = transpose(body->inertialAff) * body->affine;
+                float3 cols[3] = {ALocal.col(0), ALocal.col(1), ALocal.col(2)};
+                float C[6] = {
+                    0.5f * (dot(cols[0], cols[0]) - 1.0f),
+                    0.5f * (dot(cols[1], cols[1]) - 1.0f),
+                    0.5f * (dot(cols[2], cols[2]) - 1.0f),
+                    dot(cols[0], cols[1]),
+                    dot(cols[0], cols[2]),
+                    dot(cols[1], cols[2])
+                };
+                for (int q = 0; q < 6; q++) {
+                    body->orthoLambda[q] += body->orthoPenalty[q] * C[q];
+                    body->orthoPenalty[q] = std::min(
+                        body->orthoPenalty[q] + affine_ortho_beta * std::fabs(C[q]),
+                        affine_ortho_penalty_max);
+                    if (body->orthoPenalty[q] < affine_ortho_penalty_min)
+                        body->orthoPenalty[q] = affine_ortho_penalty_min;
+                }
+            }
+        }
+
         // Other constraints (joints, springs)
         for (Force* force = forces; force != nullptr; force = force->next)
             force->updateDual(alpha);
@@ -1120,83 +1407,31 @@ void Solver::stepCpuAffine() {
     for (Rigid* body = bodies; body != nullptr; body = body->next) {
         if (body->mass <= 0) continue;
         body->prevVelocityLin = body->velocityLin;
-        body->velocityLin = (body->positionLin - body->initialLin) / dt;
-        body->velocityAng = mat_to_angular(body->affine, body->initialAff) / dt;
-    }
-
-    // ---- Phase 4b: Contact velocity damping ----
-    // For bodies with active ground contacts, limit velocity gain from
-    // collision processing and apply normal restitution damping.
-    if (has_ground_plane) {
-        for (Rigid* body = bodies; body != nullptr; body = body->next) {
-            if (body->mass <= 0) continue;
-            bool hasContact = false;
-            for (auto& gc : groundContacts) {
-                if (gc.body == body) { hasContact = true; break; }
-            }
-            if (!hasContact) continue;
-
-            // Restitution: zero out the rebounding normal velocity
-            if (body->velocityLin.z > 0 && body->prevVelocityLin.z < 0) {
-                body->velocityLin.z = 0;
-            }
-
-            // Clamp lateral velocity gain from collision solver
-            float3 dv = body->velocityLin - body->prevVelocityLin;
-            float dvLat = length(float2{dv.x, dv.y});
-            float maxLat = length(float2{body->prevVelocityLin.x, body->prevVelocityLin.y}) + 2.0f;
-            if (dvLat > maxLat) {
-                float scale = maxLat / dvLat;
-                body->velocityLin.x = body->prevVelocityLin.x + dv.x * scale;
-                body->velocityLin.y = body->prevVelocityLin.y + dv.y * scale;
-            }
-
-            // Clamp angular velocity gain from collision solver
-            float angNew = length(body->velocityAng);
-            float angMax = 10.0f;
-            if (angNew > angMax)
-                body->velocityAng = body->velocityAng * (angMax / angNew);
+        if (affine_incremental_velocity) {
+            body->velocityLin += (body->positionLin - body->inertialLin) / dt;
+            body->velocityAng += mat_to_angular(body->affine, body->inertialAff) / dt;
+        } else {
+            body->velocityLin = (body->positionLin - body->initialLin) / dt;
+            body->velocityAng = mat_to_angular(body->affine, body->initialAff) / dt;
         }
     }
 
-    if (body_count <= 3 && (frame <= 10 || frame % 10 == 0 || (frame >= 55 && frame <= 120))) {
-        int bodyIdx = 0;
+    // DIAG: per-frame summary (most-energetic body)
+    if (body_count <= 3 && (frame <= 10 || frame % 10 == 0)) {
         for (Rigid* body = bodies; body != nullptr; body = body->next) {
             if (body->mass <= 0) continue;
             int nGC = 0, nBC = 0;
-            float sumGCLam = 0;
-            float maxGCPen = 0;
-            for (auto& gc : groundContacts) {
-                if (gc.body != body) continue;
-                nGC++;
-                sumGCLam += gc.lambda.x;
-                maxGCPen = std::max(maxGCPen, std::max(gc.penalty.x, std::max(gc.penalty.y, gc.penalty.z)));
-            }
-            for (auto& bc : boxContacts) {
-                if (bc.bodyA == body || bc.bodyB == body) nBC++;
-            }
-            std::printf("[ABD f%d b%d] pos=(%.4f,%.4f,%.4f) vel=(%.4f,%.4f,%.4f) "
-                        "angvel=(%.4f,%.4f,%.4f) gc=%d bc=%d gcLam=%.2f maxPen=%.1f\n",
-                        frame, bodyIdx,
-                        body->positionLin.x, body->positionLin.y, body->positionLin.z,
-                        body->velocityLin.x, body->velocityLin.y, body->velocityLin.z,
-                        body->velocityAng.x, body->velocityAng.y, body->velocityAng.z,
-                        nGC, nBC, sumGCLam, maxGCPen);
-            bodyIdx++;
-        }
-        // Box-box contact details
-        for (int ci = 0; ci < (int)boxContacts.size(); ci++) {
-            auto& bc = boxContacts[ci];
-            float3 diff = bc.bodyA->positionLin + bc.bodyA->affine * bc.rA
-                        - bc.bodyB->positionLin - bc.bodyB->affine * bc.rB;
-            float normalGap = dot(diff, bc.basis[0]) + AVBD_COLLISION_MARGIN;
-            std::printf("  bc[%d] gap=%.5f lam=(%.3f,%.3f,%.3f) pen=(%.1f,%.1f,%.1f) "
-                        "n=(%.3f,%.3f,%.3f) key=%08x\n",
-                        ci, normalGap,
-                        bc.lambda.x, bc.lambda.y, bc.lambda.z,
-                        bc.penalty.x, bc.penalty.y, bc.penalty.z,
-                        bc.basis[0].x, bc.basis[0].y, bc.basis[0].z,
-                        bc.featureKey);
+            for (auto& gc : groundContacts) if (gc.body == body) nGC++;
+            for (auto& bc : boxContacts) if (bc.bodyA == body || bc.bodyB == body) nBC++;
+            float maxPen = 0;
+            for (auto& gc : groundContacts) if (gc.body == body) maxPen = std::max(maxPen, gc.penalty.x);
+            for (auto& bc : boxContacts) if (bc.bodyA == body || bc.bodyB == body) maxPen = std::max(maxPen, bc.penalty.x);
+            std::printf("[ABD f%d] pos=(%.4f,%.4f,%.4f) vel=(%.4f,%.4f,%.4f) avel=(%.4f,%.4f,%.4f) gc=%d bc=%d maxPen=%.0f\n",
+                frame,
+                body->positionLin.x, body->positionLin.y, body->positionLin.z,
+                body->velocityLin.x, body->velocityLin.y, body->velocityLin.z,
+                body->velocityAng.x, body->velocityAng.y, body->velocityAng.z,
+                nGC, nBC, maxPen);
         }
     }
 

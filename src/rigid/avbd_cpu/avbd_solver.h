@@ -70,6 +70,8 @@ struct Rigid {
     float3x3 initialAff;
     float3x3 inertialAff;
     float3x3 inertiaMatrix;  // full 3×3 initial inertia (body frame)
+    float orthoLambda[6];
+    float orthoPenalty[6];
 
     Rigid(Solver* solver, float3 size, float density, float friction,
           float3 position, float3 velocity = float3{0, 0, 0});
@@ -115,7 +117,9 @@ struct Joint : Force {
     float3 lambdaLin, lambdaAng;
     float stiffnessLin, stiffnessAng, fracture;
     float torqueArm;
+    quat restRelAng;
     bool broken;
+    bool restInitialized;
 
     Joint(Solver* solver, Rigid* bodyA, Rigid* bodyB, float3 rA, float3 rB,
           float stiffnessLin = INFINITY, float stiffnessAng = 0.0f, float fracture = INFINITY);
@@ -199,7 +203,20 @@ struct Solver {
     float betaAng;
     float gamma;
 
+    bool force_cpu = false;
     RotationMode rotation_mode = RotationMode::AxisAngle;
+    bool affine_incremental_velocity = false;
+    float affine_so3_mu = 50.0f;
+    bool affine_so3_mu_ramp = false;
+    float affine_so3_mu_start = 5.0f;
+    float affine_so3_mu_end = 50.0f;
+    bool affine_ortho_al = false;
+    float affine_ortho_beta = 100.0f;
+    float affine_ortho_penalty_min = 1.0f;
+    float affine_ortho_penalty_max = 100000.0f;
+    bool affine_ortho_potential = false;
+    float affine_ortho_stiffness = 10.0f;
+    bool affine_line_search = true;
 
     // Ground plane: z = ground_z, normal = +Z.
     // When enabled, bodies are prevented from penetrating below this plane.
@@ -249,6 +266,7 @@ struct Solver {
     void clear();
     void defaultParams();
     void step();
+    void stepCpuAVBD();
     void stepCpuAffine();
     void stepCpuPABD();
 

@@ -16,6 +16,31 @@ inline float3x3 geometricStiffnessBallSocket(int k, float3 v) {
     m[2][k] += v[2];
     return m;
 }
+
+inline float3 quatLogVec(quat q) {
+    q = normalize(q);
+    if (q.w < 0.0f)
+        q = q * -1.0f;
+    float sinHalf = length(q.vec());
+    if (sinHalf < 1.0e-6f)
+        return q.vec() * 2.0f;
+    float angle = 2.0f * std::atan2(sinHalf, q.w);
+    return q.vec() * (angle / sinHalf);
+}
+
+inline quat jointQuat(const Rigid* body) {
+    return body ? body->positionAng : quat{0, 0, 0, 1};
+}
+
+inline float3 fixedJointAngularError(const Joint* joint) {
+    quat qA = jointQuat(joint->bodyA);
+    quat qB = jointQuat(joint->bodyB);
+    if (joint->bodyA && joint->restInitialized) {
+        quat qErr = qA * inverse(joint->restRelAng) * inverse(qB);
+        return quatLogVec(qErr) * joint->torqueArm;
+    }
+    return (qA - qB) * joint->torqueArm;
+}
 }  // namespace
 
 Joint::Joint(Solver* solver, Rigid* bodyA, Rigid* bodyB,
@@ -23,7 +48,7 @@ Joint::Joint(Solver* solver, Rigid* bodyA, Rigid* bodyB,
              float stiffnessLin, float stiffnessAng, float fracture)
     : Force(solver, bodyA, bodyB), rA(rA), rB(rB),
       stiffnessLin(stiffnessLin), stiffnessAng(stiffnessAng),
-      fracture(fracture), broken(false) {
+      fracture(fracture), torqueArm(0.0f), restRelAng{0, 0, 0, 1}, broken(false), restInitialized(false) {
     penaltyLin = penaltyAng = float3{0, 0, 0};
     lambdaLin = lambdaAng = float3{0, 0, 0};
     torqueArm = lengthSq((bodyA ? bodyA->size : float3{0, 0, 0}) + bodyB->size);
@@ -32,15 +57,24 @@ Joint::Joint(Solver* solver, Rigid* bodyA, Rigid* bodyB,
 bool Joint::initialize() {
     RotationMode rmode = solver->rotation_mode;
 
-    C0Lin = (bodyA ? bodyA->transformVec(rA, rmode) : rA) -
-            bodyB->transformVec(rB, rmode);
+    // Body-body joints keep their initial rest pose. World-anchor joints
+    // (e.g. mouse drag) intentionally refresh because rA is a moving target.
+    if (!restInitialized || bodyA == nullptr) {
+        C0Lin = (bodyA ? bodyA->transformVec(rA, rmode) : rA) -
+                bodyB->transformVec(rB, rmode);
 
-    if (rmode == RotationMode::Affine) {
-        float3x3 qA = bodyA ? bodyA->affine : identity3x3();
-        float3x3 qB = bodyB->affine;
-        C0Ang = mat_to_angular(qA, qB) * torqueArm;
-    } else {
-        C0Ang = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+        if (rmode == RotationMode::Affine) {
+            float3x3 qA = bodyA ? bodyA->affine : identity3x3();
+            float3x3 qB = bodyB->affine;
+            C0Ang = mat_to_angular(qA, qB) * torqueArm;
+        } else {
+            quat qA = jointQuat(bodyA);
+            quat qB = jointQuat(bodyB);
+            restRelAng = inverse(qB) * qA;
+            C0Ang = fixedJointAngularError(this);
+        }
+        if (bodyA != nullptr)
+            restInitialized = true;
     }
 
     lambdaLin = lambdaLin * solver->alpha * solver->gamma;
@@ -101,10 +135,10 @@ void Joint::updatePrimal(Rigid* body, float alpha,
             float3x3 qB = bodyB->affine;
             C = mat_to_angular(qA, qB) * torqueArm;
         } else {
-            C = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+            C = fixedJointAngularError(this);
         }
 
-        if (std::isinf(stiffnessAng))
+        if (std::isinf(stiffnessAng) && !(bodyA && rmode == RotationMode::AxisAngle))
             C -= C0Ang * alpha;
 
         float3 F = K * C + lambdaAng;
@@ -142,13 +176,18 @@ void Joint::updateDual(float alpha) {
             float3x3 qB = bodyB->affine;
             C = mat_to_angular(qA, qB) * torqueArm;
         } else {
-            C = ((bodyA ? bodyA->positionAng : quat{0, 0, 0, 1}) - bodyB->positionAng) * torqueArm;
+            C = fixedJointAngularError(this);
         }
 
         if (std::isinf(stiffnessAng)) {
+            if (bodyA && rmode == RotationMode::AxisAngle) {
+                float3 F = K * C + lambdaAng;
+                lambdaAng = F;
+            } else {
             C -= C0Ang * alpha;
             float3 F = K * C + lambdaAng;
             lambdaAng = F;
+            }
         }
 
         penaltyAng = min(penaltyAng + abs(C) * solver->betaAng, min(stiffnessAng, AVBD_PENALTY_MAX));

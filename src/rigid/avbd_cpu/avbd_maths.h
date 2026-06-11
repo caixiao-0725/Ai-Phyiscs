@@ -453,8 +453,9 @@ struct AffineDirectSolver {
         }
 
         dxLin = {(float)sol[0], (float)sol[1], (float)sol[2]};
-        for (int j = 0; j < 3; j++)
-            dxAff[j] = {(float)sol[3+3*j], (float)sol[3+3*j+1], (float)sol[3+3*j+2]};
+        for (int col = 0; col < 3; col++)
+            for (int row = 0; row < 3; row++)
+                dxAff[row][col] = (float)sol[3 + 3 * col + row];
     }
 };
 
@@ -672,9 +673,10 @@ struct AffineSchurSolver {
             Bx = Bx + Bblk[j] * A_cols[j];
         dxLin = Kinv * (srcC - Bx);
 
-        // Pack A_cols into dxAff rows: dxAff[j][i] = A_cols[j][i]
-        for (int j = 0; j < 3; j++)
-            dxAff[j] = A_cols[j];
+        // Pack column variables back into the row-major matrix.
+        for (int col = 0; col < 3; col++)
+            for (int row = 0; row < 3; row++)
+                dxAff[row][col] = A_cols[col][row];
 
         // Safeguard: if solve produced NaN/inf/extreme values, fall back to identity
         bool bad = false;

@@ -20,12 +20,14 @@
 #define _USE_MATH_DEFINES
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <vector>
 
 using namespace chysx::avbd;
 using chysx::render::DrawMesh;
 using chysx::render::Scene;
+using chysx::render::SceneMetrics;
 using chysx::render::register_scene;
 
 namespace {
@@ -137,8 +139,11 @@ public:
 
     void step(float /*dt*/) override {
         solver_->step();
-        updateGpuRender();
+        if (!headless_)
+            updateGpuRender();
     }
+
+    void set_headless(bool headless) override { headless_ = headless; }
 
     void reset() override {
         releaseDrag();
@@ -146,6 +151,109 @@ public:
     }
 
     void draw_meshes(std::vector<DrawMesh>& /*out*/) override {}
+
+    bool metrics(SceneMetrics& out) override {
+        out = SceneMetrics{};
+        out.min_z = INFINITY;
+
+        if (solver_->gpu_state_valid_ && solver_->gpu_solver()) {
+            solver_->gpu_solver()->download_positions(
+                solver_->soa_.pos_x.data(), solver_->soa_.pos_y.data(), solver_->soa_.pos_z.data(),
+                solver_->soa_.quat_x.data(), solver_->soa_.quat_y.data(), solver_->soa_.quat_z.data(), solver_->soa_.quat_w.data(),
+                solver_->soa_.vel_x.data(), solver_->soa_.vel_y.data(), solver_->soa_.vel_z.data(),
+                solver_->soa_.velang_x.data(), solver_->soa_.velang_y.data(), solver_->soa_.velang_z.data(),
+                solver_->soa_.count);
+            solver_->soa_.unpack(solver_->bodies);
+        }
+
+        int bodyIdx = 0;
+        for (Rigid* body = solver_->bodies; body != nullptr; body = body->next, bodyIdx++) {
+            out.bodies++;
+            if (body->mass <= 0.0f) continue;
+            float3 position = body->positionLin;
+            float3 velocity = body->velocityLin;
+            float3 velocityAng = body->velocityAng;
+            if (solver_->gpu_state_valid_ && bodyIdx < solver_->soa_.count) {
+                position = {solver_->soa_.pos_x[bodyIdx], solver_->soa_.pos_y[bodyIdx], solver_->soa_.pos_z[bodyIdx]};
+                velocity = {solver_->soa_.vel_x[bodyIdx], solver_->soa_.vel_y[bodyIdx], solver_->soa_.vel_z[bodyIdx]};
+                velocityAng = {solver_->soa_.velang_x[bodyIdx], solver_->soa_.velang_y[bodyIdx], solver_->soa_.velang_z[bodyIdx]};
+            }
+            quat orientation = body->positionAng;
+            if (solver_->gpu_state_valid_ && bodyIdx < solver_->soa_.count) {
+                orientation = {
+                    solver_->soa_.quat_x[bodyIdx],
+                    solver_->soa_.quat_y[bodyIdx],
+                    solver_->soa_.quat_z[bodyIdx],
+                    solver_->soa_.quat_w[bodyIdx]};
+            }
+
+            float speed = length(velocity);
+            float angularSpeed = length(velocityAng);
+            if (speed > out.max_speed) out.max_speed = speed;
+            if (velocity.z > out.max_upward_speed) out.max_upward_speed = velocity.z;
+            if (angularSpeed > out.max_angular_speed) out.max_angular_speed = angularSpeed;
+            for (int v = 0; v < 8; v++) {
+                float3 local = {
+                    kBoxV[v][0] * body->size.x,
+                    kBoxV[v][1] * body->size.y,
+                    kBoxV[v][2] * body->size.z};
+                float3 world = position + rotate(orientation, local);
+                if (world.z < out.min_z) out.min_z = world.z;
+            }
+            out.has_nan = out.has_nan
+                || std::isnan(position.x) || std::isnan(position.y) || std::isnan(position.z)
+                || std::isnan(velocity.x) || std::isnan(velocity.y) || std::isnan(velocity.z);
+        }
+        if (out.bodies == 0) out.min_z = 0.0f;
+
+        if (std::strcmp(name_, "AVBD: CPU Fixed Pair Drop") == 0) {
+            static int fixedPairMetricFrame = 0;
+            fixedPairMetricFrame++;
+            if (fixedPairMetricFrame == 1 || fixedPairMetricFrame % 20 == 0) {
+                const Joint* joint = nullptr;
+                for (const Force* f = solver_->forces; f; f = f->next) {
+                    if (const Joint* j = dynamic_cast<const Joint*>(f)) {
+                        if (j->bodyA && j->bodyB) { joint = j; break; }
+                    }
+                }
+                if (joint) {
+                    const Rigid* a = joint->bodyA;
+                    const Rigid* b = joint->bodyB;
+                    float3 ax = rotate(a->positionAng, {1, 0, 0});
+                    float3 bx = rotate(b->positionAng, {1, 0, 0});
+                    float c = clamp(dot(ax, bx), -1.0f, 1.0f);
+                    float angleDeg = std::acos(c) * 57.29577951308232f;
+                    float3 wa = a->positionLin + rotate(a->positionAng, joint->rA);
+                    float3 wb = b->positionLin + rotate(b->positionAng, joint->rB);
+                    float anchorErr = length(wa - wb);
+                    float relAngVel = length(a->velocityAng - b->velocityAng);
+                    std::printf("[FIXED_PAIR frame=%d] angleDeg=%.3f anchorErr=%.6f relAngVel=%.6f\n",
+                                fixedPairMetricFrame, angleDeg, anchorErr, relAngVel);
+                }
+            }
+        }
+
+        for (Rigid* a = solver_->bodies; a != nullptr; a = a->next) {
+            for (Rigid* b = a->next; b != nullptr; b = b->next) {
+                if (a->mass <= 0.0f && b->mass <= 0.0f) continue;
+                if (a->constrainedTo(b)) continue;
+                float3 d = b->positionLin - a->positionLin;
+                float rSum = a->radius + b->radius;
+                if (lengthSq(d) > rSum * rSum) continue;
+                Manifold::Contact contacts[8];
+                float3x3 basis;
+                int nc = Manifold::collide(a, b, contacts, basis);
+                for (int i = 0; i < nc; i++) {
+                    float3 xA = a->positionLin + a->affine * contacts[i].rA;
+                    float3 xB = b->positionLin + b->affine * contacts[i].rB;
+                    float gap = dot(xA - xB, basis[0]) + AVBD_COLLISION_MARGIN;
+                    if (-gap > out.max_pair_penetration)
+                        out.max_pair_penetration = -gap;
+                }
+            }
+        }
+        return true;
+    }
 
     void drawGroundPlane() {
         if (!solver_->has_ground_plane) return;
@@ -388,6 +496,7 @@ private:
     float boxDensity_ = 1.0f;
 
     bool showContacts_ = true;
+    bool headless_ = false;
 
     void updateGpuRender() {
         if (!solver_->gpu_state_valid_ || !solver_->gpu_solver()) return;
@@ -711,7 +820,56 @@ void setupStack(Solver* s) {
     s->clear();
     s->set_ground_plane(0.5f, 0.5f);
     for (int i = 0; i < 110; i++)
-        new Rigid(s, {1, 1, 1}, 1.0f, 0.5f, {0, 0, i * 1.0f + 1.0f});
+        new Rigid(s, {1, 1, 1}, 1.0f, 0.0f, {0, 0, i * 1.0f + 1.0f});
+}
+
+void setupCPUStack(Solver* s) {
+    s->clear();
+    s->force_cpu = true;
+    s->rotation_mode = RotationMode::AxisAngle;
+    s->set_ground_plane(0.5f, 0.5f);
+
+    new Rigid(s, {200.0f, 200.0f, 0.1f}, 0.0f, 0.5f, {0.0f, 0.0f, 0.45f});
+    for (int i = 0; i < 50; i++)
+        new Rigid(s, {1, 1, 1}, 1.0f, 0.0f, {0, 0, i * 1.0f + 1.0f});
+}
+
+void setupCPUFixedPairDrop(Solver* s) {
+    s->clear();
+    s->force_cpu = true;
+    s->rotation_mode = RotationMode::AxisAngle;
+    s->set_ground_plane(0.0f, 0.5f);
+    s->iterations = 20;
+    s->alpha = 1.0f;
+
+    // Static floor for the CPU broadphase/manifold path.
+    new Rigid(s, {20.0f, 20.0f, 0.1f}, 0.0f, 0.5f, {0.0f, 0.0f, -0.05f});
+
+    const float3 rodSize = {3.0f, 0.35f, 0.35f};
+    const float halfLen = rodSize.x * 0.5f;
+    const float3 jointWorld = {0.0f, 0.0f, 5.0f};
+
+    Rigid* a = new Rigid(s, rodSize, 1.0f, 0.5f, {0.0f, 0.0f, 5.0f});
+    Rigid* b = new Rigid(s, rodSize, 1.0f, 0.5f, {0.0f, 0.0f, 5.0f});
+
+    const float standAngle = rad(70.0f);
+    quat standRot = {0.0f, std::sin(standAngle * 0.5f), 0.0f, std::cos(standAngle * 0.5f)};
+    a->positionAng = standRot;
+    a->syncFromQuat();
+
+    const float angle = rad(60.0f);
+    quat hingeRot = {0.0f, 0.0f, std::sin(angle * 0.5f), std::cos(angle * 0.5f)};
+    b->positionAng = normalize(standRot * hingeRot);
+    b->syncFromQuat();
+
+    const float3 rA = { halfLen, 0.0f, 0.0f};
+    const float3 rB = {-halfLen, 0.0f, 0.0f};
+    a->positionLin = jointWorld - rotate(a->positionAng, rA);
+    b->positionLin = jointWorld - rotate(b->positionAng, rB);
+
+    // Fixed joint: no relative translation and no relative rotation.
+    new Joint(s, a, b, rA, rB, INFINITY, INFINITY);
+    new IgnoreCollision(s, a, b);
 }
 
 void setupSoftBody(Solver* s) {
@@ -840,9 +998,59 @@ void setupABDFreeFall(Solver* s) {
 void setupABDStacking(Solver* s) {
     s->clear();
     s->rotation_mode = RotationMode::Affine;
+    s->affine_incremental_velocity = false;
+    s->affine_line_search = false;
     s->set_ground_plane(0.0f, 0.0f);
-    const int n = 20;
-    //s->iterations = 2 * n;
+    const int n = 50;
+    s->iterations = 20;
+    s->betaLin = 100.0f;
+    for (int i = 0; i < n; i++)
+        new Rigid(s, {1, 1, 1}, 1.0f, 0.0f, {0, 0, 0.5f + i * 1.0f});
+}
+
+void setupABDStackingIncremental(Solver* s) {
+    setupABDStacking(s);
+    s->affine_incremental_velocity = true;
+}
+
+void setupABDStackingBeta100(Solver* s) {
+    setupABDStacking(s);
+    s->betaLin = 100.0f;
+}
+
+void setupABDStackingBeta1000(Solver* s) {
+    setupABDStacking(s);
+    s->betaLin = 1000.0f;
+}
+
+void setupABDStackingBeta10000(Solver* s) {
+    setupABDStacking(s);
+    s->betaLin = 10000.0f;
+}
+
+void setupABDStackingVperp1(Solver* s) {
+    setupABDStacking(s);
+    s->affine_so3_mu = 0.0f;
+    s->affine_ortho_potential = true;
+    s->affine_ortho_stiffness = 1.0f;
+}
+
+void setupAVBDStacking(Solver* s) {
+    s->clear();
+    s->rotation_mode = RotationMode::AxisAngle;
+    s->set_ground_plane(0.0f, 0.0f);
+    const int n = 50;
+    s->iterations = 20;
+    for (int i = 0; i < n; i++)
+        new Rigid(s, {1, 1, 1}, 1.0f, 0.0f, {0, 0, 0.5f + i * 1.0f});
+}
+
+void setupPABDSimpleStacking(Solver* s) {
+    s->clear();
+    s->rotation_mode = RotationMode::PABD;
+    s->set_ground_plane(0.0f, 0.0f);
+    const int n = 50;
+    s->iterations = 20;
     for (int i = 0; i < n; i++)
         new Rigid(s, {1, 1, 1}, 1.0f, 0.0f, {0, 0, 0.5f + i * 1.0f});
 }
@@ -896,8 +1104,10 @@ void setupPABDStacking(Solver* s) {
 void setupABDTiltedDrop(Solver* s) {
     s->clear();
     s->rotation_mode = RotationMode::Affine;
+    s->affine_incremental_velocity = false;
     s->set_ground_plane(0.0f, 0.5f);
     s->iterations = 20;
+    s->betaLin = 1000.0f;
 
     auto* b = new Rigid(s, {2, 2, 2}, 1.0f, 0.5f, {0, 0, 5.0f});
 
@@ -906,6 +1116,18 @@ void setupABDTiltedDrop(Solver* s) {
     float c = std::cos(angle), sn = std::sin(angle);
     b->affine = {{{ c, 0, sn}, {0, 1, 0}, {-sn, 0, c}}};
     b->syncFromAffine();
+}
+
+void setupABDTiltedDropVperp1(Solver* s) {
+    setupABDTiltedDrop(s);
+    s->affine_so3_mu = 0.0f;
+    s->affine_ortho_potential = true;
+    s->affine_ortho_stiffness = 1.0f;
+}
+
+void setupABDTiltedDropVperp1NoLS(Solver* s) {
+    setupABDTiltedDropVperp1(s);
+    s->affine_line_search = false;
 }
 
 void setupAVBDTiltedDrop(Solver* s) {
@@ -920,17 +1142,313 @@ void setupAVBDTiltedDrop(Solver* s) {
     b->syncFromQuat();
 }
 
+void setupHighRotationRods(Solver* s, RotationMode mode) {
+    s->clear();
+    s->rotation_mode = mode;
+    s->set_ground_plane(0.0f, 0.5f);
+    s->iterations = 5;
+    if (mode == RotationMode::Affine)
+        s->betaLin = 100.0f;
+
+    for (int i = 0; i < 6; i++) {
+        float x = (float)(i % 3 - 1) * 0.9f;
+        float y = (float)(i / 3) * 0.8f - 0.4f;
+        float z = 2.0f + 0.35f * (float)i;
+        Rigid* b = new Rigid(s, {4.0f, 0.35f, 0.35f}, 1.0f, 0.5f, {x, y, z}, {0.0f, 0.0f, -1.0f});
+
+        float ay = rad(35.0f + 7.0f * (float)i);
+        float az = rad((i % 2 == 0 ? 25.0f : -35.0f) + 5.0f * (float)i);
+        quat qy = {0.0f, std::sin(ay * 0.5f), 0.0f, std::cos(ay * 0.5f)};
+        quat qz = {0.0f, 0.0f, std::sin(az * 0.5f), std::cos(az * 0.5f)};
+        b->positionAng = normalize(qz * qy);
+        b->syncFromQuat();
+
+        b->velocityAng = {
+            8.0f + (float)i,
+            (i % 2 == 0 ? 22.0f : -22.0f),
+            10.0f - 0.5f * (float)i};
+    }
+}
+
+void setupABDHighRotationRods(Solver* s) {
+    setupHighRotationRods(s, RotationMode::Affine);
+}
+
+void setupAVBDHighRotationRods(Solver* s) {
+    setupHighRotationRods(s, RotationMode::AxisAngle);
+}
+
+void setupPABDHighRotationRods(Solver* s) {
+    setupHighRotationRods(s, RotationMode::PABD);
+}
+
+void setupRotatingGate(Solver* s, RotationMode mode, int iterations = 5, float muSO3 = 50.0f) {
+    s->clear();
+    s->rotation_mode = mode;
+    s->set_ground_plane(0.0f, 0.5f);
+    s->iterations = iterations;
+    if (mode == RotationMode::Affine) {
+        s->betaLin = 100.0f;
+        s->affine_so3_mu = muSO3;
+    }
+
+    // Static narrow gate posts. The rod is longer than the gap, so a stable
+    // solver must resolve repeated high-rotation impacts without tunneling.
+    new Rigid(s, {0.25f, 0.7f, 2.6f}, 0.0f, 0.5f, {-0.95f, 0.0f, 1.3f});
+    new Rigid(s, {0.25f, 0.7f, 2.6f}, 0.0f, 0.5f, { 0.95f, 0.0f, 1.3f});
+    new Rigid(s, {2.4f, 0.25f, 0.35f}, 0.0f, 0.5f, {0.0f, -0.65f, 1.0f});
+
+    Rigid* rod = new Rigid(s, {3.2f, 0.22f, 0.22f}, 1.0f, 0.5f, {0.0f, 0.05f, 2.8f}, {0.0f, 0.0f, -1.5f});
+    float ay = rad(28.0f);
+    float az = rad(38.0f);
+    quat qy = {0.0f, std::sin(ay * 0.5f), 0.0f, std::cos(ay * 0.5f)};
+    quat qz = {0.0f, 0.0f, std::sin(az * 0.5f), std::cos(az * 0.5f)};
+    rod->positionAng = normalize(qz * qy);
+    rod->syncFromQuat();
+    rod->velocityAng = {7.0f, 28.0f, 18.0f};
+}
+
+void setupRotatingGateRampMu(Solver* s, int iterations, float muStart, float muEnd) {
+    setupRotatingGate(s, RotationMode::Affine, iterations, muEnd);
+    s->affine_so3_mu_ramp = true;
+    s->affine_so3_mu_start = muStart;
+    s->affine_so3_mu_end = muEnd;
+}
+
+void setupRotatingGateOrthoAL(Solver* s, int iterations, float betaOrtho = 100.0f) {
+    setupRotatingGate(s, RotationMode::Affine, iterations, 0.0f);
+    s->affine_ortho_al = true;
+    s->affine_ortho_beta = betaOrtho;
+    s->affine_ortho_penalty_min = 1.0f;
+    s->affine_ortho_penalty_max = 100000.0f;
+    for (Rigid* b = s->bodies; b; b = b->next) {
+        for (int i = 0; i < 6; i++) {
+            b->orthoLambda[i] = 0.0f;
+            b->orthoPenalty[i] = s->affine_ortho_penalty_min;
+        }
+    }
+}
+
+void setupRotatingGateOrthoALSoft(Solver* s, int iterations, float betaOrtho, float muSO3) {
+    setupRotatingGate(s, RotationMode::Affine, iterations, muSO3);
+    s->affine_ortho_al = true;
+    s->affine_ortho_beta = betaOrtho;
+    s->affine_ortho_penalty_min = 0.001f;
+    s->affine_ortho_penalty_max = 1000.0f;
+    for (Rigid* b = s->bodies; b; b = b->next) {
+        for (int i = 0; i < 6; i++) {
+            b->orthoLambda[i] = 0.0f;
+            b->orthoPenalty[i] = s->affine_ortho_penalty_min;
+        }
+    }
+}
+
+void setupRotatingGateOrthoPotential(Solver* s, int iterations, float stiffness, float muSO3 = 0.0f) {
+    setupRotatingGate(s, RotationMode::Affine, iterations, muSO3);
+    s->affine_ortho_potential = true;
+    s->affine_ortho_stiffness = stiffness;
+}
+
+void setupRotatingGateOrthoPotentialNoLS(Solver* s, int iterations, float stiffness, float muSO3 = 0.0f) {
+    setupRotatingGateOrthoPotential(s, iterations, stiffness, muSO3);
+    s->affine_line_search = false;
+}
+
+void setupABDRotatingGate(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine);
+}
+
+void setupABDRotatingGateIter2(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine, 2);
+}
+
+void setupABDRotatingGateIter10(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine, 10);
+}
+
+void setupABDRotatingGateIter20(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine, 20);
+}
+
+void setupABDRotatingGateIter20Mu5(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine, 20, 5.0f);
+}
+
+void setupABDRotatingGateIter20Mu10(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine, 20, 10.0f);
+}
+
+void setupABDRotatingGateMu10(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine, 5, 10.0f);
+}
+
+void setupABDRotatingGateIter20Mu200(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine, 20, 200.0f);
+}
+
+void setupABDRotatingGateIter20Mu500(Solver* s) {
+    setupRotatingGate(s, RotationMode::Affine, 20, 500.0f);
+}
+
+void setupABDRotatingGateRamp5To50(Solver* s) {
+    setupRotatingGateRampMu(s, 5, 5.0f, 50.0f);
+}
+
+void setupABDRotatingGateRamp1To50(Solver* s) {
+    setupRotatingGateRampMu(s, 5, 1.0f, 50.0f);
+}
+
+void setupABDRotatingGateRamp10To50(Solver* s) {
+    setupRotatingGateRampMu(s, 5, 10.0f, 50.0f);
+}
+
+void setupABDRotatingGateIter20Ramp5To50(Solver* s) {
+    setupRotatingGateRampMu(s, 20, 5.0f, 50.0f);
+}
+
+void setupABDRotatingGateIter20Ramp1To50(Solver* s) {
+    setupRotatingGateRampMu(s, 20, 1.0f, 50.0f);
+}
+
+void setupABDRotatingGateIter20Ramp10To50(Solver* s) {
+    setupRotatingGateRampMu(s, 20, 10.0f, 50.0f);
+}
+
+void setupABDRotatingGateOrthoAL(Solver* s) {
+    setupRotatingGateOrthoAL(s, 5, 100.0f);
+}
+
+void setupABDRotatingGateOrthoALBeta10(Solver* s) {
+    setupRotatingGateOrthoAL(s, 5, 10.0f);
+}
+
+void setupABDRotatingGateIter20OrthoAL(Solver* s) {
+    setupRotatingGateOrthoAL(s, 20, 100.0f);
+}
+
+void setupABDRotatingGateIter20OrthoALBeta10(Solver* s) {
+    setupRotatingGateOrthoAL(s, 20, 10.0f);
+}
+
+void setupABDRotatingGateIter20OrthoALSoft(Solver* s) {
+    setupRotatingGateOrthoALSoft(s, 20, 1.0f, 10.0f);
+}
+
+void setupABDRotatingGateIter20OrthoALSoftNoProx(Solver* s) {
+    setupRotatingGateOrthoALSoft(s, 20, 1.0f, 0.0f);
+}
+
+void setupABDRotatingGateIter20Vperp1(Solver* s) {
+    setupRotatingGateOrthoPotential(s, 20, 1.0f);
+}
+
+void setupABDRotatingGateIter20Vperp1NoLS(Solver* s) {
+    setupRotatingGateOrthoPotentialNoLS(s, 20, 1.0f);
+}
+
+void setupABDRotatingGateIter20Vperp10(Solver* s) {
+    setupRotatingGateOrthoPotential(s, 20, 10.0f);
+}
+
+void setupABDRotatingGateIter20Vperp100(Solver* s) {
+    setupRotatingGateOrthoPotential(s, 20, 100.0f);
+}
+
+void setupABDRotatingGateVperp10(Solver* s) {
+    setupRotatingGateOrthoPotential(s, 5, 10.0f);
+}
+
+void setupABDRotatingGateVperp10NoLS(Solver* s) {
+    setupRotatingGateOrthoPotentialNoLS(s, 5, 10.0f);
+}
+
+void setupABDRotatingGateVperp10Mu10(Solver* s) {
+    setupRotatingGateOrthoPotential(s, 5, 10.0f, 10.0f);
+}
+
+void setupABDRotatingGateIter20Vperp10Mu10(Solver* s) {
+    setupRotatingGateOrthoPotential(s, 20, 10.0f, 10.0f);
+}
+
+void setupAVBDRotatingGate(Solver* s) {
+    setupRotatingGate(s, RotationMode::AxisAngle);
+}
+
+void setupAVBDRotatingGateIter2(Solver* s) {
+    setupRotatingGate(s, RotationMode::AxisAngle, 2);
+}
+
+void setupAVBDRotatingGateIter10(Solver* s) {
+    setupRotatingGate(s, RotationMode::AxisAngle, 10);
+}
+
+void setupAVBDRotatingGateIter20(Solver* s) {
+    setupRotatingGate(s, RotationMode::AxisAngle, 20);
+}
+
+void setupPABDRotatingGate(Solver* s) {
+    setupRotatingGate(s, RotationMode::PABD);
+}
+
 extern "C" void chysx_register_avbd_scenes() {
+    register_scene("AVBD: Stacking", []() -> Scene* { return new AVBDScene("AVBD: Stacking", setupAVBDStacking); });
+    register_scene("PABD: Simple Stacking", []() -> Scene* { return new AVBDScene("PABD: Simple Stacking", setupPABDSimpleStacking); });
+    register_scene("ABD: Stacking Beta100", []() -> Scene* { return new AVBDScene("ABD: Stacking Beta100", setupABDStackingBeta100); });
+    register_scene("ABD: Stacking Beta1000", []() -> Scene* { return new AVBDScene("ABD: Stacking Beta1000", setupABDStackingBeta1000); });
+    register_scene("ABD: Stacking Beta10000", []() -> Scene* { return new AVBDScene("ABD: Stacking Beta10000", setupABDStackingBeta10000); });
+    register_scene("ABD: Stacking Vperp1", []() -> Scene* { return new AVBDScene("ABD: Stacking Vperp1", setupABDStackingVperp1); });
+    register_scene("ABD: Stacking Incremental", []() -> Scene* { return new AVBDScene("ABD: Stacking Incremental", setupABDStackingIncremental); });
     register_scene("PABD: Stacking", []() -> Scene* { return new AVBDScene("PABD: Stacking", setupPABDStacking); });
     register_scene("ABD: Stacking", []() -> Scene* { return new AVBDScene("ABD: Stacking", setupABDStacking); });
     register_scene("ABD: Free Fall", []() -> Scene* { return new AVBDScene("ABD: Free Fall", setupABDFreeFall); });
     register_scene("ABD: Tilted Drop", []() -> Scene* { return new AVBDScene("ABD: Tilted Drop", setupABDTiltedDrop); });
+    register_scene("ABD: Tilted Drop Vperp1", []() -> Scene* { return new AVBDScene("ABD: Tilted Drop Vperp1", setupABDTiltedDropVperp1); });
+    register_scene("ABD: Tilted Drop Vperp1 NoLS", []() -> Scene* { return new AVBDScene("ABD: Tilted Drop Vperp1 NoLS", setupABDTiltedDropVperp1NoLS); });
     register_scene("AVBD: Tilted Drop", []() -> Scene* { return new AVBDScene("AVBD: Tilted Drop", setupAVBDTiltedDrop); });
+    register_scene("ABD: High Rotation Rods", []() -> Scene* { return new AVBDScene("ABD: High Rotation Rods", setupABDHighRotationRods); });
+    register_scene("PABD: High Rotation Rods", []() -> Scene* { return new AVBDScene("PABD: High Rotation Rods", setupPABDHighRotationRods); });
+    register_scene("AVBD: High Rotation Rods", []() -> Scene* { return new AVBDScene("AVBD: High Rotation Rods", setupAVBDHighRotationRods); });
+    register_scene("ABD: Rotating Gate Iter2", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter2", setupABDRotatingGateIter2); });
+    register_scene("ABD: Rotating Gate", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate", setupABDRotatingGate); });
+    register_scene("ABD: Rotating Gate Mu10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Mu10", setupABDRotatingGateMu10); });
+    register_scene("ABD: Rotating Gate Ramp 1-50", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Ramp 1-50", setupABDRotatingGateRamp1To50); });
+    register_scene("ABD: Rotating Gate Ramp 5-50", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Ramp 5-50", setupABDRotatingGateRamp5To50); });
+    register_scene("ABD: Rotating Gate Ramp 10-50", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Ramp 10-50", setupABDRotatingGateRamp10To50); });
+    register_scene("ABD: Rotating Gate OrthoAL", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate OrthoAL", setupABDRotatingGateOrthoAL); });
+    register_scene("ABD: Rotating Gate OrthoAL Beta10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate OrthoAL Beta10", setupABDRotatingGateOrthoALBeta10); });
+    register_scene("ABD: Rotating Gate Iter10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter10", setupABDRotatingGateIter10); });
+    register_scene("ABD: Rotating Gate Iter20", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20", setupABDRotatingGateIter20); });
+    register_scene("ABD: Rotating Gate Iter20 Mu5", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Mu5", setupABDRotatingGateIter20Mu5); });
+    register_scene("ABD: Rotating Gate Iter20 Mu10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Mu10", setupABDRotatingGateIter20Mu10); });
+    register_scene("ABD: Rotating Gate Iter20 Ramp 1-50", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Ramp 1-50", setupABDRotatingGateIter20Ramp1To50); });
+    register_scene("ABD: Rotating Gate Iter20 Ramp 5-50", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Ramp 5-50", setupABDRotatingGateIter20Ramp5To50); });
+    register_scene("ABD: Rotating Gate Iter20 Ramp 10-50", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Ramp 10-50", setupABDRotatingGateIter20Ramp10To50); });
+    register_scene("ABD: Rotating Gate Iter20 OrthoAL", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 OrthoAL", setupABDRotatingGateIter20OrthoAL); });
+    register_scene("ABD: Rotating Gate Iter20 OrthoAL Beta10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 OrthoAL Beta10", setupABDRotatingGateIter20OrthoALBeta10); });
+    register_scene("ABD: Rotating Gate Iter20 OrthoAL Soft", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 OrthoAL Soft", setupABDRotatingGateIter20OrthoALSoft); });
+    register_scene("ABD: Rotating Gate Iter20 OrthoAL Soft NoProx", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 OrthoAL Soft NoProx", setupABDRotatingGateIter20OrthoALSoftNoProx); });
+    register_scene("ABD: Rotating Gate Iter20 Vperp1", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Vperp1", setupABDRotatingGateIter20Vperp1); });
+    register_scene("ABD: Rotating Gate Iter20 Vperp1 NoLS", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Vperp1 NoLS", setupABDRotatingGateIter20Vperp1NoLS); });
+    register_scene("ABD: Rotating Gate Iter20 Vperp10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Vperp10", setupABDRotatingGateIter20Vperp10); });
+    register_scene("ABD: Rotating Gate Iter20 Vperp100", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Vperp100", setupABDRotatingGateIter20Vperp100); });
+    register_scene("ABD: Rotating Gate Vperp10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Vperp10", setupABDRotatingGateVperp10); });
+    register_scene("ABD: Rotating Gate Vperp10 NoLS", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Vperp10 NoLS", setupABDRotatingGateVperp10NoLS); });
+    register_scene("ABD: Rotating Gate Vperp10 Mu10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Vperp10 Mu10", setupABDRotatingGateVperp10Mu10); });
+    register_scene("ABD: Rotating Gate Iter20 Vperp10 Mu10", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Vperp10 Mu10", setupABDRotatingGateIter20Vperp10Mu10); });
+    register_scene("ABD: Rotating Gate Iter20 Mu200", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Mu200", setupABDRotatingGateIter20Mu200); });
+    register_scene("ABD: Rotating Gate Iter20 Mu500", []() -> Scene* { return new AVBDScene("ABD: Rotating Gate Iter20 Mu500", setupABDRotatingGateIter20Mu500); });
+    register_scene("PABD: Rotating Gate", []() -> Scene* { return new AVBDScene("PABD: Rotating Gate", setupPABDRotatingGate); });
+    register_scene("AVBD: Rotating Gate Iter2", []() -> Scene* { return new AVBDScene("AVBD: Rotating Gate Iter2", setupAVBDRotatingGateIter2); });
+    register_scene("AVBD: Rotating Gate", []() -> Scene* { return new AVBDScene("AVBD: Rotating Gate", setupAVBDRotatingGate); });
+    register_scene("AVBD: Rotating Gate Iter10", []() -> Scene* { return new AVBDScene("AVBD: Rotating Gate Iter10", setupAVBDRotatingGateIter10); });
+    register_scene("AVBD: Rotating Gate Iter20", []() -> Scene* { return new AVBDScene("AVBD: Rotating Gate Iter20", setupAVBDRotatingGateIter20); });
     register_scene("AVBD: Pyramid",    []() -> Scene* { return new AVBDScene("AVBD: Pyramid",    setupPyramid); });
     register_scene("AVBD: Pyramid 2",  []() -> Scene* { return new AVBDScene("AVBD: Pyramid 2",  setupPyramid2); });
     register_scene("AVBD: Rope",       []() -> Scene* { return new AVBDScene("AVBD: Rope",       setupRope); });
     register_scene("AVBD: Heavy Rope", []() -> Scene* { return new AVBDScene("AVBD: Heavy Rope", setupHeavyRope); });
     register_scene("AVBD: Stack",      []() -> Scene* { return new AVBDScene("AVBD: Stack",      setupStack); });
+    register_scene("AVBD: CPU Stack",  []() -> Scene* { return new AVBDScene("AVBD: CPU Stack",  setupCPUStack); });
+    register_scene("AVBD: CPU Fixed Pair Drop", []() -> Scene* { return new AVBDScene("AVBD: CPU Fixed Pair Drop", setupCPUFixedPairDrop); });
     register_scene("AVBD: Soft Body",  []() -> Scene* { return new AVBDScene("AVBD: Soft Body",  setupSoftBody); });
     register_scene("AVBD: Bridge",     []() -> Scene* { return new AVBDScene("AVBD: Bridge",     setupBridge); });
     register_scene("AVBD: Breakable",  []() -> Scene* { return new AVBDScene("AVBD: Breakable",  setupBreakable); });

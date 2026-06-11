@@ -26,6 +26,10 @@ Rigid::Rigid(Solver* solver, float3 size, float density, float friction,
     initialAff = identity3x3();
     inertialAff = identity3x3();
     inertiaMatrix = diagonal(moment.x, moment.y, moment.z);
+    for (int i = 0; i < 6; i++) {
+        orthoLambda[i] = 0.0f;
+        orthoPenalty[i] = AVBD_PENALTY_MIN;
+    }
 }
 
 Rigid::~Rigid() {
