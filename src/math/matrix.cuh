@@ -407,7 +407,7 @@ CHYSX_HDI Mat4<T> outer(const Vec4<T>& a, const Vec4<T>& b) {
 }
 
 // ============================================================================
-// Type aliases
+// Type aliases for named matrices
 // ============================================================================
 
 using Mat2f = Mat2<float>;
@@ -417,6 +417,229 @@ using Mat4f = Mat4<float>;
 using Mat2d = Mat2<double>;
 using Mat3d = Mat3<double>;
 using Mat4d = Mat4<double>;
+
+// ============================================================================
+// VecN<T, N> — generic fixed-size vector
+// ============================================================================
+
+template <typename T, int N>
+struct VecN {
+    T data[N];
+
+    CHYSX_HD T& operator[](int i) { return data[i]; }
+    CHYSX_HD const T& operator[](int i) const { return data[i]; }
+
+    CHYSX_HD VecN& operator+=(const VecN& o) {
+        for (int i = 0; i < N; ++i) data[i] += o.data[i]; return *this;
+    }
+    CHYSX_HD VecN& operator-=(const VecN& o) {
+        for (int i = 0; i < N; ++i) data[i] -= o.data[i]; return *this;
+    }
+    CHYSX_HD VecN& operator*=(T s) {
+        for (int i = 0; i < N; ++i) data[i] *= s; return *this;
+    }
+
+    static CHYSX_HD VecN zero() { VecN v; for (int i = 0; i < N; ++i) v.data[i] = T{0}; return v; }
+};
+
+template <typename T, int N>
+CHYSX_HDI VecN<T, N> operator+(VecN<T, N> a, const VecN<T, N>& b) { return a += b; }
+template <typename T, int N>
+CHYSX_HDI VecN<T, N> operator-(VecN<T, N> a, const VecN<T, N>& b) { return a -= b; }
+template <typename T, int N>
+CHYSX_HDI VecN<T, N> operator*(VecN<T, N> a, T s) { return a *= s; }
+template <typename T, int N>
+CHYSX_HDI VecN<T, N> operator*(T s, VecN<T, N> a) { return a *= s; }
+template <typename T, int N>
+CHYSX_HDI VecN<T, N> operator-(const VecN<T, N>& a) {
+    VecN<T, N> r; for (int i = 0; i < N; ++i) r[i] = -a[i]; return r;
+}
+
+template <typename T, int N>
+CHYSX_HDI T dot(const VecN<T, N>& a, const VecN<T, N>& b) {
+    T s = T{0}; for (int i = 0; i < N; ++i) s += a[i] * b[i]; return s;
+}
+
+template <typename T, int N>
+CHYSX_HDI T max_abs(const VecN<T, N>& v) {
+    T m = T{0};
+    for (int i = 0; i < N; ++i) { T a = abs(v[i]); if (a > m) m = a; }
+    return m;
+}
+
+// Convenience: embed / extract Vec3 in a VecN
+template <typename T, int N>
+CHYSX_HDI void set_block3(VecN<T, N>& v, int offset, Vec3<T> b) {
+    v[offset] = b.x; v[offset + 1] = b.y; v[offset + 2] = b.z;
+}
+
+template <typename T, int N>
+CHYSX_HDI Vec3<T> get_block3(const VecN<T, N>& v, int offset) {
+    return Vec3<T>(v[offset], v[offset + 1], v[offset + 2]);
+}
+
+// ============================================================================
+// MatN<T, N> — generic fixed-size NxN square matrix (row-major)
+// ============================================================================
+
+template <typename T, int N>
+struct MatN {
+    T data[N * N];
+
+    CHYSX_HD T& operator()(int r, int c) { return data[r * N + c]; }
+    CHYSX_HD const T& operator()(int r, int c) const { return data[r * N + c]; }
+
+    CHYSX_HD MatN& operator+=(const MatN& o) {
+        for (int i = 0; i < N * N; ++i) data[i] += o.data[i]; return *this;
+    }
+    CHYSX_HD MatN& operator-=(const MatN& o) {
+        for (int i = 0; i < N * N; ++i) data[i] -= o.data[i]; return *this;
+    }
+    CHYSX_HD MatN& operator*=(T s) {
+        for (int i = 0; i < N * N; ++i) data[i] *= s; return *this;
+    }
+
+    static CHYSX_HD MatN zero() {
+        MatN m; for (int i = 0; i < N * N; ++i) m.data[i] = T{0}; return m;
+    }
+    static CHYSX_HD MatN identity() {
+        MatN m = zero();
+        for (int i = 0; i < N; ++i) m(i, i) = T{1};
+        return m;
+    }
+};
+
+template <typename T, int N>
+CHYSX_HDI MatN<T, N> operator+(MatN<T, N> a, const MatN<T, N>& b) { return a += b; }
+template <typename T, int N>
+CHYSX_HDI MatN<T, N> operator-(MatN<T, N> a, const MatN<T, N>& b) { return a -= b; }
+template <typename T, int N>
+CHYSX_HDI MatN<T, N> operator*(MatN<T, N> a, T s) { return a *= s; }
+template <typename T, int N>
+CHYSX_HDI MatN<T, N> operator*(T s, MatN<T, N> a) { return a *= s; }
+
+template <typename T, int N>
+CHYSX_HDI VecN<T, N> operator*(const MatN<T, N>& M, const VecN<T, N>& v) {
+    VecN<T, N> r = VecN<T, N>::zero();
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+            r[i] += M(i, j) * v[j];
+    return r;
+}
+
+template <typename T, int N>
+CHYSX_HDI MatN<T, N> transpose(const MatN<T, N>& m) {
+    MatN<T, N> r;
+    for (int i = 0; i < N; ++i)
+        for (int j = 0; j < N; ++j)
+            r(i, j) = m(j, i);
+    return r;
+}
+
+// Embed/extract 3x3 block inside an NxN matrix
+template <typename T, int N>
+CHYSX_HDI void set_block3x3(MatN<T, N>& M, int row, int col, const Mat3<T>& B) {
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            M(row + r, col + c) = B(r, c);
+}
+
+template <typename T, int N>
+CHYSX_HDI Mat3<T> get_block3x3(const MatN<T, N>& M, int row, int col) {
+    Mat3<T> B;
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 3; ++c)
+            B(r, c) = M(row + r, col + c);
+    return B;
+}
+
+// ============================================================================
+// Cholesky factorization / solve for SPD MatN
+// ============================================================================
+
+// In-place LL^T factorization. Writes the lower triangle of L.
+// Clamps near-zero pivots for robustness on GPU.
+template <typename T, int N>
+CHYSX_HDI void cholesky(MatN<T, N>& L, const MatN<T, N>& M) {
+    for (int i = 0; i < N * N; ++i) L.data[i] = M.data[i];
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            T s = L(i, j);
+            for (int k = 0; k < j; ++k) s -= L(i, k) * L(j, k);
+            if (i == j) {
+                if (s <= T(1e-20)) s = T(1e-20);
+                L(i, j) = sqrt(s);
+            } else {
+                L(i, j) = s / L(j, j);
+            }
+        }
+        for (int j = i + 1; j < N; ++j) L(i, j) = T{0};
+    }
+}
+
+// Solve L L^T x = b given lower-triangular Cholesky factor L.
+template <typename T, int N>
+CHYSX_HDI VecN<T, N> cholesky_solve(const MatN<T, N>& L, const VecN<T, N>& b) {
+    VecN<T, N> y = VecN<T, N>::zero();
+    for (int i = 0; i < N; ++i) {
+        T s = b[i];
+        for (int k = 0; k < i; ++k) s -= L(i, k) * y[k];
+        y[i] = s / L(i, i);
+    }
+    VecN<T, N> x = VecN<T, N>::zero();
+    for (int i = N - 1; i >= 0; --i) {
+        T s = y[i];
+        for (int k = i + 1; k < N; ++k) s -= L(k, i) * x[k];
+        x[i] = s / L(i, i);
+    }
+    return x;
+}
+
+// SPD inverse via Cholesky: M^{-1} by solving M x_i = e_i for each column.
+template <typename T, int N>
+CHYSX_HDI MatN<T, N> inverse_spd(const MatN<T, N>& M) {
+    MatN<T, N> L;
+    cholesky<T, N>(L, M);
+    MatN<T, N> inv = MatN<T, N>::zero();
+    for (int col = 0; col < N; ++col) {
+        VecN<T, N> e = VecN<T, N>::zero();
+        e[col] = T{1};
+        VecN<T, N> x = cholesky_solve<T, N>(L, e);
+        for (int row = 0; row < N; ++row) inv(row, col) = x[row];
+    }
+    return inv;
+}
+
+// Diagonal regularization: ensure all diagonal entries >= eps.
+// Quick positive-semidefinite fix for small dense Hessians on GPU.
+template <typename T, int N>
+CHYSX_HDI void make_spd(MatN<T, N>& H) {
+    // Symmetrize
+    for (int i = 0; i < N; ++i)
+        for (int j = i + 1; j < N; ++j)
+            H(i, j) = H(j, i) = T(0.5) * (H(i, j) + H(j, i));
+    // Regularize diagonals
+    T tr = T{0};
+    for (int i = 0; i < N; ++i) tr += abs(H(i, i));
+    T eps = tr * T(1e-6);
+    if (eps < T(1e-8)) eps = T(1e-8);
+    for (int i = 0; i < N; ++i)
+        if (H(i, i) < eps) H(i, i) = eps;
+}
+
+// ============================================================================
+// Type aliases for VecN / MatN
+// ============================================================================
+
+using Vec9f  = VecN<float, 9>;
+using Vec12f = VecN<float, 12>;
+using Mat9f  = MatN<float, 9>;
+using Mat12f = MatN<float, 12>;
+
+using Vec9d  = VecN<double, 9>;
+using Vec12d = VecN<double, 12>;
+using Mat9d  = MatN<double, 9>;
+using Mat12d = MatN<double, 12>;
 
 }  // namespace math
 }  // namespace chysx

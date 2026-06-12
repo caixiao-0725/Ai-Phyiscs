@@ -109,6 +109,7 @@ add_library(chysx_scenes STATIC
     src/io/bgeo_writer.cpp
     scenes/cloth_freefall.cu
     scenes/avbd_scenes.cpp
+    scenes/abd_ipc_scenes.cpp
     src/rigid/avbd_cpu/avbd_gpu_renderer.cu
 )
 
