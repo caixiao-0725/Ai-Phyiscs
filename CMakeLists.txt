@@ -16,6 +16,61 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 find_package(CUDAToolkit REQUIRED)
 
 # ====================================================================
+# OptiX broadphase (optional, header-only SDK vendored in external/optix)
+# ====================================================================
+
+option(CHYSX_USE_OPTIX "Enable OptiX-based EF broadphase backend" OFF)
+
+if(CHYSX_USE_OPTIX)
+    set(OPTIX_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/optix/include"
+        CACHE PATH "Path to OptiX vendored headers")
+    if(NOT EXISTS "${OPTIX_INCLUDE_DIR}/optix.h")
+        message(FATAL_ERROR "OptiX headers not found at ${OPTIX_INCLUDE_DIR}. "
+            "Run: git submodule update --init external/optix")
+    endif()
+
+    find_program(BIN2C bin2c HINTS "${CUDAToolkit_BIN_DIR}")
+    if(NOT BIN2C)
+        message(FATAL_ERROR "bin2c not found in CUDA Toolkit bin directory")
+    endif()
+
+    # Compile the OptiX device program to PTX, then embed via bin2c.
+    set(OPTIX_DEVICE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/src/collision/optix/optix_ef_device.cu")
+    set(OPTIX_PTX_FILE   "${CMAKE_CURRENT_BINARY_DIR}/optix_ef_device.ptx")
+    set(OPTIX_EMBED_FILE "${CMAKE_CURRENT_BINARY_DIR}/optix_ef_device_ptx.c")
+
+    add_custom_command(
+        OUTPUT "${OPTIX_PTX_FILE}"
+        COMMAND ${CMAKE_CUDA_COMPILER}
+            -ptx
+            -std=c++17
+            --use_fast_math
+            -I "${OPTIX_INCLUDE_DIR}"
+            -I "${CMAKE_CURRENT_SOURCE_DIR}/src/collision/optix"
+            -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
+            "${OPTIX_DEVICE_SRC}"
+            -o "${OPTIX_PTX_FILE}"
+        DEPENDS "${OPTIX_DEVICE_SRC}"
+        COMMENT "Compiling OptiX EF device program to PTX"
+    )
+
+    add_custom_command(
+        OUTPUT "${OPTIX_EMBED_FILE}"
+        COMMAND "${BIN2C}" -c --padd 0 --type char
+            --name chysx_optix_ef_ptx
+            "${OPTIX_PTX_FILE}" > "${OPTIX_EMBED_FILE}"
+        DEPENDS "${OPTIX_PTX_FILE}"
+        COMMENT "Embedding OptiX EF PTX via bin2c"
+    )
+
+    set(CHYSX_OPTIX_SOURCES
+        src/collision/optix/optix_ef_kernels.cu
+        src/collision/optix/optix_ef_broadphase.cpp
+        "${OPTIX_EMBED_FILE}"
+    )
+endif()
+
+# ====================================================================
 # chysx_core — static library with all physics / solver / collision code
 # ====================================================================
 
@@ -36,6 +91,8 @@ add_library(chysx_core STATIC
     src/collision/sdf/sdf_volume.cu
     src/collision/sdf/sdf_contact.cu
     src/collision/collision_pipeline.cu
+    src/collision/ef_broadphase.cu
+    src/collision/ef_contact_detector.cu
 
     src/constraint/cloth/pin_constraint.cu
     src/constraint/cloth/spring_constraint.cu
@@ -72,6 +129,12 @@ add_library(chysx_core STATIC
     src/cloth/cloth_simulator.cu
     src/coupled/coupled_simulator.cu
 )
+
+if(CHYSX_USE_OPTIX)
+    target_sources(chysx_core PRIVATE ${CHYSX_OPTIX_SOURCES})
+    target_include_directories(chysx_core PUBLIC "${OPTIX_INCLUDE_DIR}")
+    target_compile_definitions(chysx_core PUBLIC CHYSX_HAS_OPTIX)
+endif()
 
 target_include_directories(chysx_core PUBLIC src)
 target_link_libraries(chysx_core PUBLIC CUDA::cudart)

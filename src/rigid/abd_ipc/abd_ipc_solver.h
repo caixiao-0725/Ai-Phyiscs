@@ -11,6 +11,8 @@
 #include "abd_ipc_contact.h"
 #include "abd_ipc_ccd.cuh"
 #include "../../geometry/tet_mesh.h"
+#include "../../geometry/triangle_mesh.h"
+#include "../../io/obj_io.h"
 
 #include <cstdio>
 #include <string>
@@ -79,6 +81,78 @@ public:
         surface_.body_ranges.push_back(range);
 
         bodies_.push_back(body);
+    }
+
+    // Add a body from a closed triangle mesh (no tets needed).
+    void add_body(geometry::TriangleMeshf& mesh, float density, float kappa,
+                  Vec3f translation = Vec3f(0, 0, 0), bool fixed = false) {
+        mesh.build_edges();
+
+        ABDBody body = init_body(mesh, density, kappa, config.gravity, translation, fixed);
+        body.surface_vert_offset = static_cast<int>(surface_.verts.size());
+
+        int nv = static_cast<int>(mesh.num_vertices());
+        int nt = static_cast<int>(mesh.num_triangles());
+        int ne = static_cast<int>(mesh.num_edges());
+
+        body.surface_vert_count = nv;
+        body.surface_tri_offset = static_cast<int>(surface_.tris.size());
+        body.surface_tri_count = nt;
+        body.surface_edge_offset = static_cast<int>(surface_.edges.size());
+        body.surface_edge_count = ne;
+
+        int body_idx = static_cast<int>(bodies_.size());
+
+        const Vec3f* verts = mesh.vertices().cpu_data();
+        auto jacobi = build_jacobi_array(mesh);
+        for (int i = 0; i < nv; ++i) {
+            surface_.verts.push_back(verts[i]);
+            surface_.jacobi.push_back(jacobi[i]);
+            surface_.vert_body.push_back(body_idx);
+        }
+
+        const auto* tris = mesh.triangles().cpu_data();
+        int v_off = body.surface_vert_offset;
+        for (int i = 0; i < nt; ++i)
+            surface_.tris.push_back(Vec3i(tris[i].x + v_off,
+                                          tris[i].y + v_off,
+                                          tris[i].z + v_off));
+
+        const auto* edges = mesh.edges().cpu_data();
+        for (int i = 0; i < ne; ++i)
+            surface_.edges.push_back(math::Vec2i(edges[i].x + v_off,
+                                                  edges[i].y + v_off));
+
+        SurfaceData::BodyRange range;
+        range.vert_begin = body.surface_vert_offset;
+        range.vert_end   = body.surface_vert_offset + nv;
+        range.tri_begin  = body.surface_tri_offset;
+        range.tri_end    = body.surface_tri_offset + nt;
+        range.edge_begin = body.surface_edge_offset;
+        range.edge_end   = body.surface_edge_offset + ne;
+        surface_.body_ranges.push_back(range);
+
+        bodies_.push_back(body);
+    }
+
+    // Load an OBJ file and add it as a body (convenience wrapper).
+    bool add_body_from_obj(const std::string& path, float density, float kappa,
+                           Vec3f translation = Vec3f(0, 0, 0), bool fixed = false) {
+        io::ObjMesh obj;
+        if (!io::load_obj(path, obj)) return false;
+        int nv = static_cast<int>(obj.positions.size()) / 3;
+        int nt = static_cast<int>(obj.triangles.size()) / 3;
+
+        geometry::TriangleMeshf mesh(nv, nt);
+        auto* verts = mesh.vertices().cpu_data();
+        for (int i = 0; i < nv; ++i)
+            verts[i] = Vec3f(obj.positions[i*3], obj.positions[i*3+1], obj.positions[i*3+2]);
+        auto* tris = mesh.triangles().cpu_data();
+        for (int i = 0; i < nt; ++i)
+            tris[i] = Vec3i(obj.triangles[i*3], obj.triangles[i*3+1], obj.triangles[i*3+2]);
+
+        add_body(mesh, density, kappa, translation, fixed);
+        return true;
     }
 
     // ---- simulation -------------------------------------------------------
@@ -156,6 +230,31 @@ private:
     std::vector<ABDBody> bodies_;
     SurfaceData surface_;
     StepInfo last_info_{};
+    collision::EFContactDetector ef_detector_;
+    bool bvh_initialized_ = false;
+
+    // Unified contact detection: dispatches to EFContactDetector or brute-force.
+    std::vector<ContactPair> detect_all_contacts() {
+        if (config.use_bvh_broadphase) {
+            if (!bvh_initialized_) {
+                int nv = static_cast<int>(surface_.verts.size());
+                collision::BroadphaseBackend backend = collision::BroadphaseBackend::QuantBvh;
+                if (config.broadphase_type == ABDConfig::BroadphaseType::OptiX)
+                    backend = collision::BroadphaseBackend::OptiX;
+                ef_detector_.setup(surface_.tris, nv, -1, backend);
+                bvh_initialized_ = true;
+            }
+
+            // EF broadphase + narrow phase (VF + EE with distance filter)
+            std::vector<collision::ContactResult> raw;
+            int nv = static_cast<int>(surface_.verts.size());
+            ef_detector_.detect(surface_.verts.data(), nv, config.d_hat, raw);
+
+            // Convert to ABD ContactPairs with cross-body filtering
+            return convert_contacts(raw, surface_);
+        }
+        return detect_contacts(surface_, config.d_hat);
+    }
 
     // Update surface vertex positions from body q states.
     void update_surface_verts() {
@@ -173,8 +272,7 @@ private:
             if (body.is_fixed) continue;
             E += assemble_body_energy(body, config.dt);
         }
-        // Re-detect contacts at current surface positions
-        auto contacts = detect_contacts(surface_, config.d_hat);
+        auto contacts = detect_all_contacts();
         float D_hat = config.d_hat * config.d_hat;
         for (auto& cp : contacts) {
             float D = 0;
@@ -284,8 +382,7 @@ private:
             // Update surface
             update_surface_verts();
 
-            // Detect contacts
-            auto contacts = detect_contacts(surface_, config.d_hat);
+            auto contacts = detect_all_contacts();
             last_info_.contact_count = static_cast<int>(contacts.size());
 
             // Assemble system

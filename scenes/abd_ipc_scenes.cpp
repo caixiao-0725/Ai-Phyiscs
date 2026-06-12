@@ -71,6 +71,9 @@ public:
         solver_.config.velocity_tol = 1e-3f;  // tighter convergence
         solver_.config.total_frames = 50;
 
+        // Broadphase backend: QuantBvh (default) or OptiX (when available)
+        // solver_.config.broadphase_type = ABDConfig::BroadphaseType::OptiX;
+
         // Body 0 (mesh2 in libuipc): fixed regular tetrahedron at origin
         chysx::geometry::TetMeshf tet_fixed;
         make_regular_tet(tet_fixed);
@@ -125,7 +128,7 @@ public:
         printf("  body1: ortho_psi=%.6e\n", ortho_err);
 
         // Export OBJ
-        export_frame();
+        //export_frame();
 
         rebuild_draw_buffers();
     }

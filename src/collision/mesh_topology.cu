@@ -196,7 +196,100 @@ void MeshTopology::build(const std::vector<math::Vec3i>& tris,
     }
     n_adj_ee_ = static_cast<int>(adj_h.size());
 
-    // ---- 4. Ship to device.
+    // ---- 5. Edge quad (per-edge 4-vertex neighbourhood for EE normal).
+    //
+    // For each edge, store (edge_v0, edge_v1, face0_opposite, face1_opposite).
+    // This matches PeriDyno's `mSurfaceEdgeIndex`: given edge (v0,v1) and
+    // its two adjacent faces, the quad encodes enough geometry to compute
+    // an average face normal for orienting the EE contact normal.
+
+    std::vector<math::Vec4i> edge_quad_h(n_edges_, math::Vec4i(-1,-1,-1,-1));
+    for (int eid = 0; eid < n_edges_; ++eid) {
+        const math::Vec2i e = edges_h[eid];
+        const math::Vec2i ef = edge2face_h[eid];
+        int f0_opp = -1, f1_opp = -1;
+        if (ef.x >= 0) {
+            const math::Vec3i& tri = tris[ef.x];
+            for (int k = 0; k < 3; ++k)
+                if (tri.data[k] != e.x && tri.data[k] != e.y) { f0_opp = tri.data[k]; break; }
+        }
+        if (ef.y >= 0) {
+            const math::Vec3i& tri = tris[ef.y];
+            for (int k = 0; k < 3; ++k)
+                if (tri.data[k] != e.x && tri.data[k] != e.y) { f1_opp = tri.data[k]; break; }
+        }
+        edge_quad_h[eid] = math::Vec4i(e.x, e.y, f0_opp, f1_opp);
+    }
+
+    // ---- 6. Pre-computed adjacent VF pairs (CullVFAdjacent supplement).
+    //
+    // For each face, find vertices that are adjacent (1-ring) but NOT owned
+    // by any edge in the EF broadphase for that face. These (vertex, face)
+    // pairs would be missed by the vert_in_edge trick.
+
+    std::vector<math::Vec4i> pre_vf_h;
+    for (int fid = 0; fid < n_faces_; ++fid) {
+        const math::Vec3i tri = tris[fid];
+        const int tri_v[3] = {tri.x, tri.y, tri.z};
+
+        // Collect unique adjacent vertices not on this face and not "owned"
+        // by any edge touching this face.
+        std::vector<int> adj_verts;
+        for (int j = 0; j < 3; ++j) {
+            int v0 = tri_v[j];
+            for (int eid_n : vert_to_edges[v0]) {
+                const math::Vec2i en = edges_h[eid_n];
+                int v1 = (en.x == v0) ? en.y : en.x;
+                if (v1 == tri_v[(j+1)%3] || v1 == tri_v[(j+2)%3]) continue;
+                // v1 is adjacent but not on this face.
+                // Check if v1 is NOT the owned vertex for its edge.
+                int owned = vert_in_edge_h[eid_n];
+                if (owned != v1) {
+                    adj_verts.push_back(v1);
+                }
+            }
+        }
+        // Deduplicate
+        std::sort(adj_verts.begin(), adj_verts.end());
+        adj_verts.erase(std::unique(adj_verts.begin(), adj_verts.end()), adj_verts.end());
+        for (int v : adj_verts) {
+            pre_vf_h.push_back(math::Vec4i(v, tri.x, tri.y, tri.z));
+        }
+    }
+    n_adj_vf_ = static_cast<int>(pre_vf_h.size());
+
+    // ---- 7. Pre-computed adjacent EE pairs (CullEEAdjacent supplement).
+    //
+    // Already computed in step 4 as adj_h (edge pairs sharing a 1-ring vertex
+    // but not on the same face). However, adj_h stores vertex indices.
+    // We also need the edge-index version for CullEEAdjacent's edge_quad lookup.
+
+    std::vector<math::Vec2i> pre_ee_h;
+    pre_ee_h.reserve(adj_h.size());
+    for (int fid = 0; fid < n_faces_; ++fid) {
+        const math::Vec3i tri = tris[fid];
+        const math::Vec3i f2e = face2edge[fid];
+        const math::Vec3i eif = edge_in_face_h[fid];
+        for (int j = 0; j < 3; ++j) {
+            int eid = eif.data[j];
+            if (eid < 0) break;
+            const math::Vec2i e = edges_h[eid];
+
+            int other_point = -1;
+            for (int k = 0; k < 3; ++k)
+                if (tri.data[k] != e.x && tri.data[k] != e.y) { other_point = tri.data[k]; break; }
+            if (other_point < 0) continue;
+
+            for (int nbr : vert_to_edges[other_point]) {
+                if (nbr == f2e.x || nbr == f2e.y || nbr == f2e.z) continue;
+                if (nbr <= eid) continue;
+                pre_ee_h.push_back(math::Vec2i(eid, nbr));
+            }
+        }
+    }
+    n_adj_ee_pre_ = static_cast<int>(pre_ee_h.size());
+
+    // ---- 8. Ship to device.
 
     faces_.resize(static_cast<std::size_t>(n_faces_));
     edges_.resize(static_cast<std::size_t>(n_edges_));
@@ -204,14 +297,27 @@ void MeshTopology::build(const std::vector<math::Vec3i>& tris,
     vert_in_edge_.resize(static_cast<std::size_t>(n_edges_));
     edge_in_face_.resize(static_cast<std::size_t>(n_faces_));
     adj_ee_pairs_.resize(static_cast<std::size_t>(std::max(n_adj_ee_, 1)));
+    edge_quad_.resize(static_cast<std::size_t>(n_edges_));
 
     std::copy(tris.begin(),            tris.end(),            faces_.cpu_data());
     std::copy(edges_h.begin(),         edges_h.end(),         edges_.cpu_data());
     std::copy(edge2face_h.begin(),     edge2face_h.end(),     edge2face_.cpu_data());
     std::copy(vert_in_edge_h.begin(),  vert_in_edge_h.end(),  vert_in_edge_.cpu_data());
     std::copy(edge_in_face_h.begin(),  edge_in_face_h.end(),  edge_in_face_.cpu_data());
+    std::copy(edge_quad_h.begin(),     edge_quad_h.end(),     edge_quad_.cpu_data());
     if (n_adj_ee_ > 0) {
         std::copy(adj_h.begin(), adj_h.end(), adj_ee_pairs_.cpu_data());
+    }
+
+    if (n_adj_vf_ > 0) {
+        pre_adj_vf_.resize(static_cast<std::size_t>(n_adj_vf_));
+        std::copy(pre_vf_h.begin(), pre_vf_h.end(), pre_adj_vf_.cpu_data());
+        pre_adj_vf_.copy_to_device();
+    }
+    if (n_adj_ee_pre_ > 0) {
+        pre_adj_ee_.resize(static_cast<std::size_t>(n_adj_ee_pre_));
+        std::copy(pre_ee_h.begin(), pre_ee_h.end(), pre_adj_ee_.cpu_data());
+        pre_adj_ee_.copy_to_device();
     }
 
     faces_.copy_to_device();
@@ -219,6 +325,7 @@ void MeshTopology::build(const std::vector<math::Vec3i>& tris,
     edge2face_.copy_to_device();
     vert_in_edge_.copy_to_device();
     edge_in_face_.copy_to_device();
+    edge_quad_.copy_to_device();
     if (n_adj_ee_ > 0) {
         adj_ee_pairs_.copy_to_device();
     }

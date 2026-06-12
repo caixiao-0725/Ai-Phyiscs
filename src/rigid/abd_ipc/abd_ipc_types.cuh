@@ -229,6 +229,11 @@ struct ABDConfig {
     // Line search
     int line_search_max_iter = 8;
 
+    // Broadphase: "none" = brute force, "quantbvh", "optix"
+    bool use_bvh_broadphase = true;
+    enum class BroadphaseType { BruteForce, QuantBvh, OptiX };
+    BroadphaseType broadphase_type = BroadphaseType::QuantBvh;
+
     // Output
     int total_frames = 50;
     bool export_obj = true;

@@ -1,5 +1,6 @@
 # scikit-build-core / CMake build outputs
 build/
+build*/
 build_viewer/
 _skbuild/
 dist/

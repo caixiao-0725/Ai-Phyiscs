@@ -76,11 +76,33 @@ public:
     const CudaArray<math::Vec3i>& edge_in_face() const noexcept{ return edge_in_face_; }
     const CudaArray<math::Vec4i>& adj_ee_pairs() const noexcept{ return adj_ee_pairs_; }
 
+    // Adjacent VF/EE pairs that the EF broadphase misses due to the
+    // vert_in_edge ownership trick.  These are pre-computed at build time
+    // and evaluated as supplementary narrow-phase candidates every frame.
+    //
+    // pre_adj_vf: (vertex_id, face.v0, face.v1, face.v2)
+    //   Vertices adjacent to a face (sharing an edge with one face-vertex)
+    //   but NOT "owned" by any edge in the EF query for that face.
+    //
+    // pre_adj_ee: (edge_id_A, edge_id_B)
+    //   Diagonal edge pairs across adjacent faces that share a vertex but
+    //   don't appear in the same EF candidate list.
+    int n_adj_vf() const noexcept { return n_adj_vf_; }
+    int n_adj_ee_pre() const noexcept { return n_adj_ee_pre_; }
+    const CudaArray<math::Vec4i>& pre_adj_vf() const noexcept { return pre_adj_vf_; }
+    const CudaArray<math::Vec2i>& pre_adj_ee() const noexcept { return pre_adj_ee_; }
+
+    // Per-edge: 4 vertex indices (edge_v0, adj_face_v0, adj_face_v1, adj_face_v2)
+    // for EE normal orientation (matching PeriDyno's edge_index / mSurfaceEdgeIndex).
+    const CudaArray<math::Vec4i>& edge_quad() const noexcept { return edge_quad_; }
+
 private:
     int n_verts_ = 0;
     int n_faces_ = 0;
     int n_edges_ = 0;
     int n_adj_ee_ = 0;
+    int n_adj_vf_ = 0;
+    int n_adj_ee_pre_ = 0;
 
     CudaArray<math::Vec3i> faces_;          // [n_faces] triangle vertex ids
     CudaArray<math::Vec2i> edges_;
@@ -88,6 +110,10 @@ private:
     CudaArray<int>         vert_in_edge_;
     CudaArray<math::Vec3i> edge_in_face_;
     CudaArray<math::Vec4i> adj_ee_pairs_;
+
+    CudaArray<math::Vec4i> pre_adj_vf_;     // supplementary VF candidates
+    CudaArray<math::Vec2i> pre_adj_ee_;      // supplementary EE candidates (edge id pairs)
+    CudaArray<math::Vec4i> edge_quad_;       // per-edge: 4 verts for normal orientation
 };
 
 }  // namespace collision

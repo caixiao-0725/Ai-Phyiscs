@@ -313,7 +313,13 @@ $$
 
 在每次 Newton 迭代开始时检测所有 **跨体** 的 PT 和 EE 对，筛选条件为 $D < \hat{D}$。
 
-当前实现使用暴力枚举（$O(n^2)$），适用于少量刚体。后续可接入 ChysX 的 `QuantBvh` broadphase 加速。
+提供两种 broadphase 后端（通过 `ABDConfig::use_bvh_broadphase` 切换）：
+
+1. **暴力枚举**（$O(n^2)$）：适用于少量刚体/验证场景
+2. **QuantBvh EF broadphase**（默认）：
+   - 使用 `collision::EFBroadphase` 在 GPU 上建面 BVH
+   - `query_self_ef` 产生 (edge_id, face_id) 候选对
+   - CPU narrow phase 从 EF 对中提取 VF 和 EE 碰撞（利用 `MeshTopology` 的 `vert_in_edge`、`edge_in_face` 表），附加跨体过滤
 
 ### 8.2 连续碰撞检测 (CCD)
 
@@ -363,16 +369,34 @@ $$
 ```
 src/rigid/abd_ipc/
 ├── abd_ipc_types.cuh      # 基础类型: q向量, ABDJacobi, DyadicMass, ABDBody, ContactPair, ABDConfig
-├── abd_ipc_mesh.h          # 网格工具: dyadic mass 积分, 广义体力, body 初始化
+├── abd_ipc_mesh.h          # 网格工具: dyadic mass 积分 (四面体+三角面), 广义体力, body 初始化
 ├── abd_ipc_energy.cuh      # OrthoPotential: Ψ, ∇Ψ, ∇²Ψ (符号计算公式)
 ├── abd_ipc_barrier.cuh     # IPC log-barrier: B, dB/dD, d²B/dD²
 ├── abd_ipc_distance.cuh    # 平方距离基元: PP, PE, PT, EE 及其梯度
 ├── abd_ipc_assembly.cuh    # 线性系统组装: body gradient/hessian, contact lifting
-├── abd_ipc_contact.h       # 碰撞检测: brute-force PT + EE
+├── abd_ipc_contact.h       # 碰撞检测: brute-force 或 EFBroadphase + CPU narrow phase
 ├── abd_ipc_ccd.cuh         # 连续碰撞检测 + 线搜索
 ├── abd_ipc_pcg.cuh         # 预处理共轭梯度求解器
 └── abd_ipc_solver.h        # 主求解器: Newton loop, BDF1 integration
+
+src/collision/
+├── ef_broadphase.h/.cu     # 通用 EF broadphase: QuantBvh 面 BVH + edge-face 查询
+├── bvh/quant_bvh.h/.cu     # 量化无栈 BVH (16字节节点)
+└── mesh_topology.h/.cu     # 网格拓扑表: edges, vert_in_edge, edge_in_face, adj_ee
 ```
+
+### 9.1 三角网格输入
+
+ABD-IPC 支持两种网格输入：
+
+- **四面体网格** (`TetMesh`)：通过体积积分计算 dyadic mass 和广义体力
+- **封闭三角网格** (`TriangleMesh`)：通过散度定理将体积积分转换为面积分
+  - `compute_dyadic_mass(TriangleMeshf&, density)` — 散度定理积分质量矩阵
+  - `compute_body_force(TriangleMeshf&, force_density)` — 散度定理积分广义体力
+  - `trimesh_volume(TriangleMeshf&)` — 封闭网格的体积
+  - 要求网格是封闭的、法向朝外的流形
+
+也可以通过 `add_body_from_obj(path, ...)` 直接从 OBJ 文件加载三角网格。
 
 ---
 
