@@ -124,6 +124,8 @@ add_library(chysx_core STATIC
 
     src/rigid/featherstone/featherstone_solver.cu
 
+    src/rigid/rigid_ipc/rigid_ipc_kernels.cu
+
     src/ik/ik_solver.cu
 
     src/cloth/cloth_simulator.cu
@@ -173,6 +175,7 @@ add_library(chysx_scenes STATIC
     scenes/cloth_freefall.cu
     scenes/avbd_scenes.cpp
     scenes/abd_ipc_scenes.cpp
+    scenes/rigid_ipc_scenes.cpp
     src/rigid/avbd_cpu/avbd_gpu_renderer.cu
 )
 
@@ -229,6 +232,7 @@ option(CHYSX_BUILD_SCENES "Build batch export executable" ON)
 
 if(CHYSX_BUILD_SCENES)
     add_compile_definitions(ASSET_PATH="${CMAKE_CURRENT_SOURCE_DIR}/assets/")
+    add_compile_definitions(CHYSX_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/")
 
     add_executable(chysx_scene
         src/render/batch_export.cu

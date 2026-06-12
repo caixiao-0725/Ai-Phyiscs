@@ -94,6 +94,7 @@ public:
     bool valid() const noexcept;
     const MeshTopology& topology() const noexcept;
     const EFBroadphase& broadphase() const noexcept { return qbvh_broadphase_; }
+    EFBroadphase& broadphase() noexcept { return qbvh_broadphase_; }
     BroadphaseBackend backend() const noexcept { return backend_; }
 
 private:

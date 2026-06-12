@@ -16,8 +16,18 @@
 
 #include "math/vec.cuh"
 
+#ifndef CHYSX_SOURCE_DIR
+#define CHYSX_SOURCE_DIR "./"
+#endif
+
 namespace chysx {
 namespace render {
+
+// Resolve a path relative to the ChysX source tree root.
+// Example: get_data_path("meshes/foo.obj") returns "<source_dir>/meshes/foo.obj"
+inline std::string get_data_path(const char* relative) {
+    return std::string(CHYSX_SOURCE_DIR) + relative;
+}
 
 // Per-object draw data handed from a Scene to the viewer each frame.
 struct DrawMesh {
