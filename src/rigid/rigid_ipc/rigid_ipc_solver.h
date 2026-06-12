@@ -656,7 +656,6 @@ private:
         prof_ = {};
         float prev_min_dist = 1e30f;
 
-        // Start Newton from current pose (q_prev), NOT predictor (q_tilde).
         upload_body_q();
         gpu_update_surface_verts();
 
@@ -667,16 +666,28 @@ private:
         float inv_am = (average_mass_ > 0) ? 1.0f / average_mass_ : 1.0f;
         float kappa_over_am = kappa_ * inv_am;
 
+        // Contact caching: only re-detect when bodies moved significantly
+        int nc = 0;
+        bool contacts_dirty = true;
+        float cumulative_disp = 0;
+        float redetect_threshold = config.d_hat * 0.25f;
+        float prev_residual = 1e30f;
+        int stall_count = 0;
+
         for (int iter = 0; iter < config.newton_max_iter; ++iter) {
             prof_.iters = iter + 1;
 
-            // 1. Detect contacts (fully on GPU, every iteration)
+            // 1. Detect contacts — only when needed
             cudaDeviceSynchronize();
             auto t0 = std::chrono::steady_clock::now();
 
-            int nc = detect_all_contacts_gpu();
-            last_info_.contact_count = nc;
-            last_info_.min_distance = -1.0f;
+            if (contacts_dirty) {
+                nc = detect_all_contacts_gpu();
+                last_info_.contact_count = nc;
+                last_info_.min_distance = -1.0f;
+                contacts_dirty = false;
+                cumulative_disp = 0;
+            }
 
             prof_.detect_us += us_since(t0);
 
@@ -699,7 +710,7 @@ private:
 
             prof_.body_assemble_us += us_since(t0);
 
-            // 3. Assemble contact contributions (GPU) using kappa/average_mass
+            // 3. Assemble contact contributions (GPU)
             t0 = std::chrono::steady_clock::now();
 
             kappa_over_am = kappa_ * inv_am;
@@ -733,12 +744,12 @@ private:
             t0 = std::chrono::steady_clock::now();
 
             std::vector<Vec6f> dq(n);
-            auto pcg_result = solve_pcg6(sys, dq, config.pcg_tol,
-                                          n * 6 * config.pcg_max_iter_ratio);
+            solve_pcg6(sys, dq, config.pcg_tol,
+                       n * 6 * config.pcg_max_iter_ratio);
 
             prof_.pcg_us += us_since(t0);
 
-            // Convergence: max vertex speed
+            // Convergence check
             float max_vspeed = compute_step_vertex_speed(dq);
             float max_disp = compute_max_vertex_disp(dq);
             last_info_.newton_iters = iter + 1;
@@ -747,7 +758,19 @@ private:
             if (iter >= config.newton_min_iter && max_vspeed <= conv_tol)
                 break;
 
-            // 5. CCD (GPU) — use detected contacts for CCD
+            // Early termination: if residual stalls, stop wasting iterations
+            if (iter > 10) {
+                float ratio = max_vspeed / prev_residual;
+                if (ratio > 0.95f) {
+                    stall_count++;
+                    if (stall_count >= 5) break;
+                } else {
+                    stall_count = 0;
+                }
+            }
+            prev_residual = max_vspeed;
+
+            // 5. CCD + displacement cap
             t0 = std::chrono::steady_clock::now();
 
             for (int i = 0; i < n; ++i)
@@ -763,9 +786,6 @@ private:
                 alpha_ccd = gpu_ccd_from_contacts(nc, config.d_hat * 0.1f);
             }
 
-            // Limit max vertex displacement: prevent jumping over d_hat gap
-            // This is a conservative replacement for global CCD. The original
-            // rigid-ipc uses broadphase CCD along the full motion trajectory.
             {
                 float disp_limit = config.d_hat;
                 if (max_disp > disp_limit) {
@@ -778,9 +798,10 @@ private:
             cudaDeviceSynchronize();
             prof_.ccd_us += us_since(t0);
 
-            // 6. Line search — strict decrease: f(x+αd) < f(x)
+            // 6. Line search — strict decrease
             t0 = std::chrono::steady_clock::now();
 
+            float step_disp = 0;
             {
                 float E0 = gpu_total_energy(nc);
 
@@ -801,13 +822,13 @@ private:
                     float E_trial = gpu_total_energy(nc);
                     if (E_trial < E0) {
                         ls_success = true;
+                        step_disp = max_disp * alpha;
                         break;
                     }
                     alpha *= 0.5f;
                 }
 
                 if (!ls_success) {
-                    // Revert to q_save — no improvement found
                     for (int i = 0; i < n; ++i) bodies_[i].q = q_save[i];
                 } else {
                     for (int i = 0; i < n; ++i) {
@@ -819,12 +840,16 @@ private:
 
             prof_.line_search_us += us_since(t0);
 
-            // 7. Upload updated q and update verts for next iter
+            // 7. Upload updated q, update verts
             t0 = std::chrono::steady_clock::now();
             upload_body_q();
             gpu_update_surface_verts();
-            cudaDeviceSynchronize();
             prof_.upload_us += us_since(t0);
+
+            // Track cumulative displacement for contact re-detection
+            cumulative_disp += step_disp;
+            if (cumulative_disp > redetect_threshold)
+                contacts_dirty = true;
 
             // Adaptive kappa update
             if (nc > 0) {
