@@ -1,0 +1,25 @@
+{
+	"curveFile": "configs/models/flame_ribbing_pattern.bcc",
+	"resampleLength": 3e-3,
+	"curveRadius": 1e-3,
+
+	"simulation": {
+		// Material
+		"density": 1e-3,
+		"frictionCoeff": 0.1,
+		"kStretch": 5e-2,
+		"kBend": 1e-7,
+		"kCollision": 1e-4,
+		"damping": 1e-6,
+
+		// Env
+		"gravity": [0, -9.8, 0],
+		"drag": 0.2,
+
+		// Solver
+		"maxTimeStep": 2e-4,
+		"numIterations": 4,
+		"detectionPeriod": 2,
+		"detectionScaler": 1.5
+	},
+}

@@ -44,14 +44,13 @@
 // solver never copies them back to the host inside the iteration so a
 // full solve runs without host-device synchronisation.
 //
-// CUDA Graph
-// ----------
-// The entire solve (setup + iteration loop) is captured into a CUDA
-// Graph on the first call and replayed on subsequent calls.  Because
-// all device pointers (workspace buffers, CSR topology arrays, x, b)
-// are stable across frames the graph stays valid without per-frame
-// updates.  The graph is invalidated and re-captured when the problem
-// size (`n`) or iteration count (`max_iterations`) changes.
+// Launch path
+// ------------
+// `PCGSolver::solve()` calls `emit_pcg()` in pcg_solver.cu, which
+// issues a fused PCG kernel sequence on the caller stream.  Adjacent
+// vector updates and scalar reductions are merged to minimise launch
+// overhead.  The contact SpMV kernel is launched unconditionally so
+// the sequence stays stable for CUDA Graph capture.
 
 #pragma once
 
@@ -118,8 +117,8 @@ public:
     // solver.
     //
     // The contact SpMV kernel is launched unconditionally (even when
-    // `contact.active() == false`) so that the kernel sequence is
-    // identical regardless of whether contacts exist -- this keeps
+    // `contact.active() == false`) so the kernel sequence is
+    // identical regardless of whether contacts exist — this keeps
     // a surrounding CUDA Graph capture valid across frames.
     //
     // Returns the number of iterations actually performed.
@@ -155,12 +154,9 @@ private:
     //   coeff_[3] = scratch
     CudaArray<float> coeff_;
 
-    // CUDA Graph cache.  The graph is captured on the first solve and
-    // replayed on subsequent calls.  Invalidated when the problem size
-    // or iteration count changes.  `graph_stream_` is a dedicated
-    // non-default stream because CUDA does not support graph capture on
-    // the legacy default stream (stream 0 / NULL).
-    CUstream_st* graph_stream_ = nullptr;
+    // CUDA Graph cache.  Captured on the caller's non-default stream on
+    // the first solve and replayed on subsequent calls.  Invalidated
+    // when the problem size (`n`) or iteration count changes.
     CUgraphExec_st* graph_exec_ = nullptr;
     int graph_n_ = 0;
     int graph_max_iter_ = 0;

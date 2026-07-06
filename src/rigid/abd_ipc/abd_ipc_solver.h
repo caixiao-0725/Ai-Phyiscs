@@ -10,16 +10,35 @@
 #include "abd_ipc_pcg.cuh"
 #include "abd_ipc_contact.h"
 #include "abd_ipc_ccd.cuh"
+#include "abd_ipc_ccd_kernels.cuh"               // GPU full-primitive CCD candidates
+#include "abd_ipc_gpu_kernels.cuh"               // GPU full-Hessian contact assembly
+#include "../rigid_ipc/rigid_ipc_kernels.cuh"   // GPU broadphase + CCD kernels
+#include "../../collision/simplex_trajectory_filter.h"  // libuipc-style LBVH detection
 #include "../../geometry/tet_mesh.h"
 #include "../../geometry/triangle_mesh.h"
+#include "../../memory/cuda_array.h"
 #include "../../io/obj_io.h"
 
+#include <cuda_runtime.h>
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 namespace chysx {
 namespace abd_ipc {
+
+// Axis-angle -> 3x3 rotation matrix (Rodrigues). `axis` must be unit length.
+inline Mat3f axis_angle_to_mat3(Vec3f axis, float theta) {
+    float c = std::cos(theta), s = std::sin(theta);
+    float t = 1.0f - c;
+    float x = axis.x, y = axis.y, z = axis.z;
+    Mat3f R;
+    R(0,0) = c + x*x*t;   R(0,1) = x*y*t - z*s; R(0,2) = x*z*t + y*s;
+    R(1,0) = y*x*t + z*s; R(1,1) = c + y*y*t;   R(1,2) = y*z*t - x*s;
+    R(2,0) = z*x*t - y*s; R(2,1) = z*y*t + x*s; R(2,2) = c + z*z*t;
+    return R;
+}
 
 class ABDSolver {
 public:
@@ -155,6 +174,19 @@ public:
         return true;
     }
 
+    // Attach a rotating motor to a body (libuipc RotatingMotor). The motor
+    // soft-drives the body's rotation about `axis` at `omega` rad/s with the
+    // given `strength`; translation stays free so threaded contact converts the
+    // rotation into axial motion.
+    void set_motor(int body_idx, Vec3f axis, float omega, float strength) {
+        ABDBody& b = bodies_[body_idx];
+        b.is_motor = true;
+        b.motor_axis = math::normalize(axis);
+        b.motor_omega = omega;
+        b.motor_strength = strength;
+        b.motor_q_aim = b.q;
+    }
+
     // ---- simulation -------------------------------------------------------
 
     // Advance one time step.
@@ -163,9 +195,28 @@ public:
         float dt = config.dt;
         float inv_dt = 1.0f / dt;
 
+        // Adaptive barrier stiffness: start soft, ramp toward contact_kappa.
+        if (!kappa_init_) {
+            kappa_ = config.adaptive_kappa ? config.contact_kappa_init
+                                           : config.contact_kappa;
+            kappa_init_ = true;
+        }
+
         // 0. Save q_prev at start of step (used by CCD predictor clamping)
         for (int i = 0; i < n; ++i)
             bodies_[i].q_prev = bodies_[i].q;
+
+        // Motor: advance the aim rotation by omega*dt about the axis. Matches
+        // libuipc RotatingMotor::animate (prerotate current transform), single
+        // substep so q_aim == aim_transform.
+        for (int i = 0; i < n; ++i) {
+            if (!bodies_[i].is_motor) continue;
+            Mat3f R_delta = axis_angle_to_mat3(bodies_[i].motor_axis,
+                                               bodies_[i].motor_omega * dt);
+            Mat3f A_cur = q_to_A(bodies_[i].q);
+            Mat3f A_aim = R_delta * A_cur;
+            bodies_[i].motor_q_aim = make_q(q_translation(bodies_[i].q), A_aim);
+        }
 
         // 1. BDF1 predictor: q_tilde = q_prev + q_v * dt + g * dt²
         // g = abd_gravity is the pre-computed generalized gravity acceleration
@@ -183,13 +234,40 @@ public:
         update_surface_verts();
 
         // 3. Newton iteration
-        newton_solve();
+        if (config.use_gpu_newton)
+            newton_solve_gpu();
+        else
+            newton_solve();
 
         // 4. Velocity update: q_v = (q_new - q_old) / dt
         for (int i = 0; i < n; ++i) {
             if (bodies_[i].is_fixed) continue;
             bodies_[i].q_v = (bodies_[i].q - bodies_[i].q_prev) * inv_dt;
             bodies_[i].q_prev = bodies_[i].q;
+        }
+
+        // 5. Adaptive kappa update (IPC): while contacts are active, double the
+        // barrier stiffness toward the maximum so the now-engaged bodies are
+        // held firmly. The soft start let them slide into engagement first.
+        if (config.adaptive_kappa && kappa_ < config.contact_kappa) {
+            bool active = false;
+            if (config.use_gpu_newton) {
+                active = last_info_.contact_count > 0;  // set during newton_solve_gpu
+            } else {
+                update_surface_verts();
+                auto contacts = detect_all_contacts();
+                float D_hat = config.d_hat * config.d_hat;
+                for (auto& cp : contacts) {
+                    float D = (cp.type == ContactType::PT)
+                        ? dist2_pt(surface_.verts[cp.v[0]], surface_.verts[cp.v[1]],
+                                   surface_.verts[cp.v[2]], surface_.verts[cp.v[3]])
+                        : dist2_ee(surface_.verts[cp.v[0]], surface_.verts[cp.v[1]],
+                                   surface_.verts[cp.v[2]], surface_.verts[cp.v[3]]);
+                    if (D < D_hat) { active = true; break; }
+                }
+            }
+            if (active)
+                kappa_ = std::min(config.contact_kappa, kappa_ * 2.0f);
         }
     }
 
@@ -233,8 +311,354 @@ private:
     collision::EFContactDetector ef_detector_;
     bool bvh_initialized_ = false;
 
-    // Unified contact detection: dispatches to EFContactDetector or brute-force.
+    // Runtime (adaptive) barrier stiffness. Equals config.contact_kappa when
+    // adaptive_kappa is disabled.
+    float kappa_ = 0.0f;
+    bool  kappa_init_ = false;
+
+    // ---- GPU CCD state ----------------------------------------------------
+    // World-space verts and candidate contacts live on GPU so the swept
+    // time-of-impact reuses the rigid_ipc broadphase + CCD kernels instead of
+    // the O(nv*nt + ne^2) CPU brute force.
+    CudaArray<Vec3f> d_verts_cur_;
+    CudaArray<Vec3f> d_verts_next_;
+    CudaArray<int> d_vert_body_;
+    CudaArray<Vec3i> d_tris_;
+    CudaArray<math::Vec2i> d_edges_;
+    CudaArray<float> d_alpha_;
+    int gpu_nv_ = 0, gpu_nt_ = 0, gpu_ne_ = 0;
+    bool gpu_ccd_ready_ = false;
+
+    void gpu_ccd_setup() {
+        gpu_nv_ = static_cast<int>(surface_.verts.size());
+        gpu_nt_ = static_cast<int>(surface_.tris.size());
+        gpu_ne_ = static_cast<int>(surface_.edges.size());
+
+        d_verts_cur_.resize(gpu_nv_);
+        d_verts_next_.resize(gpu_nv_);
+        d_vert_body_.resize(gpu_nv_);
+        std::memcpy(d_vert_body_.cpu_data(), surface_.vert_body.data(), gpu_nv_ * sizeof(int));
+        d_vert_body_.copy_to_device();
+
+        d_tris_.resize(gpu_nt_);
+        std::memcpy(d_tris_.cpu_data(), surface_.tris.data(), gpu_nt_ * sizeof(Vec3i));
+        d_tris_.copy_to_device();
+
+        d_edges_.resize(gpu_ne_);
+        std::memcpy(d_edges_.cpu_data(), surface_.edges.data(), gpu_ne_ * sizeof(math::Vec2i));
+        d_edges_.copy_to_device();
+
+        d_alpha_.resize(1);
+        gpu_ccd_ready_ = true;
+    }
+
+    // GPU brute-force time-of-impact: parallelizes the exact CPU compute_toi
+    // sweep (every inter-body point-triangle and edge-edge pair). Complete, so
+    // it matches the CPU result and cannot tunnel.
+    float compute_toi_gpu(const std::vector<Vec3f>& verts_cur,
+                          const std::vector<Vec3f>& verts_next,
+                          float d_min) {
+        if (!gpu_ccd_ready_) gpu_ccd_setup();
+        int nv = static_cast<int>(verts_cur.size());
+
+        std::memcpy(d_verts_cur_.cpu_data(), verts_cur.data(), nv * sizeof(Vec3f));
+        d_verts_cur_.copy_to_device();
+        std::memcpy(d_verts_next_.cpu_data(), verts_next.data(), nv * sizeof(Vec3f));
+        d_verts_next_.copy_to_device();
+
+        float one = 1.0f;
+        std::memcpy(d_alpha_.cpu_data(), &one, sizeof(float));
+        d_alpha_.copy_to_device();
+
+        launch_ccd_brute_pt(d_verts_cur_.gpu_data(), d_verts_next_.gpu_data(),
+                            d_tris_.gpu_data(), d_vert_body_.gpu_data(),
+                            gpu_nv_, gpu_nt_, d_min, d_alpha_.gpu_data());
+        launch_ccd_brute_ee(d_verts_cur_.gpu_data(), d_verts_next_.gpu_data(),
+                            d_edges_.gpu_data(), d_vert_body_.gpu_data(),
+                            gpu_ne_, d_min, d_alpha_.gpu_data());
+        cudaDeviceSynchronize();
+        d_alpha_.copy_to_host();
+        float alpha = d_alpha_.cpu_data()[0];
+        if (alpha < 0.0f) alpha = 0.0f;
+        if (alpha > 1.0f) alpha = 1.0f;
+        return alpha;
+    }
+
+    // ---- GPU Newton state -------------------------------------------------
+    CudaArray<Vec3f>  d_x_bar_;          // rest verts [nv]
+    CudaArray<Vec12f> d_body_q_;         // body q [nb]
+    CudaArray<Vec12f> d_ngrad_;          // contact gradient accumulator [nb]
+    CudaArray<Mat12f> d_nhess_;          // contact Hessian diagonal [nb]
+    CudaArray<rigid_ipc::GPUContactPair> d_ncontacts_;
+    CudaArray<int>    d_nccount_;
+    CudaArray<float>  d_nebuf_;
+    int gpu_newton_maxc_ = 0;
+    bool gpu_newton_ready_ = false;
+
+    void gpu_newton_setup() {
+        if (!gpu_ccd_ready_) gpu_ccd_setup();
+        int nv = gpu_nv_;
+        int nb = static_cast<int>(bodies_.size());
+        if (!simplex_ready_) {
+            simplex_filter_.setup(nv, surface_.edges, surface_.tris, surface_.vert_body);
+            simplex_ready_ = true;
+        }
+        d_x_bar_.resize(nv);
+        for (int i = 0; i < nv; ++i)
+            d_x_bar_.cpu_data()[i] = surface_.jacobi[i].x_bar;
+        d_x_bar_.copy_to_device();
+
+        d_body_q_.resize(nb);
+        d_ngrad_.resize(nb);
+        d_nhess_.resize(nb);
+        gpu_newton_maxc_ = std::max(gpu_ne_ * 16, 1 << 20);
+        d_ncontacts_.resize(gpu_newton_maxc_);
+        d_nccount_.resize(1);
+        d_nebuf_.resize(gpu_newton_maxc_);
+        gpu_newton_ready_ = true;
+    }
+
+    // Upload current world verts (from CPU surface_.verts) to the GPU buffer.
+    void gpu_upload_verts() {
+        std::memcpy(d_verts_cur_.cpu_data(), surface_.verts.data(),
+                    gpu_nv_ * sizeof(Vec3f));
+        d_verts_cur_.copy_to_device();
+    }
+
+    // GPU detect + filter: builds the active PT/EE contact set on GPU from the
+    // current world verts. Returns the contact count.
+    int gpu_detect_filter() {
+        simplex_filter_.detect(d_verts_cur_.gpu_data(), nullptr, 0.0f, config.d_hat);
+        float D_hat = config.d_hat * config.d_hat;
+        rigid_ipc::launch_zero_int(d_nccount_.gpu_data());
+        launch_abd_filter_pt(simplex_filter_.pt_pairs_dev(), simplex_filter_.num_pt_pairs(),
+                             d_verts_cur_.gpu_data(), simplex_filter_.tris_dev(),
+                             simplex_filter_.vert_body_dev(), D_hat,
+                             d_ncontacts_.gpu_data(), d_nccount_.gpu_data(), gpu_newton_maxc_);
+        launch_abd_filter_ee(simplex_filter_.ee_pairs_dev(), simplex_filter_.num_ee_pairs(),
+                             d_verts_cur_.gpu_data(), simplex_filter_.edges_dev(),
+                             simplex_filter_.vert_body_dev(), D_hat,
+                             d_ncontacts_.gpu_data(), d_nccount_.gpu_data(), gpu_newton_maxc_);
+        int nc = rigid_ipc::read_contact_count(d_nccount_.gpu_data());
+        if (nc > gpu_newton_maxc_) nc = gpu_newton_maxc_;
+        return nc;
+    }
+
+    // Total energy = CPU body/motor energy + GPU barrier energy over the fixed
+    // contact set `nc` evaluated at the current (already uploaded) GPU verts.
+    double total_energy_gpu(int nc) {
+        double E = 0;
+        for (auto& body : bodies_) {
+            if (body.is_fixed) continue;
+            E += assemble_body_energy(body, config.dt);
+            if (body.is_motor) {
+                Mat12f Ms = motor_metric(body);
+                Vec12f dq = body.q - body.motor_q_aim;
+                E += 0.5 * (double)math::dot(dq, Ms * dq);
+            }
+        }
+        if (nc > 0) {
+            float D_hat = config.d_hat * config.d_hat;
+            rigid_ipc::launch_barrier_energy(d_ncontacts_.gpu_data(), d_verts_cur_.gpu_data(),
+                                             d_nebuf_.gpu_data(), kappa_, D_hat, nc);
+            E += (double)rigid_ipc::gpu_reduce_sum(d_nebuf_.gpu_data(), nc);
+        }
+        return E;
+    }
+
+    // GPU Newton: dense-contact IPC solve. GPU detection + full-Hessian
+    // assembly (PSD-projected) + GPU barrier-energy line search; the tiny
+    // (<=24 DOF) linear system is solved on the CPU.
+    void newton_solve_gpu() {
+        int n = static_cast<int>(bodies_.size());
+        if (!gpu_newton_ready_) gpu_newton_setup();
+
+        // Predictor + CCD clamp (reuse the brute GPU CCD via the dispatcher).
+        // CCD only guards against actual penetration; the separation gap is
+        // maintained by the barrier, so keep d_min a small fraction of d_hat
+        // (a large d_min would cage the bodies and freeze all motion).
+        float ccd_dmin = config.d_hat * 0.01f;
+
+        std::vector<Vec3f> verts_pre(surface_.verts);
+        for (int i = 0; i < n; ++i)
+            if (!bodies_[i].is_fixed) bodies_[i].q = bodies_[i].q_tilde;
+        update_surface_verts();
+        float toi = compute_toi(verts_pre, surface_.verts, ccd_dmin);
+        if (toi < 1.0f) {
+            for (int i = 0; i < n; ++i) {
+                if (bodies_[i].is_fixed) continue;
+                Vec12f q0 = bodies_[i].q_prev;
+                bodies_[i].q = q0 + (bodies_[i].q_tilde - q0) * toi;
+                bodies_[i].q_tilde = bodies_[i].q;
+            }
+            update_surface_verts();
+        }
+
+        for (int iter = 0; iter < config.newton_max_iter; ++iter) {
+            update_surface_verts();
+            gpu_upload_verts();
+
+            int nc = gpu_detect_filter();
+            last_info_.contact_count = nc;
+
+            // GPU full-Hessian contact assembly.
+            launch_abd_zero_vec12(d_ngrad_.gpu_data(), n);
+            launch_abd_zero_mat12(d_nhess_.gpu_data(), n);
+            launch_abd_assemble(d_ncontacts_.gpu_data(), nc,
+                                d_verts_cur_.gpu_data(), d_x_bar_.gpu_data(),
+                                simplex_filter_.vert_body_dev(),
+                                kappa_, config.d_hat * config.d_hat,
+                                d_ngrad_.gpu_data(), d_nhess_.gpu_data(), n);
+            cudaDeviceSynchronize();
+            d_ngrad_.copy_to_host();
+            d_nhess_.copy_to_host();
+
+            // Assemble the (tiny) block system on the CPU.
+            BlockSystem sys;
+            sys.resize(n);
+            for (int i = 0; i < n; ++i) {
+                if (bodies_[i].is_fixed) {
+                    sys.H_diag[i] = Mat12f::identity() * 1e10f;
+                    sys.rhs[i] = Vec12f::zero();
+                    continue;
+                }
+                Mat12f H = assemble_body_hessian(bodies_[i], config.dt);
+                Vec12f g = assemble_body_gradient(bodies_[i], config.dt);
+                if (bodies_[i].is_motor) {
+                    Mat12f Ms = motor_metric(bodies_[i]);
+                    H = H + Ms;
+                    g = g + Ms * (bodies_[i].q - bodies_[i].motor_q_aim);
+                }
+                H = H + d_nhess_.cpu_data()[i];
+                sys.H_diag[i] = H;
+                sys.rhs[i] = (g + d_ngrad_.cpu_data()[i]) * (-1.0f);
+            }
+
+            std::vector<Vec12f> dq(n);
+            solve_pcg(sys, dq, config.pcg_tol, n * 12 * config.pcg_max_iter_ratio);
+
+            float max_dq = 0;
+            for (int i = 0; i < n; ++i) {
+                if (bodies_[i].is_fixed) continue;
+                float m = math::max_abs(dq[i]);
+                if (m > max_dq) max_dq = m;
+            }
+            last_info_.newton_iters = iter + 1;
+            last_info_.residual = max_dq;
+            if (iter >= config.newton_min_iter && max_dq < config.velocity_tol * config.dt)
+                break;
+
+            // CCD step-size cap.
+            std::vector<Vec3f> verts_trial(surface_.verts.size());
+            for (int b = 0; b < n; ++b) {
+                auto& range = surface_.body_ranges[b];
+                Vec12f q_trial = bodies_[b].q + dq[b];
+                for (int vi = range.vert_begin; vi < range.vert_end; ++vi)
+                    verts_trial[vi] = surface_.jacobi[vi].mul_q(q_trial);
+            }
+            float alpha_ccd = compute_toi(surface_.verts, verts_trial, ccd_dmin);
+
+            // Energy line search on the fixed contact set (GPU barrier energy).
+            double E0 = total_energy_gpu(nc);
+            double dir_deriv = 0;
+            for (int i = 0; i < n; ++i)
+                dir_deriv += (double)math::dot(sys.rhs[i] * (-1.0f), dq[i]);
+
+            std::vector<Vec12f> q_save(n);
+            for (int i = 0; i < n; ++i) q_save[i] = bodies_[i].q;
+
+            float alpha = alpha_ccd;
+            for (int ls = 0; ls < config.line_search_max_iter; ++ls) {
+                for (int i = 0; i < n; ++i) {
+                    if (bodies_[i].is_fixed) continue;
+                    bodies_[i].q = q_save[i] + dq[i] * alpha;
+                }
+                update_surface_verts();
+                gpu_upload_verts();
+                double E_trial = total_energy_gpu(nc);
+                if (E_trial <= E0 + 1e-4 * alpha * dir_deriv) break;
+                alpha *= 0.5f;
+            }
+            for (int i = 0; i < n; ++i) {
+                if (bodies_[i].is_fixed) continue;
+                bodies_[i].q = q_save[i] + dq[i] * alpha;
+            }
+        }
+    }
+
+    // libuipc-style LBVH broadphase (swept AABB) -> complete PT/EE candidates,
+    // then narrow-phase distance filter to active contacts within d_hat.
+    collision::SimplexTrajectoryFilter simplex_filter_;
+    bool simplex_ready_ = false;
+
+    std::vector<ContactPair> detect_all_contacts_lbvh() {
+        int nv = static_cast<int>(surface_.verts.size());
+        if (!simplex_ready_) {
+            simplex_filter_.setup(nv, surface_.edges, surface_.tris, surface_.vert_body);
+            simplex_ready_ = true;
+        }
+        // Reuse the GPU CCD vertex buffer for the current world positions.
+        if (!gpu_ccd_ready_) gpu_ccd_setup();
+        std::memcpy(d_verts_cur_.cpu_data(), surface_.verts.data(), nv * sizeof(Vec3f));
+        d_verts_cur_.copy_to_device();
+
+        // Discrete query: dx = null, alpha = 0, inflate by d_hat.
+        simplex_filter_.detect(d_verts_cur_.gpu_data(), nullptr, 0.0f, config.d_hat);
+
+        std::vector<math::Vec2i> pt, ee;
+        simplex_filter_.download_pt(pt);
+        simplex_filter_.download_ee(ee);
+
+        float D_hat = config.d_hat * config.d_hat;
+        std::vector<ContactPair> out;
+        out.reserve(pt.size() + ee.size());
+
+        // Point-triangle candidates: (point_id, tri_id)
+        for (auto& c : pt) {
+            int vi = c.x;
+            Vec3i f = surface_.tris[c.y];
+            int bv = surface_.vert_body[vi];
+            if (bv == surface_.vert_body[f.x] && bv == surface_.vert_body[f.y] &&
+                bv == surface_.vert_body[f.z]) continue;
+            if (vi == f.x || vi == f.y || vi == f.z) continue;
+            float D = dist2_pt(surface_.verts[vi], surface_.verts[f.x],
+                               surface_.verts[f.y], surface_.verts[f.z]);
+            if (D >= D_hat) continue;
+            ContactPair cp;
+            cp.type = ContactType::PT;
+            cp.v[0] = vi; cp.v[1] = f.x; cp.v[2] = f.y; cp.v[3] = f.z;
+            cp.body[0] = bv; cp.body[1] = surface_.vert_body[f.x];
+            cp.body[2] = surface_.vert_body[f.y]; cp.body[3] = surface_.vert_body[f.z];
+            cp.D = D;
+            out.push_back(cp);
+        }
+        // Edge-edge candidates: (edge_a, edge_b)
+        for (auto& c : ee) {
+            math::Vec2i ea = surface_.edges[c.x];
+            math::Vec2i eb = surface_.edges[c.y];
+            int ba0 = surface_.vert_body[ea.x], ba1 = surface_.vert_body[ea.y];
+            int bb0 = surface_.vert_body[eb.x], bb1 = surface_.vert_body[eb.y];
+            if (ba0 == bb0 && ba0 == bb1 && ba1 == bb0 && ba1 == bb1) continue;
+            if (ea.x == eb.x || ea.x == eb.y || ea.y == eb.x || ea.y == eb.y) continue;
+            float D = dist2_ee(surface_.verts[ea.x], surface_.verts[ea.y],
+                               surface_.verts[eb.x], surface_.verts[eb.y]);
+            if (D >= D_hat) continue;
+            ContactPair cp;
+            cp.type = ContactType::EE;
+            cp.v[0] = ea.x; cp.v[1] = ea.y; cp.v[2] = eb.x; cp.v[3] = eb.y;
+            cp.body[0] = ba0; cp.body[1] = ba1; cp.body[2] = bb0; cp.body[3] = bb1;
+            cp.D = D;
+            out.push_back(cp);
+        }
+        return out;
+    }
+
+    // Unified contact detection: dispatches to LBVH simplex filter,
+    // EFContactDetector, or brute-force.
     std::vector<ContactPair> detect_all_contacts() {
+        if (config.use_lbvh_detection) {
+            return detect_all_contacts_lbvh();
+        }
         if (config.use_bvh_broadphase) {
             if (!bvh_initialized_) {
                 int nv = static_cast<int>(surface_.verts.size());
@@ -265,12 +689,28 @@ private:
         }
     }
 
+    // Motor metric M_scaled = body mass matrix with the affine (rotation)
+    // block scaled by the motor strength and the translation block zeroed
+    // (libuipc RotatingMotor uses strength_ratio = {0, strength}).
+    Mat12f motor_metric(const ABDBody& b) const {
+        Mat12f Ms = Mat12f::zero();
+        for (int r = 3; r < 12; ++r)
+            for (int c = 3; c < 12; ++c)
+                Ms(r, c) = b.motor_strength * b.M(r, c);
+        return Ms;
+    }
+
     // Compute total energy for all bodies at current q, re-detecting contacts.
     float total_energy() {
         float E = 0;
         for (auto& body : bodies_) {
             if (body.is_fixed) continue;
             E += assemble_body_energy(body, config.dt);
+            if (body.is_motor) {
+                Mat12f Ms = motor_metric(body);
+                Vec12f dq = body.q - body.motor_q_aim;
+                E += 0.5f * math::dot(dq, Ms * dq);
+            }
         }
         auto contacts = detect_all_contacts();
         float D_hat = config.d_hat * config.d_hat;
@@ -282,17 +722,28 @@ private:
             else if (cp.type == ContactType::EE)
                 D = dist2_ee(surface_.verts[cp.v[0]], surface_.verts[cp.v[1]],
                              surface_.verts[cp.v[2]], surface_.verts[cp.v[3]]);
-            E += config.contact_kappa * barrier(D, D_hat);
+            E += kappa_ * barrier(D, D_hat);
         }
         return E;
+    }
+
+    // Dispatch CCD to the GPU candidate+CCD path or the CPU brute force.
+    float compute_toi(const std::vector<Vec3f>& verts_cur,
+                      const std::vector<Vec3f>& verts_next,
+                      float d_min_override = -1.0f) {
+        if (config.use_gpu_ccd) {
+            float d_min = d_min_override > 0 ? d_min_override : (config.d_hat * 0.5f);
+            return compute_toi_gpu(verts_cur, verts_next, d_min);
+        }
+        return compute_toi_cpu(verts_cur, verts_next, d_min_override);
     }
 
     // Brute-force CCD across all PT/EE pairs between different bodies.
     // Unlike detect_contacts (which filters by d_hat), this checks ALL
     // inter-body primitive pairs to prevent tunneling.
-    float compute_toi(const std::vector<Vec3f>& verts_cur,
-                      const std::vector<Vec3f>& verts_next,
-                      float d_min_override = -1.0f) {
+    float compute_toi_cpu(const std::vector<Vec3f>& verts_cur,
+                          const std::vector<Vec3f>& verts_next,
+                          float d_min_override = -1.0f) {
         float alpha = 1.0f;
         float d_min = d_min_override > 0 ? d_min_override : (config.d_hat * 0.5f);
         int nv = static_cast<int>(verts_cur.size());
@@ -398,6 +849,15 @@ private:
                 }
                 sys.H_diag[i] = assemble_body_hessian(bodies_[i], config.dt);
                 sys.rhs[i] = assemble_body_gradient(bodies_[i], config.dt) * (-1.0f);
+
+                // RotatingMotor soft constraint (libuipc soft_transform_constraint):
+                // E = 0.5 * dq^T (strength * M_affine) dq, dq = q - q_aim.
+                if (bodies_[i].is_motor) {
+                    Mat12f Ms = motor_metric(bodies_[i]);
+                    Vec12f dq = bodies_[i].q - bodies_[i].motor_q_aim;
+                    sys.rhs[i] = sys.rhs[i] - Ms * dq;   // rhs = -gradient
+                    sys.H_diag[i] = sys.H_diag[i] + Ms;
+                }
             }
 
             // Contact contributions
@@ -486,7 +946,7 @@ private:
 
         float dBdD  = barrier_gradient(D, D_hat);
         float d2BdD = barrier_hessian_spd(D, D_hat);
-        float kappa = config.contact_kappa;
+        float kappa = kappa_;
 
         // PT gradient
         Vec3f gp, gt0, gt1, gt2;
@@ -526,7 +986,7 @@ private:
 
         float dBdD  = barrier_gradient(D, D_hat);
         float d2BdD = barrier_hessian_spd(D, D_hat);
-        float kappa = config.contact_kappa;
+        float kappa = kappa_;
 
         Vec3f ga0, ga1, gb0, gb1;
         dist2_ee_grad(va0, va1, vb0, vb1, ga0, ga1, gb0, gb1);

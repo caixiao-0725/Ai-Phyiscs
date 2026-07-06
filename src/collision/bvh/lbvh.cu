@@ -551,6 +551,248 @@ void launch_query(
 #undef DISPATCH
 }
 
+// ---- Self-AABB query kernel (no covertex filter, dedup by sorted index) ----
+// 1:1 match with KittenGpuLBVH::query(ivec2*, size_t) self-query variant.
+
+template <int STACK_SIZE>
+__global__ void query_self_aabb_kernel(
+    const Aabb*         __restrict__ leaf_aabbs,
+    int                 n_leaves,
+    const BvhNode*      __restrict__ nodes,
+    const int*          __restrict__ sorted_id,
+    int*                __restrict__ pair_count,
+    math::Vec2i*        __restrict__ pair_list,
+    int                 max_pairs) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = tid < n_leaves;
+
+    int obj_idx = 0;
+    Aabb queryAABB;
+    if (active) {
+        obj_idx = sorted_id[tid];
+        queryAABB = leaf_aabbs[obj_idx];
+    }
+
+    __shared__ math::Vec2i s_buf[kMaxResPerBlock];
+    __shared__ int         s_counter;
+    __shared__ int         s_global_off;
+    if (threadIdx.x == 0) s_counter = 0;
+
+    std::uint32_t stack[STACK_SIZE];
+    std::uint32_t* sp = stack;
+    *(sp++) = 0u;
+
+    while (true) {
+        __syncthreads();
+
+        if (active) {
+            while (sp != stack) {
+                std::uint32_t node_raw = *(--sp);
+                const bool is_leaf = (node_raw & BvhNode::kLeafBit) != 0;
+                const std::uint32_t idx = node_raw & BvhNode::kIdxMask;
+
+                if (is_leaf) {
+                    if (idx <= static_cast<std::uint32_t>(tid)) continue;
+
+                    const int s_idx = atomicAdd(&s_counter, 1);
+                    if (s_idx >= kMaxResPerBlock) {
+                        *(sp++) = node_raw;
+                        break;
+                    }
+                    s_buf[s_idx] = math::Vec2i(sorted_id[idx], obj_idx);
+                } else {
+                    const BvhNode node = nodes[idx];
+
+                    if (max(idx, node.fence) <= static_cast<std::uint32_t>(tid)) continue;
+
+                    if (overlaps_packed(node.bounds[0], queryAABB))
+                        *(sp++) = node.left;
+                    if (overlaps_packed(node.bounds[1], queryAABB))
+                        *(sp++) = node.right;
+                }
+            }
+        }
+
+        __syncthreads();
+        int total = s_counter;
+        if (total > kMaxResPerBlock) total = kMaxResPerBlock;
+
+        if (threadIdx.x == 0)
+            s_global_off = atomicAdd(pair_count, total);
+
+        __syncthreads();
+        const int g_off = s_global_off;
+
+        if (g_off >= max_pairs || total == 0) return;
+        if (threadIdx.x == 0) s_counter = 0;
+
+        bool done = (total < kMaxResPerBlock);
+        if (g_off + total > max_pairs) {
+            total = max_pairs - g_off;
+            done = true;
+        }
+
+        for (int i = threadIdx.x; i < total; i += blockDim.x)
+            pair_list[g_off + i] = s_buf[i];
+
+        if (done) break;
+    }
+}
+
+void launch_query_self_aabb(
+    int                   n_leaves,
+    const Aabb*           leaf_aabbs,
+    const BvhNode*        nodes,
+    const int*            sorted_id,
+    int*                  pair_count,
+    math::Vec2i*          pair_list,
+    int                   max_pairs,
+    int                   stack_size,
+    cudaStream_t          stream) {
+    const int blocks = grid_for(n_leaves);
+    const int s = clamp_stack(stack_size);
+
+#define DISPATCH(N) case N:                                                 \
+    query_self_aabb_kernel<N><<<blocks, kBlockDim, 0, stream>>>(            \
+        leaf_aabbs, n_leaves, nodes, sorted_id,                             \
+        pair_count, pair_list, max_pairs);                                  \
+    break;
+
+    switch (s) {
+        DISPATCH(1)  DISPATCH(2)  DISPATCH(3)  DISPATCH(4)
+        DISPATCH(5)  DISPATCH(6)  DISPATCH(7)  DISPATCH(8)
+        DISPATCH(9)  DISPATCH(10) DISPATCH(11) DISPATCH(12)
+        DISPATCH(13) DISPATCH(14) DISPATCH(15) DISPATCH(16)
+        DISPATCH(17) DISPATCH(18) DISPATCH(19) DISPATCH(20)
+        DISPATCH(21) DISPATCH(22) DISPATCH(23) DISPATCH(24)
+        DISPATCH(25) DISPATCH(26) DISPATCH(27) DISPATCH(28)
+        DISPATCH(29) DISPATCH(30) DISPATCH(31) DISPATCH(32)
+        default:
+            query_self_aabb_kernel<32><<<blocks, kBlockDim, 0, stream>>>(
+                leaf_aabbs, n_leaves, nodes, sorted_id,
+                pair_count, pair_list, max_pairs);
+            break;
+    }
+#undef DISPATCH
+}
+
+// ---- Generic cross query: arbitrary query AABBs vs the built tree ----------
+// Emits (query_id, leaf_obj_id) pairs whose AABBs overlap. No covertex / dedup
+// filter (the caller applies its own primitive-level filtering). Used for the
+// libuipc-style point-vs-triangle broadphase (query point AABBs against a tree
+// built over triangle AABBs).
+template <int STACK_SIZE>
+__global__ void query_cross_kernel(
+    const Aabb*         __restrict__ query_aabbs,
+    int                 n_queries,
+    const BvhNode*      __restrict__ nodes,
+    const int*          __restrict__ sorted_id,
+    int*                __restrict__ pair_count,
+    math::Vec2i*        __restrict__ pair_list,
+    int                 max_pairs) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = tid < n_queries;
+
+    Aabb queryAABB;
+    if (active) queryAABB = query_aabbs[tid];
+
+    __shared__ math::Vec2i s_buf[kMaxResPerBlock];
+    __shared__ int         s_counter;
+    __shared__ int         s_global_off;
+    if (threadIdx.x == 0) s_counter = 0;
+
+    std::uint32_t stack[STACK_SIZE];
+    std::uint32_t* sp = stack;
+    *(sp++) = 0u;  // root
+
+    while (true) {
+        __syncthreads();
+
+        if (active) {
+            while (sp != stack) {
+                std::uint32_t node_raw = *(--sp);
+                const bool is_leaf = (node_raw & BvhNode::kLeafBit) != 0;
+                const std::uint32_t idx = node_raw & BvhNode::kIdxMask;
+
+                if (is_leaf) {
+                    const int obj = sorted_id[idx];
+                    const int s_idx = atomicAdd(&s_counter, 1);
+                    if (s_idx >= kMaxResPerBlock) {
+                        *(sp++) = node_raw;
+                        break;
+                    }
+                    s_buf[s_idx] = math::Vec2i(tid, obj);
+                } else {
+                    const BvhNode node = nodes[idx];
+                    if (overlaps_packed(node.bounds[0], queryAABB))
+                        *(sp++) = node.left;
+                    if (overlaps_packed(node.bounds[1], queryAABB))
+                        *(sp++) = node.right;
+                }
+            }
+        }
+
+        __syncthreads();
+        int total = s_counter;
+        if (total > kMaxResPerBlock) total = kMaxResPerBlock;
+
+        if (threadIdx.x == 0)
+            s_global_off = atomicAdd(pair_count, total);
+
+        __syncthreads();
+        const int g_off = s_global_off;
+
+        if (g_off >= max_pairs || total == 0) return;
+        if (threadIdx.x == 0) s_counter = 0;
+
+        bool done = (total < kMaxResPerBlock);
+        if (g_off + total > max_pairs) {
+            total = max_pairs - g_off;
+            done = true;
+        }
+
+        for (int i = threadIdx.x; i < total; i += blockDim.x)
+            pair_list[g_off + i] = s_buf[i];
+
+        if (done) break;
+    }
+}
+
+void launch_query_cross(
+    int                   n_queries,
+    const Aabb*           query_aabbs,
+    const BvhNode*        nodes,
+    const int*            sorted_id,
+    int*                  pair_count,
+    math::Vec2i*          pair_list,
+    int                   max_pairs,
+    int                   stack_size,
+    cudaStream_t          stream) {
+    const int blocks = grid_for(n_queries);
+    const int s = clamp_stack(stack_size);
+#define DISPATCH(N) case N:                                                 \
+    query_cross_kernel<N><<<blocks, kBlockDim, 0, stream>>>(                \
+        query_aabbs, n_queries, nodes, sorted_id,                           \
+        pair_count, pair_list, max_pairs);                                  \
+    break;
+    switch (s) {
+        DISPATCH(1)  DISPATCH(2)  DISPATCH(3)  DISPATCH(4)
+        DISPATCH(5)  DISPATCH(6)  DISPATCH(7)  DISPATCH(8)
+        DISPATCH(9)  DISPATCH(10) DISPATCH(11) DISPATCH(12)
+        DISPATCH(13) DISPATCH(14) DISPATCH(15) DISPATCH(16)
+        DISPATCH(17) DISPATCH(18) DISPATCH(19) DISPATCH(20)
+        DISPATCH(21) DISPATCH(22) DISPATCH(23) DISPATCH(24)
+        DISPATCH(25) DISPATCH(26) DISPATCH(27) DISPATCH(28)
+        DISPATCH(29) DISPATCH(30) DISPATCH(31) DISPATCH(32)
+        default:
+            query_cross_kernel<32><<<blocks, kBlockDim, 0, stream>>>(
+                query_aabbs, n_queries, nodes, sorted_id,
+                pair_count, pair_list, max_pairs);
+            break;
+    }
+#undef DISPATCH
+}
+
 }  // namespace
 
 // ============================================================================
@@ -669,6 +911,25 @@ void LinearBvh::refit(const Aabb*       leaf_aabbs,
     max_stack_size_ = clamp_stack(depth_host);
 }
 
+void LinearBvh::refit_only(const Aabb* leaf_aabbs,
+                           std::uintptr_t cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    const int N = n_leaves_;
+
+    // Clear refit flags then re-merge AABBs bottom-up.
+    clear_uint_kernel<<<grid_for(N - 1), kBlockDim, 0, stream>>>(
+        refit_flag_.gpu_data(), N - 1);
+    merge_up_kernel<<<grid_for(N), kBlockDim, 0, stream>>>(
+        nodes_.gpu_data(), leaf_parents_.gpu_data(),
+        leaf_aabbs, sorted_id_.gpu_data(),
+        reinterpret_cast<int*>(refit_flag_.gpu_data()), N);
+    check_cuda(cudaGetLastError(), "refit_only merge_up_kernel");
+
+    // max_stack_size_ stays from the last full refit — topology unchanged.
+}
+
 void LinearBvh::query_self_ef(const Aabb*           query_aabbs,
                               int                   n_queries,
                               const math::Vec2i*    edges,
@@ -685,6 +946,35 @@ void LinearBvh::query_self_ef(const Aabb*           query_aabbs,
                  max_query_pairs_,
                  max_stack_size_, stream);
     check_cuda(cudaGetLastError(), "query_self_ef_kernel");
+}
+
+void LinearBvh::query_self_aabb(const Aabb*    leaf_aabbs,
+                                std::uintptr_t cuda_stream) {
+    if (n_leaves_ <= 1) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    clear_int_kernel<<<1, 1, 0, stream>>>(query_count_.gpu_data());
+    launch_query_self_aabb(n_leaves_, leaf_aabbs,
+                           nodes_.gpu_data(), sorted_id_.gpu_data(),
+                           query_count_.gpu_data(), query_pairs_.gpu_data(),
+                           max_query_pairs_,
+                           max_stack_size_, stream);
+    check_cuda(cudaGetLastError(), "query_self_aabb_kernel");
+}
+
+void LinearBvh::query_cross(const Aabb*    query_aabbs,
+                            int            n_queries,
+                            std::uintptr_t cuda_stream) {
+    if (n_leaves_ <= 1 || n_queries <= 0) return;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    clear_int_kernel<<<1, 1, 0, stream>>>(query_count_.gpu_data());
+    launch_query_cross(n_queries, query_aabbs,
+                       nodes_.gpu_data(), sorted_id_.gpu_data(),
+                       query_count_.gpu_data(), query_pairs_.gpu_data(),
+                       max_query_pairs_,
+                       max_stack_size_, stream);
+    check_cuda(cudaGetLastError(), "query_cross_kernel");
 }
 
 }  // namespace collision

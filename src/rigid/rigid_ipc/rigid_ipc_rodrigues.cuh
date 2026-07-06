@@ -276,20 +276,24 @@ struct RigidJacobi {
         return result;
     }
 
-    // Ji^T * H3x3 * Jj -> 6x6 Hessian
-    // Includes both the J^T H J term and the second-derivative correction
-    // d^2V/dq^2 terms from vertex Hessian.
+    // Ji^T * H3x3 * Jj -> 6x6 Hessian (single body version)
     CHYSX_HDI static Mat6f JT_H_J(const RigidJacobi& Ji, const Mat3f& H,
                                     const RigidJacobi& Jj, const Vec6f& q) {
-        Vec3f theta = pose_rotation(q);
+        return JT_H_J(Ji, H, Jj, q, q);
+    }
+
+    // Ji^T * H3x3 * Jj -> 6x6 Hessian (two-body version: qi for Ji, qj for Jj)
+    CHYSX_HDI static Mat6f JT_H_J(const RigidJacobi& Ji, const Mat3f& H,
+                                    const RigidJacobi& Jj,
+                                    const Vec6f& qi, const Vec6f& qj) {
+        Vec3f theta_i = pose_rotation(qi);
+        Vec3f theta_j = pose_rotation(qj);
         Mat6f R = Mat6f::zero();
 
-        // Precompute dR/dtheta * x_bar for each Jacobi
         Vec3f dVi[3], dVj[3];
         for (int k = 0; k < 3; ++k) {
-            Mat3f dRk = dR_dr(theta, k);
-            dVi[k] = dRk * Ji.x_bar;
-            dVj[k] = dRk * Jj.x_bar;
+            dVi[k] = dR_dr(theta_i, k) * Ji.x_bar;
+            dVj[k] = dR_dr(theta_j, k) * Jj.x_bar;
         }
 
         // (0,0) block: I^T * H * I = H

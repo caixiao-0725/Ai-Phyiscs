@@ -179,6 +179,16 @@ struct ABDBody {
     bool is_fixed;
     bool is_dynamic;
 
+    // RotatingMotor (libuipc soft_transform_constraint): soft-drives the affine
+    // (rotation) block of q toward a target that advances by motor_omega*dt about
+    // motor_axis each step. Translation is left free, so contact converts the
+    // driven rotation into axial screwing. motor_q_aim is recomputed per step.
+    bool   is_motor = false;
+    Vec3f  motor_axis = Vec3f(0.0f, 1.0f, 0.0f);
+    float  motor_omega = 0.0f;     // [rad/s]
+    float  motor_strength = 0.0f;  // strength_ratio(1) in libuipc
+    Vec12f motor_q_aim;
+
     int surface_vert_offset;
     int surface_vert_count;
     int surface_tri_offset;
@@ -212,9 +222,24 @@ struct ABDConfig {
 
     // IPC contact
     float d_hat = 0.01f;
-    float contact_kappa = 1.0e9f;
+    float contact_kappa = 1.0e9f;      // maximum barrier stiffness
     float default_thickness = 0.0f;
     float default_friction = 0.5f;
+
+    // Adaptive barrier stiffness (IPC, matches rigid-ipc / libuipc). The
+    // barrier starts soft so resting bodies can settle into engagement
+    // (e.g. a threaded screw drops into the nut and unscrews) instead of
+    // being frozen by a stiff barrier from rest, then ramps up (x2 per step
+    // while contacts are active) toward `contact_kappa`. CCD keeps every step
+    // penetration-free regardless of the current stiffness.
+    bool  adaptive_kappa = true;
+    float contact_kappa_init = 1.0e3f;   // initial soft stiffness
+
+    // GPU Newton path: GPU contact detection (LBVH) + full-Hessian contact
+    // assembly (PSD-projected) + GPU barrier-energy line search. Required for
+    // dense contact (libuipc screw-and-nut, ~10^4 contacts); the rank-1 CPU
+    // path cannot converge there.
+    bool use_gpu_newton = false;
 
     // Newton solver
     int newton_max_iter = 1024;
@@ -233,6 +258,16 @@ struct ABDConfig {
     bool use_bvh_broadphase = true;
     enum class BroadphaseType { BruteForce, QuantBvh, OptiX };
     BroadphaseType broadphase_type = BroadphaseType::QuantBvh;
+
+    // GPU CCD: replace the O(nv*nt + ne^2) brute-force CPU time-of-impact with
+    // a GPU broadphase-candidate + per-contact CCD pass (reuses the rigid_ipc
+    // kernels). The CPU path is kept as a fallback / for validation.
+    bool use_gpu_ccd = true;
+
+    // GPU contact detection via the libuipc-style LBVH simplex trajectory
+    // filter (swept-AABB broadphase, complete candidate set). Replaces the
+    // incomplete edge-face detector that under-reports thread contacts.
+    bool use_lbvh_detection = true;
 
     // Output
     int total_frames = 50;

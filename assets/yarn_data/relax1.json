@@ -1,0 +1,31 @@
+{
+	"curveFile": "configs/frame.bcc",
+	"resampleLength": 3e-3,
+	"curveRadius": 0.0015,
+	"glueEndpoints": 0.01,
+	"transform": [[0.8,    0,    0,  0], 
+				  [   0, 0.8,    0,  0],
+				  [   0,    0, 0.8,  0]],
+
+	"simulation": {
+		// Material
+		"density": 1e-3,
+		"frictionCoeff": 0.1,
+		"kStretch": 1e-1,
+		"kBend": 2e-7,
+		"kCollision": 2e-4,
+		"kFriction": 5,
+		"damping": 1e-6,
+
+		// Env
+		"gravity": [0, 0, 0],
+		"drag": 0.2,
+
+		// Solver
+		"maxTimeStep": 3e-4,
+		"numIterations": 4,
+		"detectionPeriod": 1,
+		"detectionScaler": 1.4,
+		"stepLimit": true
+	},
+}

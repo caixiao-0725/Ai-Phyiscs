@@ -1,0 +1,26 @@
+{
+	"curveFile": "configs/models/openwork_trellis_pattern.bcc",
+	"resampleLength": 2e-3,
+	"curveRadius": 6e-4,
+
+	"simulation": {
+		// Material
+		"density": 1e-3,
+		"frictionCoeff": 0.1,
+		"kStretch": 2e-2,
+		"kBend": 5e-8,
+		"kCollision": 1e-4,
+		"damping": 1e-6,
+
+		// Env
+		"gravity": [0, -9.8, 0],
+		"drag": 0.2,
+
+		// Solver
+		"maxTimeStep": 2e-4,
+		"numIterations": 4,
+		"detectionPeriod": 2,
+		"detectionScaler": 1.1,
+		"stepLimit": true,
+	},
+}

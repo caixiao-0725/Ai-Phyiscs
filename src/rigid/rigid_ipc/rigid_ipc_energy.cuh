@@ -31,6 +31,14 @@ CHYSX_HDI float energy_translation(Vec3f p, Vec3f p_hat, float mass) {
     return 0.5f * mass * math::dot(p, p) - mass * math::dot(p, p_hat);
 }
 
+CHYSX_HDI double energy_translation_d(Vec3f p, Vec3f p_hat, float mass) {
+    double px = p.x, py = p.y, pz = p.z;
+    double hx = p_hat.x, hy = p_hat.y, hz = p_hat.z;
+    double m = mass;
+    return 0.5 * m * (px*px + py*py + pz*pz)
+         - m * (px*hx + py*hy + pz*hz);
+}
+
 CHYSX_HDI Vec3f grad_translation(Vec3f p, Vec3f p_hat, float mass) {
     return (p - p_hat) * mass;
 }
@@ -134,6 +142,18 @@ CHYSX_HDI float body_energy(const RigidBody& body, float dt, Vec3f gravity) {
 
     float E_trans = energy_translation(p, p_hat, body.mass);
     float E_rot = energy_rotation(theta, J_diag, Q_target);
+    return E_trans + E_rot;
+}
+
+CHYSX_HDI double body_energy_d(const RigidBody& body, float dt, Vec3f gravity) {
+    Vec3f p = pose_position(body.q);
+    Vec3f theta = pose_rotation(body.q);
+    Vec3f p_hat = compute_p_hat(body, dt, gravity);
+    Vec3f J_diag = compute_J(body.moment_of_inertia);
+    Mat3f Q_target = compute_Q_target(body, dt);
+
+    double E_trans = energy_translation_d(p, p_hat, body.mass);
+    double E_rot = static_cast<double>(energy_rotation(theta, J_diag, Q_target));
     return E_trans + E_rot;
 }
 

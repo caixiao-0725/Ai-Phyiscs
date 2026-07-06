@@ -93,6 +93,7 @@ add_library(chysx_core STATIC
     src/collision/collision_pipeline.cu
     src/collision/ef_broadphase.cu
     src/collision/ef_contact_detector.cu
+    src/collision/simplex_trajectory_filter.cu
 
     src/constraint/cloth/pin_constraint.cu
     src/constraint/cloth/spring_constraint.cu
@@ -125,11 +126,18 @@ add_library(chysx_core STATIC
     src/rigid/featherstone/featherstone_solver.cu
 
     src/rigid/rigid_ipc/rigid_ipc_kernels.cu
+    src/rigid/abd_ipc/abd_ipc_ccd_kernels.cu
+    src/rigid/abd_ipc/abd_ipc_gpu_kernels.cu
+    src/rigid/pabd_cuda/pabd_cuda_solver.cu
 
     src/ik/ik_solver.cu
 
     src/cloth/cloth_simulator.cu
     src/coupled/coupled_simulator.cu
+
+    src/yarn/yarn_iteration.cu
+    src/yarn/yarn_cosserat.cu
+    src/yarn/yarn_collision.cu
 )
 
 if(CHYSX_USE_OPTIX)
@@ -176,11 +184,26 @@ add_library(chysx_scenes STATIC
     scenes/avbd_scenes.cpp
     scenes/abd_ipc_scenes.cpp
     scenes/rigid_ipc_scenes.cpp
+    scenes/pabd_cuda_scenes.cu
+    scenes/yarn_scenes.cu
     src/rigid/avbd_cpu/avbd_gpu_renderer.cu
 )
 
 target_include_directories(chysx_scenes PUBLIC src src/io)
+find_package(jsoncpp CONFIG QUIET)
 target_link_libraries(chysx_scenes PUBLIC chysx_core)
+if(jsoncpp_FOUND)
+    target_link_libraries(chysx_scenes PRIVATE JsonCpp::JsonCpp)
+else()
+    find_library(JSONCPP_LIB NAMES jsoncpp)
+    find_path(JSONCPP_INC NAMES json/json.h)
+    if(JSONCPP_LIB AND JSONCPP_INC)
+        target_include_directories(chysx_scenes PRIVATE ${JSONCPP_INC})
+        target_link_libraries(chysx_scenes PRIVATE ${JSONCPP_LIB})
+    else()
+        message(FATAL_ERROR "jsoncpp not found. Install via vcpkg: vcpkg install jsoncpp")
+    endif()
+endif()
 
 set_target_properties(chysx_scenes PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON

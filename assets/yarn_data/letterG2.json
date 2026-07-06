@@ -1,0 +1,34 @@
+{
+	"curveFile": "configs/models/letter_G_v4.poly",
+	"resampleLength": 2e-3,
+	"breakUpClosedCurves": true,
+	"curveRadius": 0.0010,
+	"fixVertex": [[0.059308, 0.022941, -0.019133]
+				,[-0.054342, 0.081929, -0.020631]
+				,[0.106251, 0.055472, 0.008579]
+				,[0.09746, 0.016577, -0.005506]
+				,[-0.067291, 0.08238, -0.008863]
+				,[-0.056245, 0.081716, 0.021499]],
+
+	"simulation": {
+		// Material
+		"density": 1e-3,
+		"frictionCoeff": 0.1,
+		"kStretch": 1e-1,
+		"kBend": 2e-7,
+		"kCollision": 2e-4,
+		"kFriction": 5,
+		"damping": 1e-7,
+
+		// Env
+		"gravity": [0, -9.8, 0],
+		"drag": 0.2,
+
+		// Solver
+		"maxTimeStep": 4e-4,
+		"numIterations": 4,
+		"detectionPeriod": 4,
+		"detectionScaler": 1.1,
+		"stepLimit": true,
+	},
+}

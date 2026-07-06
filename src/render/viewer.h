@@ -25,6 +25,7 @@ struct ViewerConfig {
     int height = 720;
     const char* title = "ChysX Viewer";
     float dt = 1.0f / 60.0f;
+    std::string initial_scene;
 };
 
 class Viewer {
@@ -51,6 +52,7 @@ private:
     void draw_ui();
 
     void switch_scene(int index);
+    int find_scene(const std::string& name) const;
     bool screen_to_ray(int sx, int sy,
                        float& ox, float& oy, float& oz,
                        float& dx, float& dy, float& dz) const;

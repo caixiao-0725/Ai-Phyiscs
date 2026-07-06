@@ -62,12 +62,14 @@ struct RigidBody {
     // Precomputed rotation-matrix derivative state (set by solver at each step)
     Mat3f R;             // R(theta) at current pose
     Mat3f R_prev;        // R(theta_prev)
+    Mat3f R0;            // initial rotation (principal axes alignment)
     Mat3f Qdot_prev;     // dR/dt at previous step
 
     float friction;
 
     bool is_fixed;
     bool is_dynamic;
+    bool dof_fixed[6] = {};  // per-DOF lock: [px,py,pz,rx,ry,rz]
 
     int surface_vert_offset;
     int surface_vert_count;

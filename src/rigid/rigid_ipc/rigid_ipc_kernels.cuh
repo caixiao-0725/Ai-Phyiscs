@@ -20,8 +20,9 @@ namespace chysx {
 namespace rigid_ipc {
 
 // GPU-friendly contact pair (POD, no enum class)
+// type: 0=PP, 1=PE, 2=PT, 3=EE  (matches IPC Toolkit conventions)
 struct GPUContactPair {
-    int type;   // 0 = PT, 1 = EE
+    int type;
     int v[4];
     int body[4];
 };
@@ -76,11 +77,20 @@ void launch_trial_verts(Vec3f* verts_trial, const Vec3f* x_bar,
                          const Vec6f* dq, float alpha,
                          int n_verts, cudaStream_t stream = 0);
 
+// Assemble contact barrier gradient + Hessian (diagonal and off-diagonal).
+// hess_diag_out: [n_bodies]           diagonal 6×6 blocks (atomicAdd)
+// hess_offdiag_out: [n_contacts * 2]  off-diagonal 6×6 blocks per contact
+//   For contact c involving body_A and body_B:
+//     hess_offdiag_out[2*c + 0] = H[body_A, body_B]  (6×6)
+//     hess_offdiag_out[2*c + 1] = H[body_B, body_A]  (6×6)
+// offdiag_body_pairs: [n_contacts]  Vec2i(body_A, body_B) per contact
+//   Written by this kernel so CPU/GPU knows the body pair for each off-diag block.
 void launch_assemble_contacts(
     const GPUContactPair* contacts, const Vec3f* verts,
     const Vec3f* x_bar, const int* vert_body,
     const Vec6f* body_q,
     Vec6f* grad_out, Mat6f* hess_diag_out,
+    Mat6f* hess_offdiag_out, math::Vec2i* offdiag_body_pairs,
     float* barrier_energy,
     float kappa, float D_hat,
     int n_contacts, cudaStream_t stream = 0);
@@ -96,10 +106,48 @@ void launch_barrier_energy(
     float* energies, float kappa, float D_hat,
     int n_contacts, cudaStream_t stream = 0);
 
+// ---- GPU block-sparse matvec: y = H*x  ------------------------------------
+// y[i] = H_diag[i]*x[i] + Σ_c H_offdiag[...]*x[...]
+// offdiag blocks stored as: hess_offdiag[2*c+0] = H[A,B], hess_offdiag[2*c+1] = H[B,A]
+// body_pairs[c] = (A,B)
+void launch_block_sparse_matvec(
+    const Mat6f* H_diag,
+    const Mat6f* hess_offdiag, const math::Vec2i* body_pairs,
+    int n_offdiag_pairs,
+    const Vec6f* x, Vec6f* y,
+    int n_bodies, cudaStream_t stream = 0);
+
+// ---- GPU PCG solver --------------------------------------------------------
+// Solves H * dx = rhs on GPU.  Returns number of iterations.
+// All arrays are device pointers.  dx is zeroed and overwritten.
+// Needs scratch: r, z, p, Hp — each [n_bodies] Vec6f, caller-allocated.
+int launch_pcg6_gpu(
+    const Mat6f* H_diag,
+    const Mat6f* hess_offdiag, const math::Vec2i* body_pairs,
+    int n_offdiag_pairs,
+    const Vec6f* rhs, Vec6f* dx,
+    Vec6f* r, Vec6f* z, Vec6f* p, Vec6f* Hp,
+    int n_bodies, float tol, int max_iter,
+    cudaStream_t stream = 0);
+
+// Compute per-contact squared distance D (for min-distance tracking / kappa update).
+// Writes D[ci] for each contact. Inactive contacts (D >= D_hat) get D_hat.
+void launch_compute_contact_distances(
+    const GPUContactPair* contacts, const Vec3f* verts,
+    float* dist_sq_out, float D_hat,
+    int n_contacts, cudaStream_t stream = 0);
+
 // ---- Reductions -----------------------------------------------------------
 
 float gpu_reduce_sum(const float* d_data, int n, cudaStream_t stream = 0);
 float gpu_reduce_min(const float* d_data, int n, cudaStream_t stream = 0);
+
+// Clamp off-diagonal Hessian blocks for locked DOFs.
+// dof_mask: [n_bodies] Vec6f where mask[d]=0 for locked, 1 for free.
+void launch_clamp_offdiag_dofs(
+    Mat6f* hess_offdiag, const math::Vec2i* body_pairs,
+    const Vec6f* dof_mask,
+    int n_pairs, cudaStream_t stream = 0);
 
 // ---- Utility kernels ------------------------------------------------------
 

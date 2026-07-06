@@ -1,0 +1,45 @@
+{
+	// The input curve file. Can be .bcc, .obj, or .poly
+	"curveFile": "configs/models/cable_work_pattern.bcc",
+
+	// Resample the curve to contain segments of approximately 3e-3 meters.
+	// Simply remove to turn off resampling
+	"resampleLength": 3e-3,
+
+	// The radius of the curve/yarn
+	"curveRadius": 0.0015,
+
+	// Glue all endpoints within 0.01 meters of each other together. Remove to turn off. 
+	"glueEndpoints": 0.01,
+
+	// Fix borders provided as padding from [xmin, xmax, ymin, ymax, zmin, zmax].
+	// See "fixVertex" in letterS.json for how to fix by vertex.
+	"fixBorders": [0, 0, 0.01, 0.01, 0, 0],
+
+	// Transform the curve file before simulation with this matrix.
+	"transform": [[0.01,    0,    0,  0], 
+				  [   0, 0.01,    0,  0],
+				  [   0,    0, 0.01,  0]],
+
+	"simulation": {
+		// ===== Material ===== 
+		"density": 1e-3,		// Density of the curve in kg/meter
+		"frictionCoeff": 0.1,
+		"kStretch": 1e-1,
+		"kBend": 2e-7,
+		"kCollision": 2e-4,
+		"kFriction": 5,
+		"damping": 0,			// Rayleigh damping coeff
+
+		// ===== Env ===== 
+		"gravity": [0, -9.8, 0],
+		"drag": 0,				// Linear velocity drag
+
+		// ===== Solver ===== 
+		"maxTimeStep": 4e-4,	// Max allowed time step
+		"numIterations": 4,		// Number of iterations per timestep
+		"detectionPeriod": 4,	// How often to update collision queries. 1 is every frame. 4 is every 4 frames. -1 to turn off collisions. 
+		"detectionScaler": 1.1,	// How much to scale query radius when generating neighbors list
+		"stepLimit": true,		// Enforce step limits to guarentee non-penetration
+	},
+}

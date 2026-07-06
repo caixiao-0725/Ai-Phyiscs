@@ -262,7 +262,7 @@ void apply_contact_spmv(const ContactSpMVOp& op,
         op.friction_epsilon,
         x,
         y);
-    check_cuda(cudaGetLastError(), "apply_contact_spmv_kernel launch");
+    //check_cuda(cudaGetLastError(), "apply_contact_spmv_kernel launch");
 }
 
 }  // namespace collision

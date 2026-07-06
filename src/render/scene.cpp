@@ -6,6 +6,8 @@ extern "C" void chysx_register_cloth_scenes();
 extern "C" void chysx_register_avbd_scenes();
 extern "C" void chysx_register_abd_ipc_scenes();
 extern "C" void chysx_register_rigid_ipc_scenes();
+extern "C" void chysx_register_pabd_cuda_scenes();
+extern "C" void chysx_register_yarn_scenes();
 
 namespace chysx {
 namespace render {
@@ -28,6 +30,8 @@ void register_all_scenes() {
     chysx_register_avbd_scenes();
     chysx_register_abd_ipc_scenes();
     chysx_register_rigid_ipc_scenes();
+    chysx_register_pabd_cuda_scenes();
+    chysx_register_yarn_scenes();
 }
 
 }  // namespace render

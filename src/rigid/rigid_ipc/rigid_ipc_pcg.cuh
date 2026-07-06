@@ -143,5 +143,70 @@ inline PCGResult solve_pcg6(const BlockSystem6& sys,
     return result;
 }
 
+// ============================================================================
+// Dense Cholesky solver for small systems (CPU, fallback for high-kappa)
+// Assembles full dense matrix from block-sparse and solves via LDLT.
+// ============================================================================
+inline bool solve_dense_ldlt6(const BlockSystem6& sys,
+                               std::vector<Vec6f>& dx) {
+    int n = sys.n_bodies;
+    int N = n * 6;
+    std::vector<double> A(N * N, 0.0);
+    std::vector<double> b(N, 0.0);
+
+    for (int i = 0; i < n; ++i) {
+        for (int r = 0; r < 6; ++r) {
+            b[i*6 + r] = (double)sys.rhs[i][r];
+            for (int c = 0; c < 6; ++c)
+                A[(i*6+r)*N + (i*6+c)] = (double)sys.H_diag[i](r, c);
+        }
+    }
+    for (auto& od : sys.H_offdiag) {
+        for (int r = 0; r < 6; ++r)
+            for (int c = 0; c < 6; ++c)
+                A[(od.row*6+r)*N + (od.col*6+c)] += (double)od.block(r, c);
+    }
+
+    // In-place LDLT decomposition (Cholesky-like for symmetric positive definite)
+    std::vector<double> D(N);
+    for (int j = 0; j < N; ++j) {
+        double sum = A[j*N+j];
+        for (int k = 0; k < j; ++k)
+            sum -= A[j*N+k] * A[j*N+k] * D[k];
+        D[j] = sum;
+        if (std::abs(D[j]) < 1e-30) D[j] = 1e-30;
+        for (int i = j+1; i < N; ++i) {
+            double s = A[i*N+j];
+            for (int k = 0; k < j; ++k)
+                s -= A[i*N+k] * A[j*N+k] * D[k];
+            A[i*N+j] = s / D[j];
+        }
+    }
+
+    // Solve Ly = b (L is lower triangular with unit diagonal)
+    std::vector<double> y(N);
+    for (int i = 0; i < N; ++i) {
+        double s = b[i];
+        for (int k = 0; k < i; ++k)
+            s -= A[i*N+k] * y[k];
+        y[i] = s;
+    }
+    // Solve Dz = y
+    for (int i = 0; i < N; ++i)
+        y[i] = y[i] / D[i];
+    // Solve L^T x = z
+    for (int i = N-1; i >= 0; --i) {
+        double s = y[i];
+        for (int k = i+1; k < N; ++k)
+            s -= A[k*N+i] * y[k];
+        y[i] = s;
+    }
+
+    for (int i = 0; i < n; ++i)
+        for (int d = 0; d < 6; ++d)
+            dx[i][d] = (float)y[i*6+d];
+    return true;
+}
+
 }  // namespace rigid_ipc
 }  // namespace chysx

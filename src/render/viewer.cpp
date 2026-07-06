@@ -96,7 +96,8 @@ void Viewer::run() {
 
     const auto& reg = scene_registry();
     if (!reg.empty()) {
-        switch_scene(2);
+        int index = cfg_.initial_scene.empty() ? -1 : find_scene(cfg_.initial_scene);
+        switch_scene(index >= 0 ? index : 2);
     }
 
     running_ = true;
@@ -447,6 +448,16 @@ void Viewer::switch_scene(int index) {
     scene_.reset(reg[index].create());
     scene_->setup();
     paused_ = false;
+}
+
+int Viewer::find_scene(const std::string& name) const {
+    const auto& reg = scene_registry();
+    for (int i = 0; i < static_cast<int>(reg.size()); ++i) {
+        if (name == reg[i].name) {
+            return i;
+        }
+    }
+    return -1;
 }
 
 }  // namespace render

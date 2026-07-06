@@ -209,12 +209,41 @@ inline bool compute_and_align_mass(geometry::TriangleMeshf& mesh, float density,
     Mat3f evecs;
     symmetric_eigen3(props.inertia, evals, evecs);
 
-    // Ensure right-handed: flip third column if determinant < 0
+    // Ensure right-handed: flip first column if determinant < 0
+    // (matches Eigen::SelfAdjointEigenSolver convention)
     float det = math::determinant(evecs);
     if (det < 0) {
-        evecs(0, 2) = -evecs(0, 2);
-        evecs(1, 2) = -evecs(1, 2);
-        evecs(2, 2) = -evecs(2, 2);
+        evecs(0, 0) = -evecs(0, 0);
+        evecs(1, 0) = -evecs(1, 0);
+        evecs(2, 0) = -evecs(2, 0);
+    }
+
+    // Try to minimize the axis-angle magnitude of R0 by testing
+    // all 4 sign combinations of columns 0,1 (col 2 is determined
+    // by right-hand rule). Pick the orientation whose axis-angle
+    // representation has the smallest angle.
+    {
+        Mat3f best = evecs;
+        float best_angle = 1e30f;
+        for (int s0 = 0; s0 < 2; ++s0) {
+            for (int s1 = 0; s1 < 2; ++s1) {
+                Mat3f R = evecs;
+                if (s0) { R(0,0)=-R(0,0); R(1,0)=-R(1,0); R(2,0)=-R(2,0); }
+                if (s1) { R(0,1)=-R(0,1); R(1,1)=-R(1,1); R(2,1)=-R(2,1); }
+                // Fix col2 = col0 x col1 for right-handedness
+                Vec3f c0(R(0,0),R(1,0),R(2,0));
+                Vec3f c1(R(0,1),R(1,1),R(2,1));
+                Vec3f c2 = math::cross(c0, c1);
+                R(0,2)=c2.x; R(1,2)=c2.y; R(2,2)=c2.z;
+                // Angle of AxisAngle(R): cos(theta) = (trace(R)-1)/2
+                float tr = R(0,0)+R(1,1)+R(2,2);
+                float cos_t = (tr - 1.0f) * 0.5f;
+                cos_t = math::clamp(cos_t, -1.0f, 1.0f);
+                float angle = acosf(cos_t);
+                if (angle < best_angle) { best_angle = angle; best = R; }
+            }
+        }
+        evecs = best;
     }
 
     // Rotate vertices into principal frame: v' = R0^T * v
