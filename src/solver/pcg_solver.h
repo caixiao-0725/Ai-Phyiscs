@@ -127,7 +127,8 @@ public:
               DeviceSpan<math::Vec3f> x,
               const PCGParams& params = PCGParams{},
               std::uintptr_t cuda_stream = 0,
-              collision::ContactSpMVOp contact = {});
+              collision::ContactSpMVOp contact = {},
+              collision::WideContactSpMVOp wide_contact = {});
 
     // Last solve's preconditioner-weighted residual <r, z> from the
     // final iteration, copied to host on demand.  Useful for cheap

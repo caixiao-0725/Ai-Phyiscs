@@ -163,6 +163,7 @@ void emit_pcg(const sparse::BlockCSR3& A,
               int max_iterations,
               std::uintptr_t cuda_stream,
               const collision::ContactSpMVOp& contact,
+              const collision::WideContactSpMVOp& wide_contact,
               CudaArray<math::Vec3f>& r,
               CudaArray<math::Vec3f>& p,
               CudaArray<math::Vec3f>& z,
@@ -187,6 +188,8 @@ void emit_pcg(const sparse::BlockCSR3& A,
 
     collision::apply_contact_spmv(contact, x.data(), r.gpu_data(),
                                   n, -1.0f, cuda_stream);
+    collision::apply_wide_contact_spmv(wide_contact, x.data(), r.gpu_data(),
+                                       n, -1.0f, cuda_stream);
 
     jacobi_copy_dot_single_block_kernel<kBlockDim><<<1, kBlockDim, 0, stream>>>(
         M_inv.gpu_data(), r.gpu_data(), z.gpu_data(), p.gpu_data(),
@@ -200,6 +203,9 @@ void emit_pcg(const sparse::BlockCSR3& A,
                      1.0f, 0.0f, cuda_stream);
         collision::apply_contact_spmv(contact, p.gpu_data(),
                                       Ap.gpu_data(), n, 1.0f, cuda_stream);
+        collision::apply_wide_contact_spmv(wide_contact, p.gpu_data(),
+                                           Ap.gpu_data(), n, 1.0f,
+                                           cuda_stream);
 
         dot_single_block_kernel<kBlockDim><<<1, kBlockDim, 0, stream>>>(
             p.gpu_data(), Ap.gpu_data(), &coeff.gpu_data()[1], n);
@@ -284,7 +290,8 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
                      DeviceSpan<math::Vec3f> x,
                      const PCGParams& params,
                      std::uintptr_t cuda_stream,
-                     collision::ContactSpMVOp contact) {
+                     collision::ContactSpMVOp contact,
+                     collision::WideContactSpMVOp wide_contact) {
     const int n = A.num_block_rows();
     if (n == 0) return 0;
 
@@ -310,7 +317,7 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
 
     destroy_graph();
     emit_pcg(A, b, x, max_iter, cuda_stream, contact,
-             r_, p_, z_, Ap_, M_inv_, coeff_);
+             wide_contact, r_, p_, z_, Ap_, M_inv_, coeff_);
     return max_iter;
 }
 

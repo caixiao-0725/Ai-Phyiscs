@@ -91,6 +91,29 @@ struct ContactSpMVOp {
     }
 };
 
+struct alignas(16) WideContact {
+    math::Vec4i ids0;           // first 4 control ids
+    math::Vec4i ids1;           // next 4 control ids, -1 when unused
+    math::Vec4f weights0;       // signed coefficients for ids0
+    math::Vec4f weights1;       // signed coefficients for ids1
+    math::Vec4f normal_target;  // xyz = normal, w = RHS target offset
+    float stiffness = 0.0f;     // per-contact stiffness
+    float pad0 = 0.0f;
+    float pad1 = 0.0f;
+    float pad2 = 0.0f;
+};
+
+struct WideContactSpMVOp {
+    const WideContact* contacts = nullptr;
+    const int* count_dev = nullptr;
+    int max_contacts = 0;
+    float stiffness = 0.0f;
+
+    bool active() const noexcept {
+        return max_contacts > 0 && contacts != nullptr;
+    }
+};
+
 // Bake `alpha * C_diag` into `diag_blocks[]` once per step.
 //
 // For every active contact (idx < *count_dev, clamped at max_contacts)
@@ -132,6 +155,19 @@ void apply_contact_spmv(const ContactSpMVOp& op,
                         int n_particles,
                         float alpha,
                         std::uintptr_t cuda_stream);
+
+void bake_wide_contact_diag(math::Mat3f* diag_blocks,
+                            int n_particles,
+                            const WideContactSpMVOp& op,
+                            float alpha,
+                            std::uintptr_t cuda_stream);
+
+void apply_wide_contact_spmv(const WideContactSpMVOp& op,
+                             const math::Vec3f* x,
+                             math::Vec3f* y,
+                             int n_particles,
+                             float alpha,
+                             std::uintptr_t cuda_stream);
 
 }  // namespace collision
 }  // namespace chysx

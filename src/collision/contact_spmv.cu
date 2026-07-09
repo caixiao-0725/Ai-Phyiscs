@@ -200,6 +200,110 @@ __global__ void apply_contact_spmv_kernel(
     }
 }
 
+__global__ void bake_wide_contact_diag_kernel(
+    const WideContact* __restrict__ contacts,
+    const int* __restrict__ count_ptr,
+    int max_contacts,
+    float k_alpha,
+    math::Mat3f* __restrict__ diag_blocks) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n_raw = *count_ptr;
+    const int n = (n_raw < max_contacts) ? n_raw : max_contacts;
+    if (c >= n) return;
+
+    const WideContact wc = contacts[c];
+    const float k = k_alpha * wc.stiffness;
+    if (k == 0.0f) return;
+    const int ids[8] = {
+        wc.ids0.x, wc.ids0.y, wc.ids0.z, wc.ids0.w,
+        wc.ids1.x, wc.ids1.y, wc.ids1.z, wc.ids1.w,
+    };
+    const float ws[8] = {
+        wc.weights0.x, wc.weights0.y, wc.weights0.z, wc.weights0.w,
+        wc.weights1.x, wc.weights1.y, wc.weights1.z, wc.weights1.w,
+    };
+    const float nx = wc.normal_target.x;
+    const float ny = wc.normal_target.y;
+    const float nz = wc.normal_target.z;
+    const float h00 = k * nx * nx;
+    const float h01 = k * nx * ny;
+    const float h02 = k * nx * nz;
+    const float h11 = k * ny * ny;
+    const float h12 = k * ny * nz;
+    const float h22 = k * nz * nz;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int id = ids[i];
+        const float wi = ws[i];
+        if (id < 0 || wi == 0.0f) continue;
+        const float ww = wi * wi;
+        float* dst = diag_blocks[id].data;
+        atomicAdd(&dst[0], ww * h00);
+        atomicAdd(&dst[1], ww * h01);
+        atomicAdd(&dst[2], ww * h02);
+        atomicAdd(&dst[3], ww * h01);
+        atomicAdd(&dst[4], ww * h11);
+        atomicAdd(&dst[5], ww * h12);
+        atomicAdd(&dst[6], ww * h02);
+        atomicAdd(&dst[7], ww * h12);
+        atomicAdd(&dst[8], ww * h22);
+    }
+}
+
+__global__ void apply_wide_contact_spmv_kernel(
+    const WideContact* __restrict__ contacts,
+    const int* __restrict__ count_ptr,
+    int max_contacts,
+    float k_alpha,
+    const math::Vec3f* __restrict__ x,
+    math::Vec3f* __restrict__ y) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int n_raw = *count_ptr;
+    const int n = (n_raw < max_contacts) ? n_raw : max_contacts;
+    if (c >= n) return;
+
+    const WideContact wc = contacts[c];
+    const float k = k_alpha * wc.stiffness;
+    if (k == 0.0f) return;
+    const int ids[8] = {
+        wc.ids0.x, wc.ids0.y, wc.ids0.z, wc.ids0.w,
+        wc.ids1.x, wc.ids1.y, wc.ids1.z, wc.ids1.w,
+    };
+    const float ws[8] = {
+        wc.weights0.x, wc.weights0.y, wc.weights0.z, wc.weights0.w,
+        wc.weights1.x, wc.weights1.y, wc.weights1.z, wc.weights1.w,
+    };
+    const math::Vec3f normal(wc.normal_target.x,
+                             wc.normal_target.y,
+                             wc.normal_target.z);
+
+    math::Vec3f xs[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        xs[i] = ids[i] >= 0 ? x[ids[i]] : math::Vec3f(0.0f, 0.0f, 0.0f);
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int id_i = ids[i];
+        const float wi = ws[i];
+        if (id_i < 0 || wi == 0.0f) continue;
+        math::Vec3f temp(0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            if (j == i) continue;
+            const float wj = ws[j];
+            if (ids[j] < 0 || wj == 0.0f) continue;
+            temp += xs[j] * wj;
+        }
+        const float dn = math::dot(normal, temp);
+        atomicAdd(&y[id_i].x, wi * k * dn * normal.x);
+        atomicAdd(&y[id_i].y, wi * k * dn * normal.y);
+        atomicAdd(&y[id_i].z, wi * k * dn * normal.z);
+    }
+}
+
 }  // namespace
 
 void bake_contact_diag(math::Mat3f* diag_blocks,
@@ -263,6 +367,44 @@ void apply_contact_spmv(const ContactSpMVOp& op,
         x,
         y);
     //check_cuda(cudaGetLastError(), "apply_contact_spmv_kernel launch");
+}
+
+void bake_wide_contact_diag(math::Mat3f* diag_blocks,
+                            int /*n_particles*/,
+                            const WideContactSpMVOp& op,
+                            float alpha,
+                            std::uintptr_t cuda_stream) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    const int launch_size = (op.max_contacts > 0) ? op.max_contacts : 1;
+    const int* count_ptr = op.count_dev ? op.count_dev : zero_count_ptr();
+    bake_wide_contact_diag_kernel<<<grid_for(launch_size), kBlockDim, 0, stream>>>(
+        op.contacts,
+        count_ptr,
+        op.max_contacts,
+        alpha * op.stiffness,
+        diag_blocks);
+    check_cuda(cudaGetLastError(), "bake_wide_contact_diag_kernel launch");
+}
+
+void apply_wide_contact_spmv(const WideContactSpMVOp& op,
+                             const math::Vec3f* x,
+                             math::Vec3f* y,
+                             int /*n_particles*/,
+                             float alpha,
+                             std::uintptr_t cuda_stream) {
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+
+    const int launch_size = (op.max_contacts > 0) ? op.max_contacts : 1;
+    const int* count_ptr = op.count_dev ? op.count_dev : zero_count_ptr();
+    apply_wide_contact_spmv_kernel<<<grid_for(launch_size), kBlockDim, 0, stream>>>(
+        op.contacts,
+        count_ptr,
+        op.max_contacts,
+        alpha * op.stiffness,
+        x,
+        y);
+    //check_cuda(cudaGetLastError(), "apply_wide_contact_spmv_kernel launch");
 }
 
 }  // namespace collision

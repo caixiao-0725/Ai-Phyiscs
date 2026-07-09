@@ -79,6 +79,7 @@ add_library(chysx_core STATIC
     src/sparse/block_csr.cu
     src/solver/pcg_solver.cu
     src/solver/vbd_solver.cu
+    src/io/obj_io.cpp
 
     src/collision/bvh/lbvh.cu
     src/collision/bvh/quant_bvh.cu
@@ -88,6 +89,7 @@ add_library(chysx_core STATIC
     src/collision/static_contact.cu
     src/collision/untangle.cu
     src/collision/mesh_contact.cu
+    src/collision/mesh_mesh_contact.cu
     src/collision/sdf/sdf_volume.cu
     src/collision/sdf/sdf_contact.cu
     src/collision/collision_pipeline.cu
@@ -176,9 +178,36 @@ endif()
 # chysx_scenes — static library with scene definitions + scene registry
 # ====================================================================
 
+# ====================================================================
+# tests
+# ====================================================================
+
+option(CHYSX_BUILD_TESTS "Build lightweight headless tests" ON)
+
+if(CHYSX_BUILD_TESTS)
+    enable_testing()
+
+    add_executable(mesh_mesh_contact_tests
+        tests/mesh_mesh_contact_tests.cu
+    )
+    target_link_libraries(mesh_mesh_contact_tests PRIVATE chysx_core)
+    target_include_directories(mesh_mesh_contact_tests PRIVATE src)
+    set_target_properties(mesh_mesh_contact_tests PROPERTIES
+        LINKER_LANGUAGE CUDA
+    )
+
+    if(MSVC)
+        target_compile_options(mesh_mesh_contact_tests PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+        )
+    endif()
+
+    add_test(NAME mesh_mesh_contact_tests COMMAND mesh_mesh_contact_tests)
+endif()
+
 add_library(chysx_scenes STATIC
     src/render/scene.cpp
-    src/io/obj_io.cpp
     src/io/bgeo_writer.cpp
     scenes/cloth_freefall.cu
     scenes/avbd_scenes.cpp

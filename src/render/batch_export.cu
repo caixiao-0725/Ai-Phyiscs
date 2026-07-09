@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <exception>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -45,7 +46,13 @@ int main(int argc, char* argv[]) {
     }
     if (!scene) scene = reg[0].create();
     scene->set_headless(true);
-    scene->setup();
+    try {
+        scene->setup();
+    } catch (const std::exception& e) {
+        std::cerr << "Scene setup failed: " << e.what() << std::endl;
+        delete scene;
+        return 1;
+    }
 
     std::string out_dir = std::string(ASSET_PATH) + "output/";
     std::cout << "=== ChysX Batch Export ===" << std::endl;
