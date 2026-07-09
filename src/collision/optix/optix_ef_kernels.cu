@@ -3,6 +3,8 @@
 
 #include <cuda_runtime.h>
 
+#include "../../math/vec.cuh"
+
 namespace chysx {
 namespace collision {
 
@@ -44,6 +46,43 @@ void optix_ef_build_aabbs(float* aabb_buffer,
     int grid = (n_faces + block - 1) / block;
     optix_ef_build_aabb_kernel<<<grid, block, 0, stream>>>(
         aabb_buffer, verts, tris, thickness, n_faces);
+}
+
+__global__ void optix_ef_flatten_hits_kernel(
+    const int* __restrict__ hits_buffer,
+    const int* __restrict__ hit_counts,
+    int n_edges,
+    int max_hits_per_edge,
+    math::Vec2i* __restrict__ ef_pairs,
+    int* __restrict__ pair_count,
+    int max_pairs) {
+    int eid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (eid >= n_edges) return;
+
+    const int n = min(hit_counts[eid], max_hits_per_edge);
+    for (int j = 0; j < n; ++j) {
+        const int out = atomicAdd(pair_count, 1);
+        if (out < max_pairs) {
+            ef_pairs[out] =
+                math::Vec2i(eid, hits_buffer[eid * max_hits_per_edge + j]);
+        }
+    }
+}
+
+void optix_ef_flatten_hits(const int* hits_buffer,
+                           const int* hit_counts,
+                           int n_edges,
+                           int max_hits_per_edge,
+                           math::Vec2i* ef_pairs,
+                           int* pair_count,
+                           int max_pairs,
+                           cudaStream_t stream) {
+    cudaMemsetAsync(pair_count, 0, sizeof(int), stream);
+    int block = 128;
+    int grid = (n_edges + block - 1) / block;
+    optix_ef_flatten_hits_kernel<<<grid, block, 0, stream>>>(
+        hits_buffer, hit_counts, n_edges, max_hits_per_edge,
+        ef_pairs, pair_count, max_pairs);
 }
 
 }  // namespace collision

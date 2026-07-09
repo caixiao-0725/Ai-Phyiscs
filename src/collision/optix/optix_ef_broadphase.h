@@ -45,14 +45,23 @@ public:
     // Download EF candidate pairs (edge_id, face_id) to CPU.
     void download_pairs(std::vector<math::Vec2i>& out,
                         std::uintptr_t cuda_stream = 0);
+    int ef_count(std::uintptr_t cuda_stream = 0);
 
     bool valid() const noexcept { return initialized_; }
     const MeshTopology& topology() const noexcept { return topology_; }
+    int max_ef_candidates() const noexcept { return max_ef_candidates_; }
+    const math::Vec2i* ef_pairs_dev() const noexcept {
+        return ef_pairs_.gpu_data();
+    }
+    const int* ef_count_dev() const noexcept {
+        return ef_count_.gpu_data();
+    }
 
 private:
     MeshTopology topology_;
     bool initialized_ = false;
     int max_hits_per_edge_ = 64;
+    int max_ef_candidates_ = 0;
     int n_edges_ = 0;
     int n_faces_ = 0;
     int rebuild_counter_ = 0;
@@ -80,6 +89,8 @@ private:
     // Per-edge output
     CudaArray<int> hits_buffer_;
     CudaArray<int> hit_counts_;
+    CudaArray<math::Vec2i> ef_pairs_;
+    CudaArray<int> ef_count_;
 
     // Launch params
     optix_ef::Params cpu_params_{};

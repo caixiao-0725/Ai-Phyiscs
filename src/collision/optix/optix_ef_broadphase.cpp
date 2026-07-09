@@ -29,6 +29,14 @@ namespace chysx { namespace collision {
 void optix_ef_build_aabbs(float* aabb_buffer, const float3* verts,
                            const int3* tris, float thickness,
                            int n_faces, cudaStream_t stream);
+void optix_ef_flatten_hits(const int* hits_buffer,
+                           const int* hit_counts,
+                           int n_edges,
+                           int max_hits_per_edge,
+                           math::Vec2i* ef_pairs,
+                           int* pair_count,
+                           int max_pairs,
+                           cudaStream_t stream);
 }}
 
 namespace chysx {
@@ -104,11 +112,16 @@ void OptixEFBroadphase::setup(const std::vector<math::Vec3i>& tris,
 
     n_faces_ = topology_.n_faces();
     n_edges_ = topology_.n_edges();
-    max_hits_per_edge_ = max_hits_per_edge;
+    max_hits_per_edge_ = std::max(1, max_hits_per_edge);
+    max_ef_candidates_ = std::max(1, n_edges_ * max_hits_per_edge_);
 
     // Allocate per-edge output
     hits_buffer_.resize(static_cast<size_t>(n_edges_) * max_hits_per_edge_);
     hit_counts_.resize(n_edges_);
+    ef_pairs_.resize(static_cast<size_t>(max_ef_candidates_));
+    ef_count_.resize(1);
+    ef_count_.cpu_data()[0] = 0;
+    ef_count_.copy_to_device();
 
     // Allocate AABB buffer (6 floats per face)
     aabb_buffer_.resize(static_cast<size_t>(n_faces_) * 6);
@@ -351,43 +364,45 @@ void OptixEFBroadphase::query(const math::Vec3f* positions_dev,
     CHYSX_OPTIX_CHECK(optixLaunch(
         pipeline_, stream, gpu_params_, sizeof(Params),
         &sbt_, static_cast<unsigned int>(n_edges_), 1, 1));
+    optix_ef_flatten_hits(hits_buffer_.gpu_data(),
+                          hit_counts_.gpu_data(),
+                          n_edges_,
+                          max_hits_per_edge_,
+                          ef_pairs_.gpu_data(),
+                          ef_count_.gpu_data(),
+                          max_ef_candidates_,
+                          stream);
 }
 
 // ============================================================================
 // Download results
 // ============================================================================
 
+int OptixEFBroadphase::ef_count(std::uintptr_t cuda_stream) {
+    int count = 0;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+    if (stream) cudaStreamSynchronize(stream);
+    CHYSX_CUDA_CHECK(cudaMemcpy(&count, ef_count_.gpu_data(), sizeof(int),
+                                cudaMemcpyDeviceToHost));
+    return std::min(count, max_ef_candidates_);
+}
+
 void OptixEFBroadphase::download_pairs(std::vector<math::Vec2i>& out,
                                          std::uintptr_t cuda_stream) {
     if (!initialized_) { out.clear(); return; }
 
+    const int n = ef_count(cuda_stream);
+    out.resize(static_cast<std::size_t>(n));
+    if (n == 0) return;
+
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
-    if (stream) cudaStreamSynchronize(stream);
-
-    // Download hit counts
-    hit_counts_.copy_to_host();
-    const int* counts = hit_counts_.cpu_data();
-
-    // Count total hits
-    int total = 0;
-    for (int i = 0; i < n_edges_; ++i)
-        total += std::min(counts[i], max_hits_per_edge_);
-
-    if (total == 0) { out.clear(); return; }
-
-    // Download hits buffer
-    hits_buffer_.copy_to_host();
-    const int* hits = hits_buffer_.cpu_data();
-
-    out.clear();
-    out.reserve(total);
-    for (int eid = 0; eid < n_edges_; ++eid) {
-        int n = std::min(counts[eid], max_hits_per_edge_);
-        for (int j = 0; j < n; ++j) {
-            int fid = hits[eid * max_hits_per_edge_ + j];
-            out.push_back(math::Vec2i(eid, fid));
-        }
-    }
+    CHYSX_CUDA_CHECK(cudaMemcpyAsync(out.data(),
+                                     ef_pairs_.gpu_data(),
+                                     static_cast<std::size_t>(n) *
+                                         sizeof(math::Vec2i),
+                                     cudaMemcpyDeviceToHost,
+                                     stream));
+    CHYSX_CUDA_CHECK(cudaStreamSynchronize(stream));
 }
 
 }  // namespace collision

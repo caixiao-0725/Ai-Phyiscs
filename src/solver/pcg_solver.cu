@@ -273,6 +273,7 @@ void PCGSolver::initialize(int num_block_rows) {
     if (num_block_rows < 0) {
         throw std::invalid_argument("PCGSolver::initialize: negative size");
     }
+    destroy_graph();
     if (num_block_rows == num_block_rows_) return;
 
     r_.resize(num_block_rows);
@@ -306,7 +307,6 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
 
     if (n != num_block_rows_) {
         initialize(n);
-        destroy_graph();
     }
 
     CHYSX_NVTX_RANGE_COLOUR("pcg::solve", 0xfff1c40f);
@@ -314,10 +314,49 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
     collision::zero_count_ptr();
 
     const int max_iter = params.max_iterations;
+    auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+    if (stream == nullptr) {
+        emit_pcg(A, b, x, max_iter, cuda_stream, contact,
+                 wide_contact, r_, p_, z_, Ap_, M_inv_, coeff_);
+        return max_iter;
+    }
 
-    destroy_graph();
-    emit_pcg(A, b, x, max_iter, cuda_stream, contact,
-             wide_contact, r_, p_, z_, Ap_, M_inv_, coeff_);
+    if (!graph_exec_ || graph_n_ != n || graph_max_iter_ != max_iter) {
+        destroy_graph();
+        cudaGraph_t graph = nullptr;
+        cudaError_t err = cudaStreamBeginCapture(
+            stream, cudaStreamCaptureModeGlobal);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("PCGSolver::solve: cudaStreamBeginCapture failed: ") +
+                cudaGetErrorString(err));
+        }
+        emit_pcg(A, b, x, max_iter, cuda_stream, contact,
+                 wide_contact, r_, p_, z_, Ap_, M_inv_, coeff_);
+        err = cudaStreamEndCapture(stream, &graph);
+        if (err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("PCGSolver::solve: cudaStreamEndCapture failed: ") +
+                cudaGetErrorString(err));
+        }
+        err = cudaGraphInstantiate(&graph_exec_, graph, nullptr, nullptr, 0);
+        cudaGraphDestroy(graph);
+        if (err != cudaSuccess) {
+            graph_exec_ = nullptr;
+            throw std::runtime_error(
+                std::string("PCGSolver::solve: cudaGraphInstantiate failed: ") +
+                cudaGetErrorString(err));
+        }
+        graph_n_ = n;
+        graph_max_iter_ = max_iter;
+    }
+
+    cudaError_t err = cudaGraphLaunch(graph_exec_, stream);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("PCGSolver::solve: cudaGraphLaunch failed: ") +
+            cudaGetErrorString(err));
+    }
     return max_iter;
 }
 

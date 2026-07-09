@@ -94,6 +94,9 @@ public:
                const PabdCudaParams& params = PabdCudaParams{});
     void set_params(const PabdCudaParams& params) { params_ = params; }
     const PabdCudaParams& params() const noexcept { return params_; }
+    void set_auto_download_positions(bool enabled) noexcept {
+        auto_download_positions_ = enabled;
+    }
     void step(float dt);
 
     int num_vertices() const noexcept { return num_vertices_; }
@@ -107,6 +110,12 @@ public:
 
     const std::vector<float>& flat_positions() const noexcept { return flat_positions_; }
     const std::vector<int>& flat_triangles() const noexcept { return flat_triangles_; }
+    const math::Vec3f* interpolated_surface_positions_device() const noexcept {
+        return interpolated_surface_positions_dev_.gpu_data();
+    }
+    const math::Vec3i* surface_triangles_device() const noexcept {
+        return surface_triangles_dev_.gpu_data();
+    }
 
     int last_pcg_iterations() const noexcept { return last_pcg_iterations_; }
     float last_residual() const noexcept { return last_residual_; }
@@ -142,11 +151,13 @@ private:
     void assemble_interpolated_system_gpu(float h);
     void update_surface_positions(const std::vector<math::Vec3f>& controls,
                                   std::vector<math::Vec3f>& surface) const;
-    void update_interpolated_surface_positions_gpu(const math::Vec3f* controls_dev);
+    void update_interpolated_surface_positions_gpu(const math::Vec3f* controls_dev,
+                                                   bool update_min_y = false);
     void detect_interpolated_contacts_gpu();
 
     PabdCudaParams params_{};
     bool initialized_ = false;
+    bool auto_download_positions_ = true;
 
     int num_vertices_ = 0;
     int num_surface_vertices_ = 0;
@@ -184,6 +195,7 @@ private:
     CudaArray<math::Vec3i> surface_triangles_dev_;
     CudaArray<math::Vec2i> surface_edges_dev_;
     CudaArray<math::Vec3f> interpolated_surface_positions_dev_;
+    CudaArray<float> interpolated_surface_min_y_dev_;
     CudaArray<collision::WideContact> interpolated_wide_contacts_;
     CudaArray<int> interpolated_wide_contact_count_;
     CudaArray<float> tet_mass_blocks_dev_;

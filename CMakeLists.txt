@@ -19,7 +19,7 @@ find_package(CUDAToolkit REQUIRED)
 # OptiX broadphase (optional, header-only SDK vendored in external/optix)
 # ====================================================================
 
-option(CHYSX_USE_OPTIX "Enable OptiX-based EF broadphase backend" OFF)
+option(CHYSX_USE_OPTIX "Enable OptiX-based EF broadphase backend" ON)
 
 if(CHYSX_USE_OPTIX)
     set(OPTIX_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/optix/include"
@@ -216,6 +216,7 @@ add_library(chysx_scenes STATIC
     scenes/pabd_cuda_scenes.cu
     scenes/yarn_scenes.cu
     src/rigid/avbd_cpu/avbd_gpu_renderer.cu
+    src/rigid/pabd_cuda/pabd_cuda_surface_renderer.cu
 )
 
 target_include_directories(chysx_scenes PUBLIC src src/io)

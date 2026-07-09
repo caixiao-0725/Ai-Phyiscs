@@ -20,6 +20,12 @@
 #include "../memory/cuda_array.h"
 #include "ef_broadphase.h"
 
+#ifdef CHYSX_HAS_OPTIX
+#include "optix/optix_ef_broadphase.h"
+#endif
+
+#include <memory>
+
 namespace chysx {
 namespace collision {
 
@@ -52,9 +58,10 @@ public:
     void setup(const std::vector<math::Vec3i>& triangles,
                const std::vector<int>& vertex_mesh_ids,
                int max_contacts = -1,
-               int max_ef_candidates = -1);
+               int max_ef_candidates = -1,
+               BroadphaseBackend backend = BroadphaseBackend::QuantBvh);
 
-    bool valid() const noexcept { return broadphase_.valid(); }
+    bool valid() const noexcept;
 
     // CPU convenience path: upload positions, then run the GPU detector.
     void detect(const math::Vec3f* positions_cpu,
@@ -73,8 +80,10 @@ public:
 
     int max_contacts() const noexcept { return max_contacts_; }
     int last_ef_count() const noexcept { return last_ef_count_; }
+    int max_ef_candidates() const noexcept { return max_ef_candidates_; }
+    BroadphaseBackend backend() const noexcept { return backend_; }
 
-    const MeshTopology& topology() const noexcept { return broadphase_.topology(); }
+    const MeshTopology& topology() const noexcept;
     const EFBroadphase& broadphase() const noexcept { return broadphase_; }
 
     const CudaArray<MeshMeshContact>& contacts() const noexcept { return contacts_; }
@@ -83,7 +92,11 @@ public:
     CudaArray<int>& count_array() noexcept { return count_; }
 
 private:
+    BroadphaseBackend backend_ = BroadphaseBackend::QuantBvh;
     EFBroadphase broadphase_;
+#ifdef CHYSX_HAS_OPTIX
+    std::unique_ptr<OptixEFBroadphase> optix_broadphase_;
+#endif
     CudaArray<int> vertex_mesh_ids_;
     CudaArray<MeshMeshContact> contacts_;
     CudaArray<int> count_;
@@ -91,6 +104,7 @@ private:
 
     int n_verts_ = 0;
     int max_contacts_ = 0;
+    int max_ef_candidates_ = 0;
     int last_ef_count_ = 0;
 };
 

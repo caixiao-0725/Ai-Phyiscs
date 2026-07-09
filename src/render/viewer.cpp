@@ -34,6 +34,7 @@ Viewer::Viewer(const ViewerConfig& cfg)
     : cfg_(cfg), win_w_(cfg.width), win_h_(cfg.height) {}
 
 Viewer::~Viewer() {
+    scene_.reset();
     shutdown_sdl();
 }
 

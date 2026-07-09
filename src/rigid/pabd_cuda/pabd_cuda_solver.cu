@@ -138,7 +138,8 @@ __global__ void update_interpolated_surface_positions_kernel(
     const PabdSurfaceMapDevice* maps,
     int n,
     const math::Vec3f* controls,
-    math::Vec3f* surface_positions) {
+    math::Vec3f* surface_positions,
+    float* min_y) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
 
@@ -152,6 +153,15 @@ __global__ void update_interpolated_surface_positions_kernel(
         }
     }
     surface_positions[i] = p;
+    if (min_y != nullptr) {
+        int* min_bits = reinterpret_cast<int*>(min_y);
+        int old = *min_bits;
+        while (p.y < __int_as_float(old)) {
+            const int assumed = old;
+            old = atomicCAS(min_bits, assumed, __float_as_int(p.y));
+            if (old == assumed) break;
+        }
+    }
 }
 
 __global__ void assemble_interpolated_mass_elastic_kernel(
@@ -602,6 +612,9 @@ void PabdCudaSolver::setup(const PabdCudaMesh& mesh,
 
     pcg_.initialize(num_vertices_);
     initialized_ = true;
+    if (interpolated_surface_) {
+        update_interpolated_surface_positions_gpu(x_.gpu_data(), true);
+    }
     update_host_positions();
 }
 
@@ -844,6 +857,8 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
 
         interpolated_surface_positions_dev_.resize(
             static_cast<std::size_t>(num_surface_vertices_));
+        interpolated_surface_min_y_dev_.resize(1);
+        interpolated_surface_min_y_dev_[0] = 0.0f;
         interpolated_debug_counts_.resize(5);
         for (int i = 0; i < 5; ++i) {
             interpolated_debug_counts_[i] = 0;
@@ -867,14 +882,21 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
         const int max_ef_candidates = std::max(
             interpolated_contact_capacity_,
             static_cast<int>(surface_edges_.size()) * 64);
+        const collision::BroadphaseBackend self_backend =
+#ifdef CHYSX_HAS_OPTIX
+            collision::BroadphaseBackend::OptiX;
+#else
+            collision::BroadphaseBackend::QuantBvh;
+#endif
         mesh_mesh_contact_detector_.setup(
             tri_vec, vertex_body_ids, interpolated_contact_capacity_,
-            max_ef_candidates);
+            max_ef_candidates, self_backend);
     } else {
         surface_maps_dev_.clear();
         surface_triangles_dev_.clear();
         surface_edges_dev_.clear();
         interpolated_surface_positions_dev_.clear();
+        interpolated_surface_min_y_dev_.clear();
         interpolated_debug_counts_.clear();
         interpolated_normal_sum_.clear();
         interpolated_wide_contacts_.clear();
@@ -902,6 +924,7 @@ void PabdCudaSolver::upload_static_data() {
         surface_triangles_dev_.copy_to_device(s);
         surface_edges_dev_.copy_to_device(s);
         interpolated_surface_positions_dev_.copy_to_device(s);
+        interpolated_surface_min_y_dev_.copy_to_device(s);
         interpolated_wide_contacts_.copy_to_device(s);
         interpolated_wide_contact_count_.copy_to_device(s);
         tet_mass_blocks_dev_.copy_to_device(s);
@@ -929,7 +952,8 @@ void PabdCudaSolver::update_surface_positions(
 }
 
 void PabdCudaSolver::update_interpolated_surface_positions_gpu(
-    const math::Vec3f* controls_dev) {
+    const math::Vec3f* controls_dev,
+    bool update_min_y) {
     if (!interpolated_surface_ || num_surface_vertices_ <= 0 ||
         controls_dev == nullptr) {
         return;
@@ -938,11 +962,18 @@ void PabdCudaSolver::update_interpolated_surface_positions_gpu(
     auto* stream = reinterpret_cast<cudaStream_t>(stream_);
     constexpr int block = 128;
     const int grid = (num_surface_vertices_ + block - 1) / block;
+    float* min_y_dev = nullptr;
+    if (update_min_y && interpolated_surface_min_y_dev_.gpu_size() > 0) {
+        interpolated_surface_min_y_dev_[0] = 3.402823466e38f;
+        interpolated_surface_min_y_dev_.copy_to_device(stream_handle(stream_));
+        min_y_dev = interpolated_surface_min_y_dev_.gpu_data();
+    }
     update_interpolated_surface_positions_kernel<<<grid, block, 0, stream>>>(
         surface_maps_dev_.gpu_data(),
         num_surface_vertices_,
         controls_dev,
-        interpolated_surface_positions_dev_.gpu_data());
+        interpolated_surface_positions_dev_.gpu_data(),
+        min_y_dev);
     check_cuda(cudaGetLastError(),
                "update_interpolated_surface_positions_kernel");
 }
@@ -966,7 +997,7 @@ void PabdCudaSolver::detect_interpolated_contacts_gpu() {
         params_.self_collision_thickness, s);
     last_self_broadphase_pairs_ = mesh_mesh_contact_detector_.last_ef_count();
     last_self_broadphase_capacity_ =
-        mesh_mesh_contact_detector_.broadphase().max_ef_candidates();
+        mesh_mesh_contact_detector_.max_ef_candidates();
     last_self_broadphase_overflow_ =
         last_self_broadphase_capacity_ > 0 &&
         last_self_broadphase_pairs_ >= last_self_broadphase_capacity_;
@@ -1133,17 +1164,23 @@ void PabdCudaSolver::step_interpolated(float dt) {
         check_cuda(cudaGetLastError(), "interpolated update_velocity_kernel");
     }
 
+    update_interpolated_surface_positions_gpu(x_.gpu_data(), true);
+
     last_residual_ = pcg_.last_residual();
     ground_contacts_.copy_to_host(stream_handle(stream_));
     interpolated_debug_counts_.copy_to_host(stream_handle(stream_));
     interpolated_normal_sum_.copy_to_host(stream_handle(stream_));
+    interpolated_surface_min_y_dev_.copy_to_host(stream_handle(stream_));
     if (mesh_mesh_contact_detector_.valid() && interpolated_contact_capacity_ > 0) {
         mesh_mesh_contact_detector_.count_array().copy_to_host(
             stream_handle(stream_));
     }
-    x_.copy_to_host(stream_handle(stream_));
+    if (auto_download_positions_) {
+        x_.copy_to_host(stream_handle(stream_));
+    }
     check_cuda(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_)),
                "step_interpolated final sync");
+    min_y_ = interpolated_surface_min_y_dev_.cpu_data()[0];
     last_ground_contacts_ = ground_contacts_.cpu_data()[0];
     last_self_contacts_ = interpolated_debug_counts_.cpu_data()[0];
     last_self_vertical_contacts_ = interpolated_debug_counts_.cpu_data()[1];
@@ -1166,7 +1203,9 @@ void PabdCudaSolver::step_interpolated(float dt) {
                          interpolated_contact_capacity_);
         }
     }
-    update_host_positions(true);
+    if (auto_download_positions_) {
+        update_host_positions(true);
+    }
 }
 
 void PabdCudaSolver::step(float dt) {

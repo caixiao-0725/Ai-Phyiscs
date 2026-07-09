@@ -157,7 +157,8 @@ private:
 
     // CUDA Graph cache.  Captured on the caller's non-default stream on
     // the first solve and replayed on subsequent calls.  Invalidated
-    // when the problem size (`n`) or iteration count changes.
+    // when the workspace is reinitialized, or when the problem size
+    // (`n`) or iteration count changes.
     CUgraphExec_st* graph_exec_ = nullptr;
     int graph_n_ = 0;
     int graph_max_iter_ = 0;

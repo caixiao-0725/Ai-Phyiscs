@@ -392,17 +392,36 @@ void MeshMeshContactDetector::setup(
     const std::vector<math::Vec3i>& triangles,
     const std::vector<int>& vertex_mesh_ids,
     int max_contacts,
-    int max_ef_candidates)
+    int max_ef_candidates,
+    BroadphaseBackend backend)
 {
     n_verts_ = static_cast<int>(vertex_mesh_ids.size());
     if (n_verts_ <= 0 || triangles.empty()) {
         throw std::runtime_error("MeshMeshContactDetector::setup needs vertices and triangles");
     }
 
-    broadphase_.setup(triangles, n_verts_, max_ef_candidates);
+    backend_ = backend;
+    if (backend_ == BroadphaseBackend::QuantBvh) {
+        broadphase_.setup(triangles, n_verts_, max_ef_candidates);
+        max_ef_candidates_ = broadphase_.max_ef_candidates();
+    }
+#ifdef CHYSX_HAS_OPTIX
+    else if (backend_ == BroadphaseBackend::OptiX) {
+        const int hits_per_edge = 64;
+        optix_broadphase_ = std::make_unique<OptixEFBroadphase>();
+        optix_broadphase_->setup(triangles, n_verts_, hits_per_edge);
+        max_ef_candidates_ = optix_broadphase_->max_ef_candidates();
+    }
+#else
+    else if (backend_ == BroadphaseBackend::OptiX) {
+        throw std::runtime_error(
+            "MeshMeshContactDetector::setup: OptiX backend requested but "
+            "CHYSX_HAS_OPTIX is not enabled");
+    }
+#endif
 
     if (max_contacts <= 0) {
-        max_contacts = std::max(1024, 8 * broadphase_.topology().n_edges());
+        max_contacts = std::max(1024, 8 * topology().n_edges());
     }
     max_contacts_ = max_contacts;
 
@@ -417,6 +436,27 @@ void MeshMeshContactDetector::setup(
     upload_positions_.resize(static_cast<std::size_t>(n_verts_));
     count_.cpu_data()[0] = 0;
     count_.copy_to_device();
+}
+
+bool MeshMeshContactDetector::valid() const noexcept {
+    if (backend_ == BroadphaseBackend::QuantBvh) {
+        return broadphase_.valid();
+    }
+#ifdef CHYSX_HAS_OPTIX
+    if (backend_ == BroadphaseBackend::OptiX) {
+        return optix_broadphase_ && optix_broadphase_->valid();
+    }
+#endif
+    return false;
+}
+
+const MeshTopology& MeshMeshContactDetector::topology() const noexcept {
+#ifdef CHYSX_HAS_OPTIX
+    if (backend_ == BroadphaseBackend::OptiX && optix_broadphase_) {
+        return optix_broadphase_->topology();
+    }
+#endif
+    return broadphase_.topology();
 }
 
 void MeshMeshContactDetector::detect(
@@ -445,15 +485,26 @@ void MeshMeshContactDetector::detect_gpu(
     zero_count_kernel<<<1, 1, 0, stream>>>(count_.gpu_data());
     check_cuda(cudaGetLastError(), "mesh_mesh zero_count_kernel");
 
-    broadphase_.query(positions_dev, thickness, cuda_stream);
-    last_ef_count_ = broadphase_.ef_count(cuda_stream);
+    const math::Vec2i* ef_pairs_dev = nullptr;
+    if (backend_ == BroadphaseBackend::QuantBvh) {
+        broadphase_.query(positions_dev, thickness, cuda_stream);
+        last_ef_count_ = broadphase_.ef_count(cuda_stream);
+        ef_pairs_dev = broadphase_.ef_pairs_dev();
+    }
+#ifdef CHYSX_HAS_OPTIX
+    else if (backend_ == BroadphaseBackend::OptiX && optix_broadphase_) {
+        optix_broadphase_->query(positions_dev, thickness, cuda_stream);
+        last_ef_count_ = optix_broadphase_->ef_count(cuda_stream);
+        ef_pairs_dev = optix_broadphase_->ef_pairs_dev();
+    }
+#endif
 
-    const auto& topo = broadphase_.topology();
+    const auto& topo = topology();
     const int block = 256;
-    if (last_ef_count_ > 0) {
+    if (last_ef_count_ > 0 && ef_pairs_dev != nullptr) {
         int grid = (last_ef_count_ + block - 1) / block;
         ef_to_mesh_mesh_contacts_kernel<<<grid, block, 0, stream>>>(
-            broadphase_.ef_pairs_dev(),
+            ef_pairs_dev,
             last_ef_count_,
             positions_dev,
             topo.faces().gpu_data(),

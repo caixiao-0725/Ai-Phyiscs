@@ -22,6 +22,11 @@
 namespace chysx {
 namespace collision {
 
+enum class BroadphaseBackend {
+    QuantBvh,
+    OptiX
+};
+
 class EFBroadphase {
 public:
     EFBroadphase() = default;

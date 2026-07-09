@@ -36,11 +36,6 @@
 namespace chysx {
 namespace collision {
 
-enum class BroadphaseBackend {
-    QuantBvh,   // default: ChysX native stackless LBVH
-    OptiX       // NVIDIA OptiX ray-tracing broadphase
-};
-
 // Per-contact output: 4 vertex indices + normal + signed distance.
 //
 // VF (point-triangle): v[0] = point, v[1..3] = triangle vertices

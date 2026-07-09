@@ -20,12 +20,14 @@
 #include "io/obj_io.h"
 #include "render/scene.h"
 #include "rigid/pabd_cuda/pabd_cuda_solver.h"
+#include "rigid/pabd_cuda/pabd_cuda_surface_renderer.h"
 
 namespace {
 
 using chysx::rigid::pabd_cuda::PabdCudaMesh;
 using chysx::rigid::pabd_cuda::PabdCudaParams;
 using chysx::rigid::pabd_cuda::PabdCudaSolver;
+using chysx::rigid::pabd_cuda::PabdCudaSurfaceRenderer;
 using chysx::rigid::pabd_cuda::PabdSurfaceMap;
 using chysx::rigid::pabd_cuda::kDefaultStackCount;
 using chysx::rigid::pabd_cuda::kHexBlockSurfaceTris;
@@ -514,6 +516,9 @@ public:
 
     void draw_meshes(std::vector<chysx::render::DrawMesh>& out) override {
         if (!solver_) return;
+        if (gpu_surface_render_enabled()) {
+            return;
+        }
         if (kind_ == PabdSceneKind::PdAbdBoxes) {
             const int num_bodies = stack_count_;
             for (int body = 0; body < num_bodies; ++body) {
@@ -599,6 +604,24 @@ public:
             color_[0], color_[1], color_[2],
             false
         });
+    }
+
+    void draw_custom() override {
+        if (!solver_ || !gpu_surface_render_enabled()) return;
+        if (!gpu_renderer_) {
+            gpu_renderer_ = std::make_unique<PabdCudaSurfaceRenderer>();
+        }
+        gpu_renderer_->update(
+            solver_->interpolated_surface_positions_device(),
+            solver_->surface_triangles_device(),
+            solver_->num_surface_triangles());
+
+        glEnable(GL_LIGHTING);
+        glEnable(GL_LIGHT0);
+        glEnable(GL_COLOR_MATERIAL);
+        glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+        gpu_renderer_->draw(color_[0], color_[1], color_[2]);
+        glDisable(GL_LIGHTING);
     }
 
     bool metrics(chysx::render::SceneMetrics& out) override {
@@ -710,11 +733,27 @@ private:
     PabdSceneKind kind_;
     PabdCudaParams params_{};
     std::unique_ptr<PabdCudaSolver> solver_;
+    std::unique_ptr<PabdCudaSurfaceRenderer> gpu_renderer_;
     float color_[3] = {0.72f, 0.52f, 0.96f};
     int stack_count_ = kDefaultStackCount;
     int initial_box_count_ = kPdAbdDefaultBoxCount;
     float initial_box_lift_ = 0.0f;
     int frame_index_ = 0;
+    bool headless_ = false;
+
+    void set_headless(bool headless) override {
+        headless_ = headless;
+        if (solver_) {
+            solver_->set_auto_download_positions(!gpu_surface_render_enabled());
+        }
+    }
+
+    bool gpu_surface_render_enabled() const {
+        return !headless_ &&
+               (kind_ == PabdSceneKind::PdAbdBoxes ||
+                kind_ == PabdSceneKind::TetraEECross ||
+                is_rigid_ipc_link_scene(kind_));
+    }
 
     void rebuild_simulation() {
         if (kind_ == PabdSceneKind::StackedBlocks) {
@@ -737,7 +776,11 @@ private:
             params_.self_collision_max_contacts =
                 topology_scaled_contact_capacity(mesh, 4096);
         }
+        solver_->set_auto_download_positions(!gpu_surface_render_enabled());
         solver_->setup(mesh, params_);
+        if (gpu_renderer_) {
+            gpu_renderer_->reset();
+        }
         frame_index_ = 0;
         if (kind_ == PabdSceneKind::PdAbdBoxes ||
             kind_ == PabdSceneKind::TetraEECross ||
@@ -763,10 +806,6 @@ private:
     }
 
     void print_pd_abd_stats() const {
-        const float* positions = solver_->flat_positions().data();
-        const int* triangles = solver_->flat_triangles().data();
-        float global_min_y = std::numeric_limits<float>::max();
-        float global_max_y = -std::numeric_limits<float>::max();
         const auto ns = solver_->last_self_normal_sum();
         std::printf("[PABD_DBG frame=%d] ground=%d self=%d raw=%d cap=%d overflow=%d pf=%d ee=%d bpairs=%d bcap=%d boverflow=%d vertical=%d horizontal=%d nsum=(%.3f,%.3f,%.3f) minY=%.5f residual=%.3e\n",
                     frame_index_, solver_->last_ground_contacts(),
@@ -783,6 +822,17 @@ private:
                     solver_->last_self_horizontal_contacts(),
                     ns.x, ns.y, ns.z, solver_->min_y(),
                     solver_->last_residual());
+        if (gpu_surface_render_enabled()) {
+            std::printf("[PABD_DBG frame=%d summary] gpuSurfaceMinY=%.5f surfaceVerts=%d surfaceTris=%d\n",
+                        frame_index_, solver_->min_y(),
+                        solver_->num_surface_vertices(),
+                        solver_->num_surface_triangles());
+            return;
+        }
+        const float* positions = solver_->flat_positions().data();
+        const int* triangles = solver_->flat_triangles().data();
+        float global_min_y = std::numeric_limits<float>::max();
+        float global_max_y = -std::numeric_limits<float>::max();
         if (is_rigid_ipc_link_scene(kind_)) {
             const char* label = kind_ == PabdSceneKind::RigidIpcVerticalChain
                 ? "verticalChain"
