@@ -26,7 +26,47 @@ inline void check_cuda(cudaError_t err, const char* what) {
 }
 
 constexpr int kBlockDim = 256;
+constexpr int kCountDrivenBlocksPerSm = 4;
+constexpr int kWideContactGroupSize = 8;
+static_assert(sizeof(math::Vec3f) == 3 * sizeof(float),
+              "float4 contact atomics require tightly packed Vec3f");
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define CHYSX_USE_FLOAT4_ATOMIC_ADD 1
+#else
+#define CHYSX_USE_FLOAT4_ATOMIC_ADD 0
+#endif
+
+inline int count_driven_max_blocks() {
+    static const int max_blocks = [] {
+        int device = 0;
+        int sm_count = 0;
+        check_cuda(cudaGetDevice(&device), "query current CUDA device");
+        check_cuda(cudaDeviceGetAttribute(&sm_count,
+                                          cudaDevAttrMultiProcessorCount,
+                                          device),
+                   "query CUDA SM count");
+        const int blocks = sm_count * kCountDrivenBlocksPerSm;
+        return blocks > 0 ? blocks : 1;
+    }();
+    return max_blocks;
+}
+
 inline int grid_for(int n) { return (n + kBlockDim - 1) / kBlockDim; }
+inline int bounded_count_grid_for(int n) {
+    // Keep launch size independent of large reserved contact capacities.
+    const int grid = grid_for(n > 0 ? n : 1);
+    const int max_blocks = count_driven_max_blocks();
+    return grid < max_blocks ? grid : max_blocks;
+}
+
+inline int bounded_wide_contact_grid_for(int n) {
+    constexpr int kContactsPerBlock = kBlockDim / kWideContactGroupSize;
+    const int count = n > 0 ? n : 1;
+    const int grid = (count + kContactsPerBlock - 1) / kContactsPerBlock;
+    const int max_blocks = count_driven_max_blocks();
+    return grid < max_blocks ? grid : max_blocks;
+}
 
 // One thread per contact; each thread does up to 4 atomicAdd-mat3
 // updates into `diag_blocks`.  Mirrors cuda-cloth's
@@ -206,48 +246,55 @@ __global__ void bake_wide_contact_diag_kernel(
     int max_contacts,
     float k_alpha,
     math::Mat3f* __restrict__ diag_blocks) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
     const int n_raw = *count_ptr;
     const int n = (n_raw < max_contacts) ? n_raw : max_contacts;
-    if (c >= n) return;
+    const int stride = blockDim.x * gridDim.x;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x;
+         c < n; c += stride) {
+        const WideContact wc = contacts[c];
+        const float k = k_alpha * wc.stiffness;
+        if (k == 0.0f) continue;
+        const int ids[8] = {
+            wc.base0 >= 0 ? wc.base0 + 0 : -1,
+            wc.base0 >= 0 ? wc.base0 + 1 : -1,
+            wc.base0 >= 0 ? wc.base0 + 2 : -1,
+            wc.base0 >= 0 ? wc.base0 + 3 : -1,
+            wc.base1 >= 0 ? wc.base1 + 0 : -1,
+            wc.base1 >= 0 ? wc.base1 + 1 : -1,
+            wc.base1 >= 0 ? wc.base1 + 2 : -1,
+            wc.base1 >= 0 ? wc.base1 + 3 : -1,
+        };
+        const float ws[8] = {
+            wc.weights0.x, wc.weights0.y, wc.weights0.z, wc.weights0.w,
+            wc.weights1.x, wc.weights1.y, wc.weights1.z, wc.weights1.w,
+        };
+        const float nx = wc.normal_target.x;
+        const float ny = wc.normal_target.y;
+        const float nz = wc.normal_target.z;
+        const float h00 = k * nx * nx;
+        const float h01 = k * nx * ny;
+        const float h02 = k * nx * nz;
+        const float h11 = k * ny * ny;
+        const float h12 = k * ny * nz;
+        const float h22 = k * nz * nz;
 
-    const WideContact wc = contacts[c];
-    const float k = k_alpha * wc.stiffness;
-    if (k == 0.0f) return;
-    const int ids[8] = {
-        wc.ids0.x, wc.ids0.y, wc.ids0.z, wc.ids0.w,
-        wc.ids1.x, wc.ids1.y, wc.ids1.z, wc.ids1.w,
-    };
-    const float ws[8] = {
-        wc.weights0.x, wc.weights0.y, wc.weights0.z, wc.weights0.w,
-        wc.weights1.x, wc.weights1.y, wc.weights1.z, wc.weights1.w,
-    };
-    const float nx = wc.normal_target.x;
-    const float ny = wc.normal_target.y;
-    const float nz = wc.normal_target.z;
-    const float h00 = k * nx * nx;
-    const float h01 = k * nx * ny;
-    const float h02 = k * nx * nz;
-    const float h11 = k * ny * ny;
-    const float h12 = k * ny * nz;
-    const float h22 = k * nz * nz;
-
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int id = ids[i];
-        const float wi = ws[i];
-        if (id < 0 || wi == 0.0f) continue;
-        const float ww = wi * wi;
-        float* dst = diag_blocks[id].data;
-        atomicAdd(&dst[0], ww * h00);
-        atomicAdd(&dst[1], ww * h01);
-        atomicAdd(&dst[2], ww * h02);
-        atomicAdd(&dst[3], ww * h01);
-        atomicAdd(&dst[4], ww * h11);
-        atomicAdd(&dst[5], ww * h12);
-        atomicAdd(&dst[6], ww * h02);
-        atomicAdd(&dst[7], ww * h12);
-        atomicAdd(&dst[8], ww * h22);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int id = ids[i];
+            const float wi = ws[i];
+            if (id < 0 || wi == 0.0f) continue;
+            const float ww = wi * wi;
+            float* dst = diag_blocks[id].data;
+            atomicAdd(&dst[0], ww * h00);
+            atomicAdd(&dst[1], ww * h01);
+            atomicAdd(&dst[2], ww * h02);
+            atomicAdd(&dst[3], ww * h01);
+            atomicAdd(&dst[4], ww * h11);
+            atomicAdd(&dst[5], ww * h12);
+            atomicAdd(&dst[6], ww * h02);
+            atomicAdd(&dst[7], ww * h12);
+            atomicAdd(&dst[8], ww * h22);
+        }
     }
 }
 
@@ -258,49 +305,132 @@ __global__ void apply_wide_contact_spmv_kernel(
     float k_alpha,
     const math::Vec3f* __restrict__ x,
     math::Vec3f* __restrict__ y) {
-    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    static_assert(kBlockDim % kWideContactGroupSize == 0,
+                  "wide contact groups must tile a block");
+    constexpr int kGroupsPerBlock = kBlockDim / kWideContactGroupSize;
+    const int lane = threadIdx.x & (kWideContactGroupSize - 1);
+    const int group_in_block = threadIdx.x / kWideContactGroupSize;
+    const int group = blockIdx.x * kGroupsPerBlock + group_in_block;
+    const int group_stride = gridDim.x * kGroupsPerBlock;
+    const int warp_lane = threadIdx.x & 31;
+    const unsigned group_mask =
+        0xffu << (warp_lane & ~(kWideContactGroupSize - 1));
+
     const int n_raw = *count_ptr;
     const int n = (n_raw < max_contacts) ? n_raw : max_contacts;
-    if (c >= n) return;
-
-    const WideContact wc = contacts[c];
-    const float k = k_alpha * wc.stiffness;
-    if (k == 0.0f) return;
-    const int ids[8] = {
-        wc.ids0.x, wc.ids0.y, wc.ids0.z, wc.ids0.w,
-        wc.ids1.x, wc.ids1.y, wc.ids1.z, wc.ids1.w,
-    };
-    const float ws[8] = {
-        wc.weights0.x, wc.weights0.y, wc.weights0.z, wc.weights0.w,
-        wc.weights1.x, wc.weights1.y, wc.weights1.z, wc.weights1.w,
-    };
-    const math::Vec3f normal(wc.normal_target.x,
-                             wc.normal_target.y,
-                             wc.normal_target.z);
-
-    math::Vec3f xs[8];
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        xs[i] = ids[i] >= 0 ? x[ids[i]] : math::Vec3f(0.0f, 0.0f, 0.0f);
-    }
-
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int id_i = ids[i];
-        const float wi = ws[i];
-        if (id_i < 0 || wi == 0.0f) continue;
-        math::Vec3f temp(0.0f, 0.0f, 0.0f);
-        #pragma unroll
-        for (int j = 0; j < 8; ++j) {
-            if (j == i) continue;
-            const float wj = ws[j];
-            if (ids[j] < 0 || wj == 0.0f) continue;
-            temp += xs[j] * wj;
+    for (int c = group; c < n; c += group_stride) {
+        const WideContact& wc = contacts[c];
+        int base0 = -1;
+        int base1 = -1;
+        float nx = 0.0f;
+        float ny = 0.0f;
+        float nz = 0.0f;
+        float k = 0.0f;
+        if (lane == 0) {
+            base0 = wc.base0;
+            base1 = wc.base1;
+            nx = wc.normal_target.x;
+            ny = wc.normal_target.y;
+            nz = wc.normal_target.z;
+            k = k_alpha * wc.stiffness;
         }
-        const float dn = math::dot(normal, temp);
-        atomicAdd(&y[id_i].x, wi * k * dn * normal.x);
-        atomicAdd(&y[id_i].y, wi * k * dn * normal.y);
-        atomicAdd(&y[id_i].z, wi * k * dn * normal.z);
+        base0 = __shfl_sync(group_mask, base0, 0, kWideContactGroupSize);
+        base1 = __shfl_sync(group_mask, base1, 0, kWideContactGroupSize);
+        nx = __shfl_sync(group_mask, nx, 0, kWideContactGroupSize);
+        ny = __shfl_sync(group_mask, ny, 0, kWideContactGroupSize);
+        nz = __shfl_sync(group_mask, nz, 0, kWideContactGroupSize);
+        k = __shfl_sync(group_mask, k, 0, kWideContactGroupSize);
+        if (k == 0.0f) continue;
+
+        const bool first_side = lane < 4;
+        const int local = first_side ? lane : lane - 4;
+        const int base = first_side ? base0 : base1;
+        const int id = base >= 0 ? base + local : -1;
+        const float wi = first_side ? wc.weights0[local] : wc.weights1[local];
+        const math::Vec3f xi = id >= 0
+            ? x[id]
+            : math::Vec3f(0.0f, 0.0f, 0.0f);
+        const float projection = nx * xi.x + ny * xi.y + nz * xi.z;
+        float weighted_projection = wi * projection;
+
+        #pragma unroll
+        for (int offset = kWideContactGroupSize / 2;
+             offset > 0; offset >>= 1) {
+            weighted_projection += __shfl_down_sync(
+                group_mask, weighted_projection, offset,
+                kWideContactGroupSize);
+        }
+        const float normal_weighted_x = __shfl_sync(
+            group_mask, weighted_projection, 0, kWideContactGroupSize);
+        float cx = 0.0f;
+        float cy = 0.0f;
+        float cz = 0.0f;
+        if (id >= 0 && wi != 0.0f) {
+            // The diagonal wi^2 block is already in A.diag.  Subtract it
+            // from the rank-one contact action to retain only off-diagonals.
+            const float offdiag_projection =
+                normal_weighted_x - wi * projection;
+            const float scale = wi * k * offdiag_projection;
+            cx = scale * nx;
+            cy = scale * ny;
+            cz = scale * nz;
+        }
+
+#if CHYSX_USE_FLOAT4_ATOMIC_ADD
+        // Four consecutive ABD controls occupy 12 tightly packed floats.
+        // Repack them into three aligned float4 chunks:
+        // [p0.xyz p1.x], [p1.yz p2.xy], [p2.z p3.xyz].
+        const int side_lane0 = first_side ? 0 : 4;
+        const float c0x = __shfl_sync(
+            group_mask, cx, side_lane0 + 0, kWideContactGroupSize);
+        const float c0y = __shfl_sync(
+            group_mask, cy, side_lane0 + 0, kWideContactGroupSize);
+        const float c0z = __shfl_sync(
+            group_mask, cz, side_lane0 + 0, kWideContactGroupSize);
+        const float c1x = __shfl_sync(
+            group_mask, cx, side_lane0 + 1, kWideContactGroupSize);
+        const float c1y = __shfl_sync(
+            group_mask, cy, side_lane0 + 1, kWideContactGroupSize);
+        const float c1z = __shfl_sync(
+            group_mask, cz, side_lane0 + 1, kWideContactGroupSize);
+        const float c2x = __shfl_sync(
+            group_mask, cx, side_lane0 + 2, kWideContactGroupSize);
+        const float c2y = __shfl_sync(
+            group_mask, cy, side_lane0 + 2, kWideContactGroupSize);
+        const float c2z = __shfl_sync(
+            group_mask, cz, side_lane0 + 2, kWideContactGroupSize);
+        const float c3x = __shfl_sync(
+            group_mask, cx, side_lane0 + 3, kWideContactGroupSize);
+        const float c3y = __shfl_sync(
+            group_mask, cy, side_lane0 + 3, kWideContactGroupSize);
+        const float c3z = __shfl_sync(
+            group_mask, cz, side_lane0 + 3, kWideContactGroupSize);
+
+        if (base >= 0 && (base & 3) == 0 && local < 3) {
+            float4 packed;
+            if (local == 0) {
+                packed = make_float4(c0x, c0y, c0z, c1x);
+            } else if (local == 1) {
+                packed = make_float4(c1y, c1z, c2x, c2y);
+            } else {
+                packed = make_float4(c2z, c3x, c3y, c3z);
+            }
+            float4* body = reinterpret_cast<float4*>(&y[base]);
+            atomicAdd(&body[local], packed);
+        } else if (base >= 0 && (base & 3) != 0 && id >= 0) {
+            // WideContact normally guarantees a four-control-aligned base.
+            // Retain a safe scalar path for malformed/custom operators.
+            atomicAdd(&y[id].x, cx);
+            atomicAdd(&y[id].y, cy);
+            atomicAdd(&y[id].z, cz);
+        }
+#else
+        if (id >= 0) {
+            atomicAdd(&y[id].x, cx);
+            atomicAdd(&y[id].y, cy);
+            atomicAdd(&y[id].z, cz);
+        }
+#endif
     }
 }
 
@@ -378,7 +508,8 @@ void bake_wide_contact_diag(math::Mat3f* diag_blocks,
 
     const int launch_size = (op.max_contacts > 0) ? op.max_contacts : 1;
     const int* count_ptr = op.count_dev ? op.count_dev : zero_count_ptr();
-    bake_wide_contact_diag_kernel<<<grid_for(launch_size), kBlockDim, 0, stream>>>(
+    bake_wide_contact_diag_kernel<<<
+        bounded_count_grid_for(launch_size), kBlockDim, 0, stream>>>(
         op.contacts,
         count_ptr,
         op.max_contacts,
@@ -397,7 +528,8 @@ void apply_wide_contact_spmv(const WideContactSpMVOp& op,
 
     const int launch_size = (op.max_contacts > 0) ? op.max_contacts : 1;
     const int* count_ptr = op.count_dev ? op.count_dev : zero_count_ptr();
-    apply_wide_contact_spmv_kernel<<<grid_for(launch_size), kBlockDim, 0, stream>>>(
+    apply_wide_contact_spmv_kernel<<<
+        bounded_wide_contact_grid_for(launch_size), kBlockDim, 0, stream>>>(
         op.contacts,
         count_ptr,
         op.max_contacts,

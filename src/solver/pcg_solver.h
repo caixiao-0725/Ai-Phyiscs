@@ -12,12 +12,10 @@
 //
 // Preconditioner
 // --------------
-// The solver uses a block-Jacobi preconditioner: M = block_diag(A) and
-// M^-1 is the matrix that contains the inverse 3x3 of every diagonal
-// block of A.  Because `BlockCSR3` already stores the diagonal as a
-// dedicated `A.diag` array (separate from the off-diagonal CSR), no
-// extraction pass is needed — the solver just inverts each `A.diag[i]`
-// at the start of every solve.
+// By default the solver uses the inverse 3x3 diagonal blocks from
+// `BlockCSR3::diag`. Callers whose unknowns form four-Vec3 rigid-body groups
+// may instead provide packed 12x12 Cholesky factors through
+// `BodyBlock12PreconditionerOp`; this changes only M^-1, not A or its SpMV.
 //
 // Algorithm
 // ---------
@@ -77,6 +75,26 @@ namespace solver {
 
 struct PCGParams {
     int max_iterations = 50;
+    bool compute_true_residual = false;
+};
+
+constexpr int kBodyBlock12Dofs = 12;
+constexpr int kBodyBlock12PackedLowerSize =
+    kBodyBlock12Dofs * (kBodyBlock12Dofs + 1) / 2;
+
+// Optional four-Vec3 (12 scalar DoF) block preconditioner. `lower_factors`
+// stores one packed lower-triangular Cholesky factor per body, while
+// `body_rows` maps the body's four local controls to BlockCSR rows.
+struct BodyBlock12PreconditionerOp {
+    const float* lower_factors = nullptr;
+    const math::Vec4i* body_rows = nullptr;
+    const unsigned char* fixed_rows = nullptr;
+    int num_bodies = 0;
+
+    bool active() const noexcept {
+        return lower_factors != nullptr && body_rows != nullptr &&
+               num_bodies > 0;
+    }
 };
 
 class PCGSolver {
@@ -97,9 +115,8 @@ public:
 
     // Solve A x = b in place.
     //
-    //   A : block-CSR matrix.  `A.diag` (per-particle 3x3 diagonal
-    //       block) is read every solve and inverted on the fly to
-    //       produce the block-Jacobi preconditioner.
+    //   A : block-CSR matrix. `A.diag` supplies the default per-row 3x3
+    //       preconditioner when no body preconditioner is provided.
     //   b : right-hand side, length = A.num_block_rows().
     //   x : solution buffer, length = A.num_block_rows().  Used as
     //       the initial guess on entry and overwritten with the
@@ -121,6 +138,9 @@ public:
     // identical regardless of whether contacts exist — this keeps
     // a surrounding CUDA Graph capture valid across frames.
     //
+    // `body_preconditioner` optionally replaces pointwise 3x3 Jacobi with
+    // one packed 12x12 triangular solve per four-row rigid-body group.
+    //
     // Returns the number of iterations actually performed.
     int solve(const sparse::BlockCSR3& A,
               DeviceSpan<math::Vec3f> b,
@@ -128,12 +148,20 @@ public:
               const PCGParams& params = PCGParams{},
               std::uintptr_t cuda_stream = 0,
               collision::ContactSpMVOp contact = {},
-              collision::WideContactSpMVOp wide_contact = {});
+              collision::WideContactSpMVOp wide_contact = {},
+              BodyBlock12PreconditionerOp body_preconditioner = {});
 
     // Last solve's preconditioner-weighted residual <r, z> from the
     // final iteration, copied to host on demand.  Useful for cheap
     // convergence checks outside the main loop.
     float last_residual();
+
+    // Queue the residual copy on an existing stream so callers that already
+    // have a frame-end synchronization can avoid an extra wait.  The host
+    // value is valid after that stream has completed.
+    void copy_last_residual_to_host(std::uintptr_t cuda_stream);
+    float host_last_residual() const noexcept;
+    float host_last_true_relative_residual() const noexcept;
 
 private:
     void destroy_graph() noexcept;
@@ -152,8 +180,14 @@ private:
     //   coeff_[0] = <r, z>      (rho_k)
     //   coeff_[1] = <p, A p>    (sigma_k)
     //   coeff_[2] = <r, z>_new  (rho_{k+1})
-    //   coeff_[3] = scratch
+    //   coeff_[3] = beta_k
     CudaArray<float> coeff_;
+
+    // One partial sum per vector block.  The buffer is allocated before
+    // graph capture and reused by every reduction in every iteration.
+    CudaArray<float> reduction_partial_;
+    CudaArray<float> true_residual_norms_;
+    bool last_true_residual_valid_ = false;
 
     // CUDA Graph cache.  Captured on the caller's non-default stream on
     // the first solve and replayed on subsequent calls.  Invalidated
@@ -162,6 +196,10 @@ private:
     CUgraphExec_st* graph_exec_ = nullptr;
     int graph_n_ = 0;
     int graph_max_iter_ = 0;
+    const float* graph_body_factors_ = nullptr;
+    const math::Vec4i* graph_body_rows_ = nullptr;
+    const unsigned char* graph_fixed_rows_ = nullptr;
+    int graph_num_bodies_ = 0;
 };
 
 }  // namespace solver

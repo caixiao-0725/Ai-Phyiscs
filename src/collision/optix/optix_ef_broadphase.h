@@ -39,6 +39,13 @@ public:
     // Build/refit the AABB BVH from current positions + thickness,
     // then launch the EF query.
     void query(const math::Vec3f* positions_dev,
+               const int* vertex_mesh_ids_dev,
+               unsigned int collision_mask,
+               float thickness,
+               std::uintptr_t cuda_stream = 0);
+
+    // Compatibility path for callers that do not provide body ownership.
+    void query(const math::Vec3f* positions_dev,
                float thickness,
                std::uintptr_t cuda_stream = 0);
 
@@ -55,6 +62,9 @@ public:
     }
     const int* ef_count_dev() const noexcept {
         return ef_count_.gpu_data();
+    }
+    const int* dropped_hits_dev() const noexcept {
+        return dropped_hits_.gpu_data();
     }
 
 private:
@@ -91,10 +101,10 @@ private:
     CudaArray<int> hit_counts_;
     CudaArray<math::Vec2i> ef_pairs_;
     CudaArray<int> ef_count_;
+    CudaArray<int> dropped_hits_;
 
     // Launch params
-    optix_ef::Params cpu_params_{};
-    CUdeviceptr gpu_params_ = 0;
+    CudaArray<optix_ef::Params> launch_params_;
 
     // SBT record buffers
     CUdeviceptr sbt_raygen_ = 0;

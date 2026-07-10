@@ -15,6 +15,8 @@ struct Params {
     const float3*  vertices;     // surface vertex positions
     const int2*    edges;        // surface edges (vertex index pairs)
     const int3*    triangles;    // surface triangles (vertex index triplets)
+    const int*     vertex_mesh_ids;
+    unsigned int   collision_mask;  // bit 0 self, bit 1 inter-object
     float          thickness;    // AABB inflation for broadphase
     OptixTraversableHandle handle;
 

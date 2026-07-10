@@ -36,6 +36,7 @@ void optix_ef_flatten_hits(const int* hits_buffer,
                            math::Vec2i* ef_pairs,
                            int* pair_count,
                            int max_pairs,
+                           int* dropped_hits,
                            cudaStream_t stream);
 }}
 
@@ -94,7 +95,6 @@ OptixEFBroadphase::~OptixEFBroadphase() {
     if (context_) optixDeviceContextDestroy(context_);
     if (gas_output_) cudaFree(reinterpret_cast<void*>(gas_output_));
     if (gas_temp_) cudaFree(reinterpret_cast<void*>(gas_temp_));
-    if (gpu_params_) cudaFree(reinterpret_cast<void*>(gpu_params_));
     if (sbt_raygen_) cudaFree(reinterpret_cast<void*>(sbt_raygen_));
     if (sbt_miss_) cudaFree(reinterpret_cast<void*>(sbt_miss_));
     if (sbt_hitgroup_) cudaFree(reinterpret_cast<void*>(sbt_hitgroup_));
@@ -120,8 +120,11 @@ void OptixEFBroadphase::setup(const std::vector<math::Vec3i>& tris,
     hit_counts_.resize(n_edges_);
     ef_pairs_.resize(static_cast<size_t>(max_ef_candidates_));
     ef_count_.resize(1);
+    dropped_hits_.resize(1);
     ef_count_.cpu_data()[0] = 0;
+    dropped_hits_.cpu_data()[0] = 0;
     ef_count_.copy_to_device();
+    dropped_hits_.copy_to_device();
 
     // Allocate AABB buffer (6 floats per face)
     aabb_buffer_.resize(static_cast<size_t>(n_faces_) * 6);
@@ -129,9 +132,9 @@ void OptixEFBroadphase::setup(const std::vector<math::Vec3i>& tris,
     create_context();
     create_pipeline();
 
-    // Allocate GPU launch params
-    CHYSX_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&gpu_params_),
-                                sizeof(Params)));
+    // Pinned host + device launch params allow the per-frame update to stay
+    // ordered on the simulation stream without a synchronous cudaMemcpy.
+    launch_params_.resize(1);
 
     initialized_ = true;
 }
@@ -335,6 +338,8 @@ void OptixEFBroadphase::refit_gas(const math::Vec3f* positions_dev,
 // ============================================================================
 
 void OptixEFBroadphase::query(const math::Vec3f* positions_dev,
+                               const int* vertex_mesh_ids_dev,
+                               unsigned int collision_mask,
                                float thickness,
                                std::uintptr_t cuda_stream) {
     if (!initialized_) return;
@@ -347,22 +352,25 @@ void OptixEFBroadphase::query(const math::Vec3f* positions_dev,
     rebuild_counter_++;
 
     // Update launch params
-    cpu_params_.vertices = reinterpret_cast<const float3*>(positions_dev);
-    cpu_params_.edges = reinterpret_cast<const int2*>(topology_.edges().gpu_data());
-    cpu_params_.triangles = reinterpret_cast<const int3*>(topology_.faces().gpu_data());
-    cpu_params_.thickness = thickness;
-    cpu_params_.handle = gas_handle_;
-    cpu_params_.hits_buffer = hits_buffer_.gpu_data();
-    cpu_params_.hit_counts = hit_counts_.gpu_data();
-    cpu_params_.max_hits_per_edge = max_hits_per_edge_;
+    Params& params = launch_params_.cpu_data()[0];
+    params.vertices = reinterpret_cast<const float3*>(positions_dev);
+    params.edges = reinterpret_cast<const int2*>(topology_.edges().gpu_data());
+    params.triangles = reinterpret_cast<const int3*>(topology_.faces().gpu_data());
+    params.vertex_mesh_ids = vertex_mesh_ids_dev;
+    params.collision_mask = collision_mask;
+    params.thickness = thickness;
+    params.handle = gas_handle_;
+    params.hits_buffer = hits_buffer_.gpu_data();
+    params.hit_counts = hit_counts_.gpu_data();
+    params.max_hits_per_edge = max_hits_per_edge_;
 
-    CHYSX_CUDA_CHECK(cudaMemcpy(
-        reinterpret_cast<void*>(gpu_params_), &cpu_params_,
-        sizeof(Params), cudaMemcpyHostToDevice));
+    launch_params_.copy_to_device(cuda_stream);
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
     CHYSX_OPTIX_CHECK(optixLaunch(
-        pipeline_, stream, gpu_params_, sizeof(Params),
+        pipeline_, stream,
+        reinterpret_cast<CUdeviceptr>(launch_params_.gpu_data()),
+        sizeof(Params),
         &sbt_, static_cast<unsigned int>(n_edges_), 1, 1));
     optix_ef_flatten_hits(hits_buffer_.gpu_data(),
                           hit_counts_.gpu_data(),
@@ -371,7 +379,14 @@ void OptixEFBroadphase::query(const math::Vec3f* positions_dev,
                           ef_pairs_.gpu_data(),
                           ef_count_.gpu_data(),
                           max_ef_candidates_,
+                          dropped_hits_.gpu_data(),
                           stream);
+}
+
+void OptixEFBroadphase::query(const math::Vec3f* positions_dev,
+                              float thickness,
+                              std::uintptr_t cuda_stream) {
+    query(positions_dev, nullptr, ~0u, thickness, cuda_stream);
 }
 
 // ============================================================================

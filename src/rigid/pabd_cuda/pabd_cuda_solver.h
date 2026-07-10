@@ -24,6 +24,11 @@ namespace chysx {
 namespace rigid {
 namespace pabd_cuda {
 
+enum class PabdGlobalSolverMode {
+    PCG = 0,
+    BlockJacobi12 = 1,
+};
+
 struct PabdCudaParams {
     float dt = 0.0033f;
     int substeps = 1;
@@ -39,7 +44,13 @@ struct PabdCudaParams {
     float self_collision_thickness = 0.0f;
     float self_collision_stiffness = 0.0f;
     int self_collision_max_contacts = 256;
+    int mesh_broadphase_interval = 1;
+    float mesh_broadphase_skin = 0.0f;
     int pcg_iterations = 40;
+    bool pcg_body_preconditioner = true;
+    bool pcg_true_residual_diagnostics = false;
+    PabdGlobalSolverMode global_solver = PabdGlobalSolverMode::PCG;
+    float block_jacobi_omega = 1.0f;
 };
 
 struct PabdSurfaceMap {
@@ -119,6 +130,9 @@ public:
 
     int last_pcg_iterations() const noexcept { return last_pcg_iterations_; }
     float last_residual() const noexcept { return last_residual_; }
+    float last_true_relative_residual() const noexcept {
+        return last_true_relative_residual_;
+    }
     int last_ground_contacts() const noexcept { return last_ground_contacts_; }
     int last_self_contacts() const noexcept { return last_self_contacts_; }
     int last_self_point_face_contacts() const noexcept { return last_self_point_face_contacts_; }
@@ -132,6 +146,21 @@ public:
     bool last_self_broadphase_overflow() const noexcept {
         return last_self_broadphase_overflow_;
     }
+    bool last_mesh_broadphase_refreshed() const noexcept {
+        return last_mesh_broadphase_refreshed_;
+    }
+    int mesh_broadphase_cache_age() const noexcept {
+        return mesh_broadphase_cache_age_;
+    }
+    int mesh_broadphase_refresh_count() const noexcept {
+        return mesh_broadphase_refresh_count_;
+    }
+    float last_mesh_broadphase_max_displacement() const noexcept {
+        return last_mesh_broadphase_max_displacement_;
+    }
+    int last_mesh_broadphase_dropped_hits() const noexcept {
+        return last_mesh_broadphase_dropped_hits_;
+    }
     int last_self_raw_contacts() const noexcept { return last_self_raw_contacts_; }
     int interpolated_contact_capacity() const noexcept {
         return interpolated_contact_capacity_;
@@ -140,6 +169,22 @@ public:
         return last_self_contact_overflow_;
     }
     math::Vec3f last_self_normal_sum() const noexcept { return last_self_normal_sum_; }
+    int last_block_jacobi_failures() const noexcept {
+        return last_block_jacobi_failures_;
+    }
+    int block_jacobi_contact_ell_width() const noexcept {
+        return block_jacobi_contact_ell_width_;
+    }
+    int last_block_jacobi_contact_ell_overflow() const noexcept {
+        return last_block_jacobi_contact_ell_overflow_;
+    }
+    int last_pcg_body_preconditioner_failures() const noexcept {
+        return last_pcg_body_preconditioner_failures_;
+    }
+    bool pcg_body_preconditioner_active() const noexcept {
+        return params_.pcg_body_preconditioner &&
+               pcg_body_preconditioner_valid_;
+    }
     float min_y() const noexcept { return min_y_; }
 
 private:
@@ -149,6 +194,10 @@ private:
     void update_host_positions(bool x_already_on_host = false);
     void step_interpolated(float dt);
     void assemble_interpolated_system_gpu(float h);
+    void update_block_jacobi_base_k_gpu(float h);
+    void build_body_contact_ell_gpu();
+    void build_interpolated_pcg_body_preconditioner_gpu(float h);
+    void solve_interpolated_block_jacobi_gpu(float h, float omega);
     void update_surface_positions(const std::vector<math::Vec3f>& controls,
                                   std::vector<math::Vec3f>& surface) const;
     void update_interpolated_surface_positions_gpu(const math::Vec3f* controls_dev,
@@ -199,6 +248,15 @@ private:
     CudaArray<collision::WideContact> interpolated_wide_contacts_;
     CudaArray<int> interpolated_wide_contact_count_;
     CudaArray<float> tet_mass_blocks_dev_;
+    CudaArray<float> block_jacobi_base_k_;
+    CudaArray<math::Vec3f> block_jacobi_x_lagged_;
+    CudaArray<int> block_jacobi_failure_count_;
+    CudaArray<int> block_jacobi_contact_ell_counts_;
+    CudaArray<std::uint32_t> block_jacobi_contact_ell_refs_;
+    CudaArray<int> block_jacobi_contact_ell_overflow_;
+    CudaArray<float> pcg_body_preconditioner_lower_;
+    CudaArray<math::Vec4i> pcg_body_preconditioner_rows_;
+    CudaArray<int> pcg_body_preconditioner_failure_count_;
     CudaArray<int> interpolated_debug_counts_;
     CudaArray<math::Vec3f> interpolated_normal_sum_;
 
@@ -215,10 +273,25 @@ private:
     int last_self_broadphase_pairs_ = 0;
     int last_self_broadphase_capacity_ = 0;
     bool last_self_broadphase_overflow_ = false;
+    bool last_mesh_broadphase_refreshed_ = true;
+    int mesh_broadphase_cache_age_ = 0;
+    int mesh_broadphase_refresh_count_ = 0;
+    float last_mesh_broadphase_max_displacement_ = 0.0f;
+    int last_mesh_broadphase_dropped_hits_ = 0;
     int last_self_raw_contacts_ = 0;
     bool last_self_contact_overflow_ = false;
     math::Vec3f last_self_normal_sum_ = math::Vec3f(0.0f, 0.0f, 0.0f);
+    int last_block_jacobi_failures_ = 0;
+    int block_jacobi_contact_ell_width_ = 0;
+    int last_block_jacobi_contact_ell_overflow_ = 0;
+    int last_pcg_body_preconditioner_failures_ = 0;
+    bool pcg_body_preconditioner_valid_ = false;
+    float block_jacobi_base_inv_h2_ = -1.0f;
+    float block_jacobi_base_stiffness_ = -1.0f;
+    float block_jacobi_base_fixed_weight_ = -1.0f;
+    bool block_jacobi_base_k_valid_ = false;
     float last_residual_ = 0.0f;
+    float last_true_relative_residual_ = -1.0f;
     float min_y_ = 0.0f;
 };
 

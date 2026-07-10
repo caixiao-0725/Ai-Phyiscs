@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -28,6 +29,7 @@ using chysx::rigid::pabd_cuda::PabdCudaMesh;
 using chysx::rigid::pabd_cuda::PabdCudaParams;
 using chysx::rigid::pabd_cuda::PabdCudaSolver;
 using chysx::rigid::pabd_cuda::PabdCudaSurfaceRenderer;
+using chysx::rigid::pabd_cuda::PabdGlobalSolverMode;
 using chysx::rigid::pabd_cuda::PabdSurfaceMap;
 using chysx::rigid::pabd_cuda::kDefaultStackCount;
 using chysx::rigid::pabd_cuda::kHexBlockSurfaceTris;
@@ -50,7 +52,7 @@ enum class PabdSceneKind {
 constexpr int kRigidIpcChainNet4x4Bodies = 24;
 constexpr int kRigidIpcChainNet8x8Bodies = 144;
 constexpr int kRigidIpcChainNet32x32Bodies = 2880;
-constexpr int kRigidIpcVerticalChainDefaultBodies = 12;
+constexpr int kRigidIpcVerticalChainDefaultBodies = 2;
 
 void body_color(int body, int count, float out_rgb[3]) {
     const float hue = static_cast<float>(body) / static_cast<float>(std::max(1, count));
@@ -689,8 +691,30 @@ public:
             changed |= ImGui::SliderFloat("fixed weight", &params_.fixed_weight,
                                           1.0e3f, 1.0e8f, "%.1e",
                                           ImGuiSliderFlags_Logarithmic);
+            ImGui::Separator();
+            const bool pcg_selected =
+                params_.global_solver == PabdGlobalSolverMode::PCG;
+            if (ImGui::Button(pcg_selected ? "PCG active" : "Use PCG")) {
+                params_.global_solver = PabdGlobalSolverMode::PCG;
+                changed = true;
+            }
+            ImGui::SameLine();
+            const bool jacobi_selected =
+                params_.global_solver == PabdGlobalSolverMode::BlockJacobi12;
+            if (ImGui::Button(jacobi_selected ? "Block-Jacobi12 active"
+                                              : "Use Block-Jacobi12")) {
+                params_.global_solver = PabdGlobalSolverMode::BlockJacobi12;
+                changed = true;
+            }
             changed |= ImGui::SliderInt("PCG iterations", &params_.pcg_iterations,
                                         1, 200);
+            changed |= ImGui::Checkbox("PCG Body12 preconditioner",
+                                       &params_.pcg_body_preconditioner);
+            changed |= ImGui::Checkbox("PCG true residual diagnostics",
+                                       &params_.pcg_true_residual_diagnostics);
+            changed |= ImGui::SliderFloat("Block-Jacobi omega",
+                                          &params_.block_jacobi_omega,
+                                          0.05f, 1.0f, "%.2f");
 
             ImGui::Separator();
             changed |= ImGui::SliderFloat("ground y", &params_.ground_y, -2.0f,
@@ -706,6 +730,12 @@ public:
             changed |= ImGui::SliderFloat("self collision stiffness",
                                           &params_.self_collision_stiffness,
                                           0.0f, 1.0e5f, "%.1e");
+            changed |= ImGui::SliderInt("mesh broadphase interval",
+                                        &params_.mesh_broadphase_interval,
+                                        1, 16);
+            changed |= ImGui::SliderFloat("mesh broadphase skin",
+                                          &params_.mesh_broadphase_skin,
+                                          0.0f, 0.2f, "%.3f");
 
             if (topology_changed) {
                 rebuild_simulation();
@@ -725,7 +755,27 @@ public:
         ImGui::Text("self contacts: %d", solver_->last_self_contacts());
         ImGui::Text("min y: %.5f", solver_->min_y());
         ImGui::Text("PCG iters (last): %d", solver_->last_pcg_iterations());
-        ImGui::Text("PCG residual: %.3e", solver_->last_residual());
+        ImGui::Text("PCG recursive <r,M^-1 r>: %.3e",
+                    solver_->last_residual());
+        ImGui::Text("PCG true relative residual: %.3e",
+                    solver_->last_true_relative_residual());
+        ImGui::Text("PCG preconditioner: %s",
+                    solver_->pcg_body_preconditioner_active()
+                        ? "Body12"
+                        : "Point3");
+        ImGui::Text("PCG 12x12 factor failures: %d",
+                    solver_->last_pcg_body_preconditioner_failures());
+        ImGui::Text("broadphase: %s, age %d, max disp %.5f, dropped %d",
+                    solver_->last_mesh_broadphase_refreshed()
+                        ? "refresh"
+                        : "cached",
+                    solver_->mesh_broadphase_cache_age(),
+                    solver_->last_mesh_broadphase_max_displacement(),
+                    solver_->last_mesh_broadphase_dropped_hits());
+        ImGui::Text("BJ failures: %d", solver_->last_block_jacobi_failures());
+        ImGui::Text("BJ contact ELL: width %d, overflow %d",
+                    solver_->block_jacobi_contact_ell_width(),
+                    solver_->last_block_jacobi_contact_ell_overflow());
     }
 
 private:
@@ -794,21 +844,37 @@ private:
                 body_count = stack_count_;
             }
             std::printf(
-                "[PABD_DBG setup] bodies=%d dt=%.6f substeps=%d iterations=%d "
-                "pcg=%d stiffness=%.1f groundK=%.1f selfK=%.1f gap=%.4f thickness=%.4f maxContacts=%d\n",
-                body_count, params_.dt, params_.substeps,
+                "[PABD_DBG setup] bodies=%d solver=%s dt=%.6f substeps=%d iterations=%d "
+                "pcg=%d omega=%.2f damping=%.3f stiffness=%.1f groundK=%.1f selfK=%.1f gap=%.4f thickness=%.4f maxContacts=%d bpN=%d bpSkin=%.4f\n",
+                body_count,
+                params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
+                    ? "BlockJacobi12"
+                    : "PCG",
+                params_.dt, params_.substeps,
                 params_.iterations, params_.pcg_iterations,
+                params_.block_jacobi_omega,
+                params_.damping,
                 params_.stiffness, params_.ground_stiffness,
                 params_.self_collision_stiffness, params_.contact_gap,
                 params_.self_collision_thickness,
-                params_.self_collision_max_contacts);
+                params_.self_collision_max_contacts,
+                params_.mesh_broadphase_interval,
+                params_.mesh_broadphase_skin);
         }
     }
 
     void print_pd_abd_stats() const {
         const auto ns = solver_->last_self_normal_sum();
-        std::printf("[PABD_DBG frame=%d] ground=%d self=%d raw=%d cap=%d overflow=%d pf=%d ee=%d bpairs=%d bcap=%d boverflow=%d vertical=%d horizontal=%d nsum=(%.3f,%.3f,%.3f) minY=%.5f residual=%.3e\n",
-                    frame_index_, solver_->last_ground_contacts(),
+        std::printf("[PABD_DBG frame=%d] solver=%s pcgIters=%d pcgPrec=%s ground=%d self=%d raw=%d cap=%d overflow=%d pf=%d ee=%d bpairs=%d bcap=%d boverflow=%d bpRefresh=%d bpAge=%d bpRefreshes=%d bpDisp=%.5f bpDropped=%d vertical=%d horizontal=%d nsum=(%.3f,%.3f,%.3f) minY=%.5f pcgRho=%.3e pcgTrueRel=%.3e pcgPrecFail=%d bjFail=%d ellWidth=%d ellOverflow=%d\n",
+                    frame_index_,
+                    params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
+                        ? "BlockJacobi12"
+                        : "PCG",
+                    solver_->last_pcg_iterations(),
+                    solver_->pcg_body_preconditioner_active()
+                        ? "Body12"
+                        : "Point3",
+                    solver_->last_ground_contacts(),
                     solver_->last_self_contacts(),
                     solver_->last_self_raw_contacts(),
                     solver_->interpolated_contact_capacity(),
@@ -818,10 +884,20 @@ private:
                     solver_->last_self_broadphase_pairs(),
                     solver_->last_self_broadphase_capacity(),
                     solver_->last_self_broadphase_overflow() ? 1 : 0,
+                    solver_->last_mesh_broadphase_refreshed() ? 1 : 0,
+                    solver_->mesh_broadphase_cache_age(),
+                    solver_->mesh_broadphase_refresh_count(),
+                    solver_->last_mesh_broadphase_max_displacement(),
+                    solver_->last_mesh_broadphase_dropped_hits(),
                     solver_->last_self_vertical_contacts(),
                     solver_->last_self_horizontal_contacts(),
                     ns.x, ns.y, ns.z, solver_->min_y(),
-                    solver_->last_residual());
+                    solver_->last_residual(),
+                    solver_->last_true_relative_residual(),
+                    solver_->last_pcg_body_preconditioner_failures(),
+                    solver_->last_block_jacobi_failures(),
+                    solver_->block_jacobi_contact_ell_width(),
+                    solver_->last_block_jacobi_contact_ell_overflow());
         if (gpu_surface_render_enabled()) {
             std::printf("[PABD_DBG frame=%d summary] gpuSurfaceMinY=%.5f surfaceVerts=%d surfaceTris=%d\n",
                         frame_index_, solver_->min_y(),
@@ -842,7 +918,7 @@ private:
                         solver_->num_surface_vertices(),
                         solver_->num_surface_triangles());
             if (kind_ == PabdSceneKind::RigidIpcVerticalChain &&
-                stack_count_ <= 4 && stack_count_ > 0) {
+                stack_count_ <= 8 && stack_count_ > 0) {
                 const int tris_per_body =
                     solver_->num_surface_triangles() / stack_count_;
                 for (int body = 0; body < stack_count_; ++body) {
@@ -966,6 +1042,10 @@ private:
         params_.self_collision_thickness = 0.0f;
         params_.self_collision_stiffness = 0.0f;
         params_.self_collision_max_contacts = 256;
+        params_.mesh_broadphase_interval = 1;
+        params_.mesh_broadphase_skin = 0.0f;
+        params_.global_solver = PabdGlobalSolverMode::PCG;
+        params_.block_jacobi_omega = 1.0f;
         color_[0] = 0.72f;
         color_[1] = 0.52f;
         color_[2] = 0.96f;
@@ -1068,6 +1148,10 @@ private:
                     : (kind_ == PabdSceneKind::RigidIpcChainNet8x8
                            ? 65536
                            : 16384);
+            if (kind_ == PabdSceneKind::RigidIpcChainNet32x32) {
+                params_.mesh_broadphase_interval = 3;
+                params_.mesh_broadphase_skin = 0.030f;
+            }
             color_[0] = 0.58f;
             color_[1] = 0.74f;
             color_[2] = 0.44f;
@@ -1075,6 +1159,8 @@ private:
             params_.dt = 0.0033f;
             params_.substeps = 1;
             params_.iterations = 1;
+            params_.global_solver = PabdGlobalSolverMode::BlockJacobi12;
+            params_.block_jacobi_omega = 0.8f;
             params_.gravity = -9.8f;
             params_.stiffness = 10000.0f;
             params_.density = 1.0f;
@@ -1091,6 +1177,40 @@ private:
             color_[0] = 0.74f;
             color_[1] = 0.62f;
             color_[2] = 0.36f;
+        }
+
+        if (const char* value = std::getenv("CHYSX_PABD_BP_INTERVAL")) {
+            params_.mesh_broadphase_interval =
+                std::max(1, std::atoi(value));
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_BP_SKIN")) {
+            params_.mesh_broadphase_skin =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_DAMPING")) {
+            params_.damping = std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_BJ_OMEGA")) {
+            params_.block_jacobi_omega =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_PCG_ITERS")) {
+            params_.pcg_iterations = std::max(1, std::atoi(value));
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_PCG_BODY12")) {
+            params_.pcg_body_preconditioner = std::atoi(value) != 0;
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_PCG_TRUE_RESIDUAL")) {
+            params_.pcg_true_residual_diagnostics = std::atoi(value) != 0;
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_SOLVER")) {
+            const std::string solver(value);
+            if (solver == "pcg" || solver == "PCG") {
+                params_.global_solver = PabdGlobalSolverMode::PCG;
+            } else if (solver == "block_jacobi" ||
+                       solver == "BlockJacobi12") {
+                params_.global_solver = PabdGlobalSolverMode::BlockJacobi12;
+            }
         }
     }
 };

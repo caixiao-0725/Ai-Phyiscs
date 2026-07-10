@@ -92,15 +92,13 @@ struct ContactSpMVOp {
 };
 
 struct alignas(16) WideContact {
-    math::Vec4i ids0;           // first 4 control ids
-    math::Vec4i ids1;           // next 4 control ids, -1 when unused
-    math::Vec4f weights0;       // signed coefficients for ids0
-    math::Vec4f weights1;       // signed coefficients for ids1
+    math::Vec4f weights0;       // signed coefficients for base0 + [0..3]
+    math::Vec4f weights1;       // signed coefficients for base1 + [0..3]
     math::Vec4f normal_target;  // xyz = normal, w = RHS target offset
+    int base0 = -1;             // first consecutive 4-control block
+    int base1 = -1;             // second consecutive block, -1 when unused
     float stiffness = 0.0f;     // per-contact stiffness
     float pad0 = 0.0f;
-    float pad1 = 0.0f;
-    float pad2 = 0.0f;
 };
 
 struct WideContactSpMVOp {

@@ -33,6 +33,53 @@ inline std::uintptr_t stream_handle(CUstream_st* stream) {
     return reinterpret_cast<std::uintptr_t>(stream);
 }
 
+constexpr int kCountDrivenBlocksPerSm = 4;
+constexpr int kBodyContactEllMinWidth = 64;
+constexpr int kBodyContactEllCapacityScale = 8;
+
+inline int count_driven_max_blocks() {
+    static const int max_blocks = [] {
+        int device = 0;
+        int sm_count = 0;
+        check_cuda(cudaGetDevice(&device), "query current CUDA device");
+        check_cuda(cudaDeviceGetAttribute(&sm_count,
+                                          cudaDevAttrMultiProcessorCount,
+                                          device),
+                   "query CUDA SM count");
+        return std::max(1, sm_count * kCountDrivenBlocksPerSm);
+    }();
+    return max_blocks;
+}
+
+inline int bounded_count_grid(int capacity, int block_size) {
+    // The device-side count controls work; capacity only bounds the loop.
+    const int launch_size = std::max(1, capacity);
+    return std::min(count_driven_max_blocks(),
+                    (launch_size + block_size - 1) / block_size);
+}
+
+inline int choose_body_contact_ell_width(int contact_capacity,
+                                         int body_count) {
+    if (contact_capacity <= 0 || body_count <= 0) return 0;
+
+    // A contact contributes at most two body references. Reserve four times
+    // that capacity-derived average degree, then round for regular addressing.
+    const std::uint64_t scaled =
+        static_cast<std::uint64_t>(contact_capacity) *
+        kBodyContactEllCapacityScale;
+    std::uint64_t desired =
+        (scaled + static_cast<std::uint64_t>(body_count) - 1) /
+        static_cast<std::uint64_t>(body_count);
+    desired = std::max<std::uint64_t>(desired, kBodyContactEllMinWidth);
+    desired = std::min<std::uint64_t>(
+        desired, static_cast<std::uint64_t>(contact_capacity));
+
+    std::uint64_t rounded = 1;
+    while (rounded < desired) rounded <<= 1;
+    return static_cast<int>(std::min<std::uint64_t>(
+        rounded, static_cast<std::uint64_t>(contact_capacity)));
+}
+
 CHYSX_HDI math::Mat3f make_columns(math::Vec3f c0, math::Vec3f c1, math::Vec3f c2) {
     return math::Mat3f(c0.x, c1.x, c2.x,
                        c0.y, c1.y, c2.y,
@@ -86,6 +133,22 @@ __device__ void add_scalar_identity_by_slot_device(math::Mat3f* diag,
     } else {
         atomic_add_scalar_identity(&values[slot], value);
     }
+}
+
+constexpr int kBlockJacobiDofs = 12;
+constexpr int kBlockJacobiBaseKSize = 10;
+constexpr int kBodyBlockPackedLowerSize =
+    solver::kBodyBlock12PackedLowerSize;
+static_assert(kBlockJacobiDofs == solver::kBodyBlock12Dofs,
+              "PABD and PCG body block sizes must match");
+
+__device__ __forceinline__ int sym4_index(int r, int c) {
+    if (r < c) {
+        const int t = r;
+        r = c;
+        c = t;
+    }
+    return r * (r + 1) / 2 + c;
 }
 
 __global__ void prepare_step_kernel(const math::Vec3f* rest,
@@ -161,6 +224,421 @@ __global__ void update_interpolated_surface_positions_kernel(
             old = atomicCAS(min_bits, assumed, __float_as_int(p.y));
             if (old == assumed) break;
         }
+    }
+}
+
+__global__ void rebuild_block_jacobi_base_k_kernel(
+    const PabdCudaSolver::TetData* __restrict__ tets,
+    const float* __restrict__ mass_blocks,
+    const unsigned char* __restrict__ fixed,
+    int n_tets,
+    float inv_h2,
+    float stiffness,
+    float fixed_weight,
+    float* __restrict__ base_k) {
+    const int body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= n_tets) return;
+
+    const PabdCudaSolver::TetData tet = tets[body];
+    const float* mass = mass_blocks + body * 16;
+    float* K = base_k + body * kBlockJacobiBaseKSize;
+    const float w_elastic = stiffness * tet.volume;
+
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        #pragma unroll
+        for (int b = 0; b <= a; ++b) {
+            const float mass_value =
+                __fmul_rn(mass[a * 4 + b], inv_h2);
+            const float elastic_value = __fmul_rn(
+                w_elastic, math::dot(tet.grad[a], tet.grad[b]));
+            float value = __fadd_rn(mass_value, elastic_value);
+            if (a == b && fixed[tet.v[a]]) {
+                value = __fadd_rn(value, fixed_weight);
+            }
+            K[sym4_index(a, b)] = value;
+        }
+    }
+}
+
+__device__ void append_body_contact_ell_ref(
+    int body,
+    std::uint32_t ref,
+    int n_bodies,
+    int ell_width,
+    int* __restrict__ ell_counts,
+    std::uint32_t* __restrict__ ell_refs,
+    int* __restrict__ overflow_count) {
+    if (body < 0 || body >= n_bodies) return;
+    const int slot = atomicAdd(&ell_counts[body], 1);
+    if (slot < ell_width) {
+        // Slot-major ELL: neighboring body workers read neighboring addresses.
+        ell_refs[static_cast<std::size_t>(slot) * n_bodies + body] = ref;
+    } else {
+        atomicAdd(overflow_count, 1);
+    }
+}
+
+__global__ void build_body_contact_ell_kernel(
+    const collision::WideContact* __restrict__ contacts,
+    const int* __restrict__ count_ptr,
+    int max_contacts,
+    int n_bodies,
+    int ell_width,
+    int* __restrict__ ell_counts,
+    std::uint32_t* __restrict__ ell_refs,
+    int* __restrict__ overflow_count) {
+    const int n_raw = *count_ptr;
+    const int n = n_raw < max_contacts ? n_raw : max_contacts;
+    const int stride = blockDim.x * gridDim.x;
+    for (int c = blockIdx.x * blockDim.x + threadIdx.x;
+         c < n; c += stride) {
+        const collision::WideContact wc = contacts[c];
+        if (wc.stiffness == 0.0f) continue;
+
+        const int body0 = wc.base0 >= 0 ? wc.base0 / 4 : -1;
+        const int body1 = wc.base1 >= 0 ? wc.base1 / 4 : -1;
+        const std::uint32_t contact_ref =
+            static_cast<std::uint32_t>(c) << 1;
+        if (body0 >= 0) {
+            append_body_contact_ell_ref(body0, contact_ref, n_bodies,
+                                        ell_width, ell_counts, ell_refs,
+                                        overflow_count);
+        }
+        if (body1 >= 0 && body1 != body0) {
+            append_body_contact_ell_ref(body1, contact_ref | 1u, n_bodies,
+                                        ell_width, ell_counts, ell_refs,
+                                        overflow_count);
+        }
+    }
+}
+
+template <bool BuildRhs>
+__device__ __forceinline__ void gather_body_contact_ell_to_local_system(
+    int body,
+    const collision::WideContact* __restrict__ contacts,
+    const int* __restrict__ ell_counts,
+    const std::uint32_t* __restrict__ ell_refs,
+    int ell_width,
+    int n_bodies,
+    int n_controls,
+    const math::Vec3f* __restrict__ x_lagged,
+    float A[kBlockJacobiDofs][kBlockJacobiDofs],
+    float* b) {
+    const int stored_count =
+        ell_counts[body] < ell_width ? ell_counts[body] : ell_width;
+    for (int slot = 0; slot < stored_count; ++slot) {
+        const std::uint32_t ref =
+            ell_refs[static_cast<std::size_t>(slot) * n_bodies + body];
+        const int contact_id = static_cast<int>(ref >> 1);
+        const int side = static_cast<int>(ref & 1u);
+        const collision::WideContact wc = contacts[contact_id];
+
+        int own_base = side == 0 ? wc.base0 : wc.base1;
+        int other_base = side == 0 ? wc.base1 : wc.base0;
+        math::Vec4f own_w = side == 0 ? wc.weights0 : wc.weights1;
+        const math::Vec4f other_w = side == 0 ? wc.weights1 : wc.weights0;
+        if (own_base < 0 || own_base / 4 != body ||
+            own_base + 3 >= n_controls) {
+            continue;
+        }
+
+        // Same-body contacts are represented by one ELL reference. Fold both
+        // coefficient sets together so their cross terms stay in this block.
+        if (other_base >= 0 && other_base / 4 == body) {
+            #pragma unroll
+            for (int a = 0; a < 4; ++a) own_w[a] += other_w[a];
+            other_base = -1;
+        }
+
+        const float normal[3] = {
+            wc.normal_target.x,
+            wc.normal_target.y,
+            wc.normal_target.z,
+        };
+        const float k = wc.stiffness;
+        #pragma unroll
+        for (int row = 0; row < kBlockJacobiDofs; ++row) {
+            const int a = row / 3;
+            const int r = row - 3 * a;
+            const float ur = own_w[a] * normal[r];
+            #pragma unroll
+            for (int col = 0; col <= row; ++col) {
+                const int b = col / 3;
+                const int q = col - 3 * b;
+                A[row][col] += k * ur * own_w[b] * normal[q];
+            }
+        }
+
+        if constexpr (BuildRhs) {
+            float rhs_scale = k * wc.normal_target.w;
+            if (other_base >= 0 && other_base + 3 < n_controls) {
+                math::Vec3f other_position(0.0f, 0.0f, 0.0f);
+                #pragma unroll
+                for (int a = 0; a < 4; ++a) {
+                    other_position += x_lagged[other_base + a] * other_w[a];
+                }
+                rhs_scale -= k * (normal[0] * other_position.x +
+                                  normal[1] * other_position.y +
+                                  normal[2] * other_position.z);
+            }
+
+            #pragma unroll
+            for (int a = 0; a < 4; ++a) {
+                const float scale = own_w[a] * rhs_scale;
+                b[3 * a + 0] += normal[0] * scale;
+                b[3 * a + 1] += normal[1] * scale;
+                b[3 * a + 2] += normal[2] * scale;
+            }
+        }
+    }
+}
+
+__global__ void build_interpolated_body_preconditioner_kernel(
+    int n_bodies,
+    int n_controls,
+    const float* __restrict__ base_k,
+    const unsigned char* __restrict__ fixed,
+    const collision::WideContact* __restrict__ contacts,
+    const int* __restrict__ ell_counts,
+    const std::uint32_t* __restrict__ ell_refs,
+    int ell_width,
+    float* __restrict__ packed_lower,
+    int* __restrict__ failure_count) {
+    const int body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= n_bodies) return;
+
+    float A[kBlockJacobiDofs][kBlockJacobiDofs];
+    const float* K = base_k + body * kBlockJacobiBaseKSize;
+    #pragma unroll
+    for (int row = 0; row < kBlockJacobiDofs; ++row) {
+        const int a = row / 3;
+        const int axis_row = row - 3 * a;
+        #pragma unroll
+        for (int col = 0; col <= row; ++col) {
+            const int b = col / 3;
+            const int axis_col = col - 3 * b;
+            A[row][col] = axis_row == axis_col
+                ? K[sym4_index(a, b)]
+                : 0.0f;
+        }
+    }
+
+    gather_body_contact_ell_to_local_system<false>(
+        body, contacts, ell_counts, ell_refs, ell_width, n_bodies,
+        n_controls, nullptr, A, nullptr);
+
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        if (!fixed[body * 4 + a]) continue;
+        #pragma unroll
+        for (int axis = 0; axis < 3; ++axis) {
+            const int row = 3 * a + axis;
+            #pragma unroll
+            for (int col = 0; col < row; ++col) A[row][col] = 0.0f;
+            #pragma unroll
+            for (int lower_row = row + 1;
+                 lower_row < kBlockJacobiDofs; ++lower_row) {
+                A[lower_row][row] = 0.0f;
+            }
+            A[row][row] = 1.0f;
+        }
+    }
+
+    float diag_sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < kBlockJacobiDofs; ++i) {
+        diag_sum += A[i][i];
+    }
+    const float eps = fmaxf(1.0e-6f,
+                            1.0e-6f * diag_sum / kBlockJacobiDofs);
+    #pragma unroll
+    for (int i = 0; i < kBlockJacobiDofs; ++i) {
+        if (!fixed[body * 4 + i / 3]) A[i][i] += eps;
+    }
+
+    bool failed = false;
+    #pragma unroll
+    for (int i = 0; i < kBlockJacobiDofs; ++i) {
+        #pragma unroll
+        for (int j = 0; j <= i; ++j) {
+            float sum = A[i][j];
+            #pragma unroll
+            for (int k = 0; k < j; ++k) {
+                sum -= A[i][k] * A[j][k];
+            }
+            if (i == j) {
+                if (sum <= eps) {
+                    sum = eps;
+                    failed = true;
+                }
+                A[i][j] = sqrtf(sum);
+            } else {
+                A[i][j] = sum / A[j][j];
+            }
+        }
+    }
+
+    float* lower = packed_lower + body * kBodyBlockPackedLowerSize;
+    #pragma unroll
+    for (int i = 0; i < kBlockJacobiDofs; ++i) {
+        #pragma unroll
+        for (int j = 0; j <= i; ++j) {
+            lower[i * (i + 1) / 2 + j] = A[i][j];
+        }
+    }
+    if (failed) atomicAdd(failure_count, 1);
+}
+
+__global__ void solve_interpolated_block_jacobi_kernel(
+    const PabdCudaSolver::TetData* __restrict__ tets,
+    int n_tets,
+    const float* __restrict__ base_k,
+    const float* __restrict__ mass_blocks,
+    const math::Vec3f* __restrict__ predicted,
+    const math::Vec3f* __restrict__ rest,
+    const collision::WideContact* __restrict__ contacts,
+    const int* __restrict__ ell_counts,
+    const std::uint32_t* __restrict__ ell_refs,
+    int ell_width,
+    int n_controls,
+    const math::Vec3f* __restrict__ x_lagged,
+    const unsigned char* __restrict__ fixed,
+    float inv_h2,
+    float stiffness,
+    float fixed_weight,
+    math::Vec3f* __restrict__ x,
+    float omega,
+    int* __restrict__ failure_count) {
+    const int body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= n_tets) return;
+
+    float A[kBlockJacobiDofs][kBlockJacobiDofs];
+    float b[kBlockJacobiDofs];
+    const PabdCudaSolver::TetData tet = tets[body];
+    const float* K = base_k + body * kBlockJacobiBaseKSize;
+    const float* mass = mass_blocks + body * 16;
+
+    const math::Mat3f Ds = make_columns(
+        x_lagged[tet.v[1]] - x_lagged[tet.v[0]],
+        x_lagged[tet.v[2]] - x_lagged[tet.v[0]],
+        x_lagged[tet.v[3]] - x_lagged[tet.v[0]]);
+    const math::Mat3f R = polar_rotation(Ds * tet.inv_dm);
+    const float w_elastic = stiffness * tet.volume;
+
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const int id = tet.v[a];
+        math::Vec3f bi(0.0f, 0.0f, 0.0f);
+        #pragma unroll
+        for (int col = 0; col < 4; ++col) {
+            const float m = __fmul_rn(mass[a * 4 + col], inv_h2);
+            const math::Vec3f p = predicted[tet.v[col]];
+            bi.x = __fadd_rn(bi.x, __fmul_rn(p.x, m));
+            bi.y = __fadd_rn(bi.y, __fmul_rn(p.y, m));
+            bi.z = __fadd_rn(bi.z, __fmul_rn(p.z, m));
+        }
+        const math::Vec3f rotated = R * tet.grad[a];
+        bi.x = __fadd_rn(bi.x, __fmul_rn(rotated.x, w_elastic));
+        bi.y = __fadd_rn(bi.y, __fmul_rn(rotated.y, w_elastic));
+        bi.z = __fadd_rn(bi.z, __fmul_rn(rotated.z, w_elastic));
+        if (fixed[id]) {
+            const math::Vec3f target = rest[id];
+            bi.x = __fadd_rn(bi.x, __fmul_rn(target.x, fixed_weight));
+            bi.y = __fadd_rn(bi.y, __fmul_rn(target.y, fixed_weight));
+            bi.z = __fadd_rn(bi.z, __fmul_rn(target.z, fixed_weight));
+        }
+        b[3 * a + 0] = bi.x;
+        b[3 * a + 1] = bi.y;
+        b[3 * a + 2] = bi.z;
+    }
+
+    #pragma unroll
+    for (int r = 0; r < kBlockJacobiDofs; ++r) {
+        const int a = r / 3;
+        const int axis_r = r - 3 * a;
+        #pragma unroll
+        for (int c = 0; c < kBlockJacobiDofs; ++c) {
+            const int col = c / 3;
+            const int axis_c = c - 3 * col;
+            A[r][c] = axis_r == axis_c
+                ? K[sym4_index(a, col)]
+                : 0.0f;
+        }
+    }
+
+    gather_body_contact_ell_to_local_system<true>(
+        body, contacts, ell_counts, ell_refs, ell_width, n_tets,
+        n_controls, x_lagged, A, b);
+
+    float diag_sum = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < kBlockJacobiDofs; ++i) {
+        diag_sum += A[i][i];
+    }
+    const float eps = fmaxf(1.0e-6f, 1.0e-6f * diag_sum / 12.0f);
+    #pragma unroll
+    for (int i = 0; i < kBlockJacobiDofs; ++i) A[i][i] += eps;
+
+    bool failed = false;
+    #pragma unroll
+    for (int i = 0; i < kBlockJacobiDofs; ++i) {
+        #pragma unroll
+        for (int j = 0; j <= i; ++j) {
+            float sum = A[i][j];
+            #pragma unroll
+            for (int k = 0; k < j; ++k) {
+                sum -= A[i][k] * A[j][k];
+            }
+            if (i == j) {
+                if (sum <= eps) {
+                    sum = eps;
+                    failed = true;
+                }
+                A[i][j] = sqrtf(sum);
+            } else {
+                A[i][j] = sum / A[j][j];
+            }
+        }
+        #pragma unroll
+        for (int j = i + 1; j < kBlockJacobiDofs; ++j) {
+            A[i][j] = 0.0f;
+        }
+    }
+
+    float y[kBlockJacobiDofs];
+    #pragma unroll
+    for (int i = 0; i < kBlockJacobiDofs; ++i) {
+        float sum = b[i];
+        #pragma unroll
+        for (int k = 0; k < i; ++k) {
+            sum -= A[i][k] * y[k];
+        }
+        y[i] = sum / A[i][i];
+    }
+
+    float solved[kBlockJacobiDofs];
+    for (int i = kBlockJacobiDofs - 1; i >= 0; --i) {
+        float sum = y[i];
+        for (int k = i + 1; k < kBlockJacobiDofs; ++k) {
+            sum -= A[k][i] * solved[k];
+        }
+        solved[i] = sum / A[i][i];
+    }
+
+    const float w = fminf(fmaxf(omega, 0.0f), 1.0f);
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const int id = tet.v[a];
+        if (fixed[id]) continue;
+        const math::Vec3f target(solved[3 * a + 0],
+                                 solved[3 * a + 1],
+                                 solved[3 * a + 2]);
+        x[id] = x[id] * (1.0f - w) + target * w;
+    }
+
+    if (failed) {
+        atomicAdd(failure_count, 1);
     }
 }
 
@@ -247,19 +725,24 @@ __device__ void store_wide_contact(collision::WideContact* wide_contacts,
                                    float target,
                                    float stiffness) {
     collision::WideContact out{};
-    out.ids0 = math::Vec4i(-1, -1, -1, -1);
-    out.ids1 = math::Vec4i(-1, -1, -1, -1);
+    out.base0 = -1;
+    out.base1 = -1;
     out.weights0 = math::Vec4f(0.0f, 0.0f, 0.0f, 0.0f);
     out.weights1 = math::Vec4f(0.0f, 0.0f, 0.0f, 0.0f);
     out.normal_target = math::Vec4f(normal.x, normal.y, normal.z, target);
     out.stiffness = stiffness;
     for (int i = 0; i < coeff_count && i < 8; ++i) {
-        if (i < 4) {
-            out.ids0[i] = dofs[i];
-            out.weights0[i] = coeffs[i];
+        const int base = (dofs[i] / 4) * 4;
+        const int lane = dofs[i] - base;
+        if (lane < 0 || lane >= 4) continue;
+        if (out.base0 < 0 || out.base0 == base) {
+            out.base0 = base;
+            out.weights0[lane] += coeffs[i];
+        } else if (out.base1 < 0 || out.base1 == base) {
+            out.base1 = base;
+            out.weights1[lane] += coeffs[i];
         } else {
-            out.ids1[i - 4] = dofs[i];
-            out.weights1[i - 4] = coeffs[i];
+            return;
         }
     }
     wide_contacts[cid] = out;
@@ -292,8 +775,11 @@ __global__ void append_interpolated_ground_contacts_kernel(
         const float wa = map.weight[a];
         if (ia < 0 || wa == 0.0f) continue;
         merge_wide_coeff(ia, wa, dofs, coeffs, &coeff_count);
-        atomic_add_vec(&rhs[ia],
-                       math::Vec3f(0.0f, stiffness * wa * target_y, 0.0f));
+        if (rhs != nullptr) {
+            atomic_add_vec(&rhs[ia],
+                           math::Vec3f(0.0f, stiffness * wa * target_y,
+                                       0.0f));
+        }
     }
     if (coeff_count > 0) {
         const int cid = atomicAdd(wide_count, 1);
@@ -318,54 +804,61 @@ __global__ void append_interpolated_self_contacts_kernel(
     collision::WideContact* wide_contacts,
     int* wide_count,
     int wide_capacity) {
-    const int cid = blockIdx.x * blockDim.x + threadIdx.x;
     const int n_raw = *contact_count;
     const int n = n_raw < max_contacts ? n_raw : max_contacts;
-    if (cid >= n || stiffness <= 0.0f) return;
-
-    const collision::MeshMeshContact c = contacts[cid];
-    if (c.type == static_cast<int>(collision::MeshMeshContactType::PointFace)) {
-        atomicAdd(&debug_counts[3], 1);
-    } else if (c.type == static_cast<int>(collision::MeshMeshContactType::EdgeEdge)) {
-        atomicAdd(&debug_counts[4], 1);
-    }
-    if (c.distance >= contact_gap) return;
-
-    atomicAdd(&debug_counts[0], 1);
-    atomic_add_vec(normal_sum, c.normal);
-    if (math::abs(c.normal.y) >= 0.75f) {
-        atomicAdd(&debug_counts[1], 1);
-    } else {
-        atomicAdd(&debug_counts[2], 1);
-    }
-
-    int dofs[8];
-    float coeffs[8];
-    int coeff_count = 0;
-    const int ids[4] = {c.vertices.x, c.vertices.y, c.vertices.z, c.vertices.w};
-    const float ws[4] = {c.weights.x, c.weights.y, c.weights.z, c.weights.w};
-    #pragma unroll
-    for (int si = 0; si < 4; ++si) {
-        const PabdSurfaceMapDevice map = maps[ids[si]];
-        #pragma unroll
-        for (int k = 0; k < 4; ++k) {
-            const float scalar = ws[si] * map.weight[k];
-            merge_wide_coeff(map.index[k], scalar, dofs, coeffs,
-                             &coeff_count);
+    if (stiffness <= 0.0f || contact_gap <= 0.0f) return;
+    const int stride = blockDim.x * gridDim.x;
+    for (int cid = blockIdx.x * blockDim.x + threadIdx.x;
+         cid < n; cid += stride) {
+        const collision::MeshMeshContact c = contacts[cid];
+        if (c.type == static_cast<int>(collision::MeshMeshContactType::PointFace)) {
+            atomicAdd(&debug_counts[3], 1);
+        } else if (c.type == static_cast<int>(collision::MeshMeshContactType::EdgeEdge)) {
+            atomicAdd(&debug_counts[4], 1);
         }
-    }
+        if (!(c.separation < contact_gap)) continue;
 
-    for (int i = 0; i < coeff_count; ++i) {
-        const int di = dofs[i];
-        const float ci = coeffs[i];
-        atomic_add_vec(&rhs[di],
-                       c.normal * (stiffness * ci * contact_gap));
-    }
-    if (coeff_count > 0) {
-        const int out_cid = atomicAdd(wide_count, 1);
-        if (out_cid < wide_capacity) {
-            store_wide_contact(wide_contacts, out_cid, dofs, coeffs,
-                               coeff_count, c.normal, contact_gap, stiffness);
+        atomicAdd(&debug_counts[0], 1);
+        atomic_add_vec(normal_sum, c.normal);
+        if (math::abs(c.normal.y) >= 0.75f) {
+            atomicAdd(&debug_counts[1], 1);
+        } else {
+            atomicAdd(&debug_counts[2], 1);
+        }
+
+        int dofs[8];
+        float coeffs[8];
+        int coeff_count = 0;
+        const int ids[4] = {
+            c.vertices.x, c.vertices.y, c.vertices.z, c.vertices.w};
+        const float ws[4] = {
+            c.weights.x, c.weights.y, c.weights.z, c.weights.w};
+        #pragma unroll
+        for (int si = 0; si < 4; ++si) {
+            const PabdSurfaceMapDevice map = maps[ids[si]];
+            #pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float scalar = ws[si] * map.weight[k];
+                merge_wide_coeff(map.index[k], scalar, dofs, coeffs,
+                                 &coeff_count);
+            }
+        }
+
+        if (rhs != nullptr) {
+            for (int i = 0; i < coeff_count; ++i) {
+                const int di = dofs[i];
+                const float ci = coeffs[i];
+                atomic_add_vec(&rhs[di],
+                               c.normal * (stiffness * ci * contact_gap));
+            }
+        }
+        if (coeff_count > 0) {
+            const int out_cid = atomicAdd(wide_count, 1);
+            if (out_cid < wide_capacity) {
+                store_wide_contact(wide_contacts, out_cid, dofs, coeffs,
+                                   coeff_count, c.normal, contact_gap,
+                                   stiffness);
+            }
         }
     }
 }
@@ -790,6 +1283,12 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
         tets_[i] = host_tets[i];
         rotations_[i] = math::Mat3f::identity();
     }
+    block_jacobi_base_k_.allocate_device(
+        host_tets.size() * kBlockJacobiBaseKSize);
+    block_jacobi_x_lagged_.allocate_device(num_vertices_);
+    block_jacobi_failure_count_.resize(1);
+    block_jacobi_failure_count_[0] = 0;
+    block_jacobi_base_k_valid_ = false;
 
     surface_triangles_ = mesh.surface_triangles.empty()
         ? derive_surface_triangles(oriented_tets)
@@ -875,10 +1374,55 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
         interpolated_wide_contact_count_.resize(1);
         interpolated_wide_contact_count_[0] = 0;
 
+        block_jacobi_contact_ell_width_ = choose_body_contact_ell_width(
+            wide_capacity, static_cast<int>(host_tets.size()));
+        block_jacobi_contact_ell_counts_.allocate_device(host_tets.size());
+        const std::size_t ell_slots =
+            host_tets.size() *
+            static_cast<std::size_t>(block_jacobi_contact_ell_width_);
+        block_jacobi_contact_ell_refs_.allocate_device(ell_slots);
+        block_jacobi_contact_ell_overflow_.resize(1);
+        block_jacobi_contact_ell_overflow_[0] = 0;
+
+        pcg_body_preconditioner_valid_ =
+            num_vertices_ == static_cast<int>(host_tets.size()) * 4;
+        if (pcg_body_preconditioner_valid_) {
+            pcg_body_preconditioner_rows_.resize(host_tets.size());
+            for (std::size_t body = 0; body < host_tets.size(); ++body) {
+                const TetData& tet = host_tets[body];
+                for (int a = 0; a < 4; ++a) {
+                    if (tet.v[a] != static_cast<int>(body) * 4 + a) {
+                        pcg_body_preconditioner_valid_ = false;
+                    }
+                }
+                pcg_body_preconditioner_rows_[body] = math::Vec4i(
+                    tet.v[0], tet.v[1], tet.v[2], tet.v[3]);
+            }
+        }
+        if (pcg_body_preconditioner_valid_) {
+            pcg_body_preconditioner_lower_.allocate_device(
+                host_tets.size() * kBodyBlockPackedLowerSize);
+            pcg_body_preconditioner_failure_count_.resize(1);
+            pcg_body_preconditioner_failure_count_[0] = 0;
+        } else {
+            pcg_body_preconditioner_lower_.clear();
+            pcg_body_preconditioner_rows_.clear();
+            pcg_body_preconditioner_failure_count_.clear();
+            std::printf(
+                "[PABD] 12x12 PCG body preconditioner disabled: controls "
+                "are not four canonical rows per body\n");
+        }
+        std::printf(
+            "[PABD_DBG ELL] bodies=%zu width=%d slots=%zu memory=%.2f MiB\n",
+            host_tets.size(), block_jacobi_contact_ell_width_, ell_slots,
+            static_cast<double>(ell_slots * sizeof(std::uint32_t)) /
+                (1024.0 * 1024.0));
+
         std::vector<int> vertex_body_ids(surface_maps_.size(), 0);
         for (std::size_t i = 0; i < surface_maps_.size(); ++i) {
             vertex_body_ids[i] = surface_maps_[i].body;
         }
+        update_surface_positions(mesh.rest_positions, host_surface_positions_);
         const int max_ef_candidates = std::max(
             interpolated_contact_capacity_,
             static_cast<int>(surface_edges_.size()) * 64);
@@ -890,7 +1434,9 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
 #endif
         mesh_mesh_contact_detector_.setup(
             tri_vec, vertex_body_ids, interpolated_contact_capacity_,
-            max_ef_candidates, self_backend);
+            max_ef_candidates, self_backend,
+            collision::kMeshCollisionInterObject,
+            &host_surface_positions_);
     } else {
         surface_maps_dev_.clear();
         surface_triangles_dev_.clear();
@@ -901,6 +1447,14 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
         interpolated_normal_sum_.clear();
         interpolated_wide_contacts_.clear();
         interpolated_wide_contact_count_.clear();
+        block_jacobi_contact_ell_counts_.clear();
+        block_jacobi_contact_ell_refs_.clear();
+        block_jacobi_contact_ell_overflow_.clear();
+        pcg_body_preconditioner_lower_.clear();
+        pcg_body_preconditioner_rows_.clear();
+        pcg_body_preconditioner_failure_count_.clear();
+        pcg_body_preconditioner_valid_ = false;
+        block_jacobi_contact_ell_width_ = 0;
         interpolated_contact_capacity_ = 0;
         mesh_mesh_contact_detector_ = collision::MeshMeshContactDetector{};
     }
@@ -927,6 +1481,11 @@ void PabdCudaSolver::upload_static_data() {
         interpolated_surface_min_y_dev_.copy_to_device(s);
         interpolated_wide_contacts_.copy_to_device(s);
         interpolated_wide_contact_count_.copy_to_device(s);
+        block_jacobi_contact_ell_overflow_.copy_to_device(s);
+        if (pcg_body_preconditioner_valid_) {
+            pcg_body_preconditioner_rows_.copy_to_device(s);
+            pcg_body_preconditioner_failure_count_.copy_to_device(s);
+        }
         tet_mass_blocks_dev_.copy_to_device(s);
         interpolated_debug_counts_.copy_to_device(s);
         interpolated_normal_sum_.copy_to_device(s);
@@ -986,40 +1545,42 @@ void PabdCudaSolver::detect_interpolated_contacts_gpu() {
         last_self_broadphase_pairs_ = 0;
         last_self_broadphase_capacity_ = 0;
         last_self_broadphase_overflow_ = false;
+        last_mesh_broadphase_refreshed_ = false;
+        mesh_broadphase_cache_age_ = 0;
+        mesh_broadphase_refresh_count_ = 0;
+        last_mesh_broadphase_max_displacement_ = 0.0f;
+        last_mesh_broadphase_dropped_hits_ = 0;
         last_self_point_face_contacts_ = 0;
         last_self_edge_edge_contacts_ = 0;
         return;
     }
 
     const std::uintptr_t s = stream_handle(stream_);
+    mesh_mesh_contact_detector_.configure_broadphase_cache(
+        params_.mesh_broadphase_interval,
+        params_.mesh_broadphase_skin);
     mesh_mesh_contact_detector_.detect_gpu(
         interpolated_surface_positions_dev_.gpu_data(),
         params_.self_collision_thickness, s);
-    last_self_broadphase_pairs_ = mesh_mesh_contact_detector_.last_ef_count();
     last_self_broadphase_capacity_ =
         mesh_mesh_contact_detector_.max_ef_candidates();
-    last_self_broadphase_overflow_ =
-        last_self_broadphase_capacity_ > 0 &&
-        last_self_broadphase_pairs_ >= last_self_broadphase_capacity_;
-    if (last_self_broadphase_overflow_) {
-        std::fprintf(stderr,
-                     "[PABD_ERROR] self EF broadphase buffer overflow: pairs=%d capacity=%d. "
-                     "Some edge-face candidates were dropped before narrow phase.\n",
-                     last_self_broadphase_pairs_,
-                     last_self_broadphase_capacity_);
-    }
 }
 
 void PabdCudaSolver::assemble_interpolated_system_gpu(float h) {
     const std::uintptr_t s = stream_handle(stream_);
     auto* stream = reinterpret_cast<cudaStream_t>(stream_);
     constexpr int block = 128;
+    const bool body_owned_contacts =
+        params_.global_solver == PabdGlobalSolverMode::BlockJacobi12;
+    math::Vec3f* contact_rhs = body_owned_contacts ? nullptr : rhs_.gpu_data();
 
-    H_.set_zero(s);
-    check_cuda(cudaMemsetAsync(rhs_.gpu_data(), 0,
-                               rhs_.gpu_size() * sizeof(math::Vec3f),
-                               stream),
-               "interpolated rhs memset");
+    if (!body_owned_contacts) {
+        H_.set_zero(s);
+        check_cuda(cudaMemsetAsync(rhs_.gpu_data(), 0,
+                                   rhs_.gpu_size() * sizeof(math::Vec3f),
+                                   stream),
+                   "interpolated rhs memset");
+    }
     check_cuda(cudaMemsetAsync(ground_contacts_.gpu_data(), 0, sizeof(int),
                                stream),
                "interpolated ground count memset");
@@ -1038,39 +1599,41 @@ void PabdCudaSolver::assemble_interpolated_system_gpu(float h) {
 
     update_interpolated_surface_positions_gpu(x_.gpu_data());
 
-    const float inv_h2 = 1.0f / std::max(h * h, 1.0e-8f);
-    const int n_tets = static_cast<int>(tets_.gpu_size());
-    if (n_tets > 0) {
-        const int grid = (n_tets + block - 1) / block;
-        assemble_interpolated_mass_elastic_kernel<<<grid, block, 0, stream>>>(
-            H_.diag.gpu_data(),
-            H_.values.gpu_data(),
-            rhs_.gpu_data(),
-            tets_.gpu_data(),
-            tet_mass_blocks_dev_.gpu_data(),
-            n_tets,
-            y_.gpu_data(),
-            x_.gpu_data(),
-            inv_h2,
-            params_.stiffness);
-        check_cuda(cudaGetLastError(),
-                   "assemble_interpolated_mass_elastic_kernel");
-    }
+    if (!body_owned_contacts) {
+        const float inv_h2 = 1.0f / std::max(h * h, 1.0e-8f);
+        const int n_tets = static_cast<int>(tets_.gpu_size());
+        if (n_tets > 0) {
+            const int grid = (n_tets + block - 1) / block;
+            assemble_interpolated_mass_elastic_kernel<<<grid, block, 0, stream>>>(
+                H_.diag.gpu_data(),
+                H_.values.gpu_data(),
+                rhs_.gpu_data(),
+                tets_.gpu_data(),
+                tet_mass_blocks_dev_.gpu_data(),
+                n_tets,
+                y_.gpu_data(),
+                x_.gpu_data(),
+                inv_h2,
+                params_.stiffness);
+            check_cuda(cudaGetLastError(),
+                       "assemble_interpolated_mass_elastic_kernel");
+        }
 
-    const int vertex_grid = (num_vertices_ + block - 1) / block;
-    assemble_interpolated_fixed_kernel<<<vertex_grid, block, 0, stream>>>(
-        H_.diag.gpu_data(),
-        rhs_.gpu_data(),
-        rest_.gpu_data(),
-        fixed_.gpu_data(),
-        num_vertices_,
-        params_.fixed_weight);
-    check_cuda(cudaGetLastError(), "assemble_interpolated_fixed_kernel");
+        const int vertex_grid = (num_vertices_ + block - 1) / block;
+        assemble_interpolated_fixed_kernel<<<vertex_grid, block, 0, stream>>>(
+            H_.diag.gpu_data(),
+            rhs_.gpu_data(),
+            rest_.gpu_data(),
+            fixed_.gpu_data(),
+            num_vertices_,
+            params_.fixed_weight);
+        check_cuda(cudaGetLastError(), "assemble_interpolated_fixed_kernel");
+    }
 
     if (num_surface_vertices_ > 0) {
         const int surface_grid = (num_surface_vertices_ + block - 1) / block;
         append_interpolated_ground_contacts_kernel<<<surface_grid, block, 0, stream>>>(
-            rhs_.gpu_data(),
+            contact_rhs,
             surface_maps_dev_.gpu_data(),
             interpolated_surface_positions_dev_.gpu_data(),
             num_surface_vertices_,
@@ -1089,9 +1652,9 @@ void PabdCudaSolver::assemble_interpolated_system_gpu(float h) {
         interpolated_contact_capacity_ > 0 &&
         mesh_mesh_contact_detector_.valid()) {
         const int contact_grid =
-            (interpolated_contact_capacity_ + block - 1) / block;
+            bounded_count_grid(interpolated_contact_capacity_, block);
         append_interpolated_self_contacts_kernel<<<contact_grid, block, 0, stream>>>(
-            rhs_.gpu_data(),
+            contact_rhs,
             mesh_mesh_contact_detector_.contacts().gpu_data(),
             mesh_mesh_contact_detector_.count_array().gpu_data(),
             interpolated_contact_capacity_,
@@ -1107,14 +1670,152 @@ void PabdCudaSolver::assemble_interpolated_system_gpu(float h) {
                    "append_interpolated_self_contacts_kernel");
     }
 
-    collision::WideContactSpMVOp wide_op;
-    wide_op.contacts = interpolated_wide_contacts_.gpu_data();
-    wide_op.count_dev = interpolated_wide_contact_count_.gpu_data();
-    wide_op.max_contacts =
+    if (!body_owned_contacts) {
+        collision::WideContactSpMVOp wide_op;
+        wide_op.contacts = interpolated_wide_contacts_.gpu_data();
+        wide_op.count_dev = interpolated_wide_contact_count_.gpu_data();
+        wide_op.max_contacts =
+            static_cast<int>(interpolated_wide_contacts_.gpu_size());
+        wide_op.stiffness = 1.0f;
+        collision::bake_wide_contact_diag(H_.diag.gpu_data(), num_vertices_,
+                                          wide_op, 1.0f, s);
+    }
+}
+
+void PabdCudaSolver::update_block_jacobi_base_k_gpu(float h) {
+    const int n_tets = static_cast<int>(tets_.gpu_size());
+    if (n_tets <= 0) return;
+
+    const float inv_h2 = 1.0f / std::max(h * h, 1.0e-8f);
+    if (block_jacobi_base_k_valid_ &&
+        block_jacobi_base_inv_h2_ == inv_h2 &&
+        block_jacobi_base_stiffness_ == params_.stiffness &&
+        block_jacobi_base_fixed_weight_ == params_.fixed_weight) {
+        return;
+    }
+
+    auto* stream = reinterpret_cast<cudaStream_t>(stream_);
+    constexpr int block = 128;
+    const int grid = (n_tets + block - 1) / block;
+    rebuild_block_jacobi_base_k_kernel<<<grid, block, 0, stream>>>(
+        tets_.gpu_data(),
+        tet_mass_blocks_dev_.gpu_data(),
+        fixed_.gpu_data(),
+        n_tets,
+        inv_h2,
+        params_.stiffness,
+        params_.fixed_weight,
+        block_jacobi_base_k_.gpu_data());
+    check_cuda(cudaGetLastError(), "rebuild_block_jacobi_base_k_kernel");
+    block_jacobi_base_inv_h2_ = inv_h2;
+    block_jacobi_base_stiffness_ = params_.stiffness;
+    block_jacobi_base_fixed_weight_ = params_.fixed_weight;
+    block_jacobi_base_k_valid_ = true;
+}
+
+void PabdCudaSolver::build_body_contact_ell_gpu() {
+    auto* stream = reinterpret_cast<cudaStream_t>(stream_);
+    const int n_bodies = static_cast<int>(tets_.gpu_size());
+    if (n_bodies <= 0 || block_jacobi_contact_ell_width_ <= 0) return;
+
+    check_cuda(cudaMemsetAsync(
+                   block_jacobi_contact_ell_counts_.gpu_data(), 0,
+                   block_jacobi_contact_ell_counts_.gpu_size() * sizeof(int),
+                   stream),
+               "body contact ELL count memset");
+    check_cuda(cudaMemsetAsync(
+                   block_jacobi_contact_ell_overflow_.gpu_data(), 0,
+                   sizeof(int), stream),
+               "body contact ELL overflow memset");
+
+    const int wide_capacity =
         static_cast<int>(interpolated_wide_contacts_.gpu_size());
-    wide_op.stiffness = 1.0f;
-    collision::bake_wide_contact_diag(H_.diag.gpu_data(), num_vertices_,
-                                      wide_op, 1.0f, s);
+    if (wide_capacity <= 0) return;
+    constexpr int block = 128;
+    const int contact_grid = bounded_count_grid(wide_capacity, block);
+    build_body_contact_ell_kernel<<<contact_grid, block, 0, stream>>>(
+        interpolated_wide_contacts_.gpu_data(),
+        interpolated_wide_contact_count_.gpu_data(),
+        wide_capacity,
+        n_bodies,
+        block_jacobi_contact_ell_width_,
+        block_jacobi_contact_ell_counts_.gpu_data(),
+        block_jacobi_contact_ell_refs_.gpu_data(),
+        block_jacobi_contact_ell_overflow_.gpu_data());
+    check_cuda(cudaGetLastError(), "build_body_contact_ell_kernel");
+}
+
+void PabdCudaSolver::build_interpolated_pcg_body_preconditioner_gpu(float h) {
+    if (!params_.pcg_body_preconditioner ||
+        !pcg_body_preconditioner_valid_) return;
+    const int n_bodies = static_cast<int>(tets_.gpu_size());
+    if (n_bodies <= 0) return;
+
+    update_block_jacobi_base_k_gpu(h);
+    build_body_contact_ell_gpu();
+    auto* stream = reinterpret_cast<cudaStream_t>(stream_);
+    check_cuda(cudaMemsetAsync(
+                   pcg_body_preconditioner_failure_count_.gpu_data(), 0,
+                   sizeof(int), stream),
+               "PCG body preconditioner failure count memset");
+
+    constexpr int block = 128;
+    const int grid = (n_bodies + block - 1) / block;
+    build_interpolated_body_preconditioner_kernel<<<grid, block, 0, stream>>>(
+        n_bodies,
+        num_vertices_,
+        block_jacobi_base_k_.gpu_data(),
+        fixed_.gpu_data(),
+        interpolated_wide_contacts_.gpu_data(),
+        block_jacobi_contact_ell_counts_.gpu_data(),
+        block_jacobi_contact_ell_refs_.gpu_data(),
+        block_jacobi_contact_ell_width_,
+        pcg_body_preconditioner_lower_.gpu_data(),
+        pcg_body_preconditioner_failure_count_.gpu_data());
+    check_cuda(cudaGetLastError(),
+               "build_interpolated_body_preconditioner_kernel");
+}
+
+void PabdCudaSolver::solve_interpolated_block_jacobi_gpu(float h,
+                                                          float omega) {
+    auto* stream = reinterpret_cast<cudaStream_t>(stream_);
+    constexpr int block = 128;
+    const int n_tets = static_cast<int>(tets_.gpu_size());
+    if (n_tets <= 0) return;
+
+    update_block_jacobi_base_k_gpu(h);
+    check_cuda(cudaMemsetAsync(block_jacobi_failure_count_.gpu_data(), 0,
+                               sizeof(int), stream),
+               "block jacobi failure count memset");
+    check_cuda(cudaMemcpyAsync(block_jacobi_x_lagged_.gpu_data(), x_.gpu_data(),
+                               num_vertices_ * sizeof(math::Vec3f),
+                               cudaMemcpyDeviceToDevice, stream),
+               "block jacobi lagged x copy");
+
+    build_body_contact_ell_gpu();
+
+    const int body_grid = (n_tets + block - 1) / block;
+    solve_interpolated_block_jacobi_kernel<<<body_grid, block, 0, stream>>>(
+        tets_.gpu_data(),
+        n_tets,
+        block_jacobi_base_k_.gpu_data(),
+        tet_mass_blocks_dev_.gpu_data(),
+        y_.gpu_data(),
+        rest_.gpu_data(),
+        interpolated_wide_contacts_.gpu_data(),
+        block_jacobi_contact_ell_counts_.gpu_data(),
+        block_jacobi_contact_ell_refs_.gpu_data(),
+        block_jacobi_contact_ell_width_,
+        num_vertices_,
+        block_jacobi_x_lagged_.gpu_data(),
+        fixed_.gpu_data(),
+        1.0f / std::max(h * h, 1.0e-8f),
+        params_.stiffness,
+        params_.fixed_weight,
+        x_.gpu_data(),
+        omega,
+        block_jacobi_failure_count_.gpu_data());
+    check_cuda(cudaGetLastError(), "solve_interpolated_block_jacobi_kernel");
 }
 
 void PabdCudaSolver::step_interpolated(float dt) {
@@ -1139,20 +1840,41 @@ void PabdCudaSolver::step_interpolated(float dt) {
 
         solver::PCGParams pcg_params;
         pcg_params.max_iterations = params_.pcg_iterations;
+        pcg_params.compute_true_residual =
+            params_.pcg_true_residual_diagnostics;
         const int iterations = std::max(1, params_.iterations);
         for (int iter = 0; iter < iterations; ++iter) {
             assemble_interpolated_system_gpu(h);
-            collision::WideContactSpMVOp wide_op{
-                interpolated_wide_contacts_.gpu_data(),
-                interpolated_wide_contact_count_.gpu_data(),
-                static_cast<int>(interpolated_wide_contacts_.gpu_size()),
-                1.0f};
-            last_pcg_iterations_ = pcg_.solve(
-                H_, DeviceSpan<math::Vec3f>::from(rhs_),
-                DeviceSpan<math::Vec3f>::from(x_),
-                pcg_params, stream_handle(stream_),
-                collision::ContactSpMVOp{},
-                wide_op);
+            if (params_.global_solver == PabdGlobalSolverMode::BlockJacobi12) {
+                solve_interpolated_block_jacobi_gpu(
+                    h, params_.block_jacobi_omega);
+                last_pcg_iterations_ = 0;
+            } else {
+                build_interpolated_pcg_body_preconditioner_gpu(h);
+                collision::WideContactSpMVOp wide_op{
+                    interpolated_wide_contacts_.gpu_data(),
+                    interpolated_wide_contact_count_.gpu_data(),
+                    static_cast<int>(interpolated_wide_contacts_.gpu_size()),
+                    1.0f};
+                solver::BodyBlock12PreconditionerOp body_preconditioner;
+                if (params_.pcg_body_preconditioner &&
+                    pcg_body_preconditioner_valid_) {
+                    body_preconditioner.lower_factors =
+                        pcg_body_preconditioner_lower_.gpu_data();
+                    body_preconditioner.body_rows =
+                        pcg_body_preconditioner_rows_.gpu_data();
+                    body_preconditioner.fixed_rows = fixed_.gpu_data();
+                    body_preconditioner.num_bodies =
+                        static_cast<int>(tets_.gpu_size());
+                }
+                last_pcg_iterations_ = pcg_.solve(
+                    H_, DeviceSpan<math::Vec3f>::from(rhs_),
+                    DeviceSpan<math::Vec3f>::from(x_),
+                    pcg_params, stream_handle(stream_),
+                    collision::ContactSpMVOp{},
+                    wide_op,
+                    body_preconditioner);
+            }
             apply_fixed_kernel<<<vertex_grid, block, 0, stream>>>(
                 x_.gpu_data(), rest_.gpu_data(), fixed_.gpu_data(), num_vertices_);
             check_cuda(cudaGetLastError(), "interpolated apply_fixed_kernel");
@@ -1166,8 +1888,18 @@ void PabdCudaSolver::step_interpolated(float dt) {
 
     update_interpolated_surface_positions_gpu(x_.gpu_data(), true);
 
-    last_residual_ = pcg_.last_residual();
+    if (params_.global_solver != PabdGlobalSolverMode::BlockJacobi12) {
+        pcg_.copy_last_residual_to_host(stream_handle(stream_));
+    }
     ground_contacts_.copy_to_host(stream_handle(stream_));
+    block_jacobi_failure_count_.copy_to_host(stream_handle(stream_));
+    block_jacobi_contact_ell_overflow_.copy_to_host(stream_handle(stream_));
+    if (params_.global_solver != PabdGlobalSolverMode::BlockJacobi12 &&
+        params_.pcg_body_preconditioner &&
+        pcg_body_preconditioner_valid_) {
+        pcg_body_preconditioner_failure_count_.copy_to_host(
+            stream_handle(stream_));
+    }
     interpolated_debug_counts_.copy_to_host(stream_handle(stream_));
     interpolated_normal_sum_.copy_to_host(stream_handle(stream_));
     interpolated_surface_min_y_dev_.copy_to_host(stream_handle(stream_));
@@ -1180,14 +1912,78 @@ void PabdCudaSolver::step_interpolated(float dt) {
     }
     check_cuda(cudaStreamSynchronize(reinterpret_cast<cudaStream_t>(stream_)),
                "step_interpolated final sync");
+    last_residual_ =
+        params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
+            ? 0.0f
+            : pcg_.host_last_residual();
+    last_true_relative_residual_ =
+        params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
+            ? -1.0f
+            : pcg_.host_last_true_relative_residual();
     min_y_ = interpolated_surface_min_y_dev_.cpu_data()[0];
     last_ground_contacts_ = ground_contacts_.cpu_data()[0];
+    last_block_jacobi_failures_ =
+        block_jacobi_failure_count_.cpu_data()[0];
+    last_block_jacobi_contact_ell_overflow_ =
+        block_jacobi_contact_ell_overflow_.cpu_data()[0];
+    last_pcg_body_preconditioner_failures_ =
+        params_.global_solver != PabdGlobalSolverMode::BlockJacobi12 &&
+                params_.pcg_body_preconditioner &&
+                pcg_body_preconditioner_valid_
+            ? pcg_body_preconditioner_failure_count_.cpu_data()[0]
+            : 0;
+    if (last_block_jacobi_contact_ell_overflow_ > 0) {
+        std::fprintf(
+            stderr,
+            "[PABD_ERROR] body-contact ELL overflow: "
+            "dropped_refs=%d width=%d. Increase the ELL width policy.\n",
+            last_block_jacobi_contact_ell_overflow_,
+            block_jacobi_contact_ell_width_);
+    }
+    if (last_pcg_body_preconditioner_failures_ > 0) {
+        std::fprintf(
+            stderr,
+            "[PABD_ERROR] PCG 12x12 body preconditioner Cholesky failures=%d\n",
+            last_pcg_body_preconditioner_failures_);
+    }
     last_self_contacts_ = interpolated_debug_counts_.cpu_data()[0];
     last_self_vertical_contacts_ = interpolated_debug_counts_.cpu_data()[1];
     last_self_horizontal_contacts_ = interpolated_debug_counts_.cpu_data()[2];
     last_self_point_face_contacts_ = interpolated_debug_counts_.cpu_data()[3];
     last_self_edge_edge_contacts_ = interpolated_debug_counts_.cpu_data()[4];
     last_self_normal_sum_ = interpolated_normal_sum_.cpu_data()[0];
+    last_self_broadphase_pairs_ =
+        mesh_mesh_contact_detector_.valid()
+            ? mesh_mesh_contact_detector_.last_ef_count()
+            : 0;
+    last_mesh_broadphase_refreshed_ =
+        mesh_mesh_contact_detector_.last_broadphase_refreshed();
+    mesh_broadphase_cache_age_ =
+        mesh_mesh_contact_detector_.broadphase_cache_age();
+    mesh_broadphase_refresh_count_ =
+        mesh_mesh_contact_detector_.broadphase_refresh_count();
+    last_mesh_broadphase_max_displacement_ =
+        mesh_mesh_contact_detector_.last_broadphase_max_displacement();
+    last_mesh_broadphase_dropped_hits_ =
+        mesh_mesh_contact_detector_.last_broadphase_dropped_hits();
+    last_self_broadphase_overflow_ =
+        last_self_broadphase_capacity_ > 0 &&
+        last_self_broadphase_pairs_ >= last_self_broadphase_capacity_;
+    if (last_self_broadphase_overflow_) {
+        std::fprintf(stderr,
+                     "[PABD_ERROR] self EF broadphase buffer overflow: pairs=%d capacity=%d. "
+                     "Some edge-face candidates were dropped before narrow phase.\n",
+                     last_self_broadphase_pairs_,
+                     last_self_broadphase_capacity_);
+    }
+    if (last_mesh_broadphase_refreshed_ &&
+        last_mesh_broadphase_dropped_hits_ > 0) {
+        std::fprintf(
+            stderr,
+            "[PABD_ERROR] OptiX per-edge EF hit capacity overflow: "
+            "dropped=%d. Increase max_hits_per_edge or reduce broadphase skin.\n",
+            last_mesh_broadphase_dropped_hits_);
+    }
     last_self_raw_contacts_ = 0;
     last_self_contact_overflow_ = false;
     if (mesh_mesh_contact_detector_.valid() && interpolated_contact_capacity_ > 0) {

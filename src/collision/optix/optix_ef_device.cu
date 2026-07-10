@@ -39,7 +39,7 @@ extern "C" __global__ void __raygen__ef() {
         0.0f, 1.0f,        // tmin, tmax: ray spans the edge
         0.0f,               // rayTime
         OptixVisibilityMask(255),
-        OPTIX_RAY_FLAG_ENFORCE_ANYHIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
+        OPTIX_RAY_FLAG_DISABLE_ANYHIT | OPTIX_RAY_FLAG_DISABLE_CLOSESTHIT,
         0, 0, 0             // SBT offset/stride/miss index
     );
 }
@@ -64,12 +64,21 @@ extern "C" __global__ void __intersection__ef() {
     if (face.y == edge.x || face.y == edge.y) return;
     if (face.z == edge.x || face.z == edge.y) return;
 
+    if (params.vertex_mesh_ids != nullptr) {
+        const int edge_mesh = params.vertex_mesh_ids[edge.x];
+        const int face_mesh = params.vertex_mesh_ids[face.x];
+        const bool same_mesh = edge_mesh == face_mesh;
+        const unsigned int category_bit = same_mesh ? 1u : 2u;
+        if ((params.collision_mask & category_bit) == 0u) return;
+    }
+
     // Record hit
     int slot = atomicAdd(&params.hit_counts[eid], 1);
     if (slot < params.max_hits_per_edge) {
         params.hits_buffer[eid * params.max_hits_per_edge + slot] = prim_idx;
     }
 
-    // Report intersection to keep traversal going (anyhit will ignore it)
-    optixReportIntersection(0.5f, 0);
+    // Do not report an accepted intersection. Returning without a report
+    // makes traversal continue to the next overlapping custom primitive,
+    // avoiding an any-hit program transition for this broadphase-only query.
 }
