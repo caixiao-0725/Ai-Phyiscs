@@ -14,6 +14,7 @@
 #include <utility>
 
 #include "../../collision/contact_spmv.h"
+#include "../../collision/friction.cuh"
 #include "../../io/obj_io.h"
 
 namespace chysx {
@@ -357,38 +358,48 @@ __device__ __forceinline__ void gather_body_contact_ell_to_local_system(
             wc.normal_target.z,
         };
         const float k = wc.stiffness;
+        const float tangent_k = wc.friction_target_alpha.w;
+        const float normal_k = k - tangent_k;
         #pragma unroll
         for (int row = 0; row < kBlockJacobiDofs; ++row) {
             const int a = row / 3;
             const int r = row - 3 * a;
-            const float ur = own_w[a] * normal[r];
             #pragma unroll
             for (int col = 0; col <= row; ++col) {
                 const int b = col / 3;
                 const int q = col - 3 * b;
-                A[row][col] += k * ur * own_w[b] * normal[q];
+                const float h = normal_k * normal[r] * normal[q] +
+                    (r == q ? tangent_k : 0.0f);
+                A[row][col] += own_w[a] * own_w[b] * h;
             }
         }
 
         if constexpr (BuildRhs) {
-            float rhs_scale = k * wc.normal_target.w;
+            const math::Vec3f n(normal[0], normal[1], normal[2]);
+            const math::Vec3f lagged_relative(
+                wc.friction_target_alpha.x,
+                wc.friction_target_alpha.y,
+                wc.friction_target_alpha.z);
+            math::Vec3f rhs_target = n * (k * wc.normal_target.w);
+            rhs_target += (lagged_relative -
+                           n * math::dot(lagged_relative, n)) * tangent_k;
             if (other_base >= 0 && other_base + 3 < n_controls) {
                 math::Vec3f other_position(0.0f, 0.0f, 0.0f);
                 #pragma unroll
                 for (int a = 0; a < 4; ++a) {
                     other_position += x_lagged[other_base + a] * other_w[a];
                 }
-                rhs_scale -= k * (normal[0] * other_position.x +
-                                  normal[1] * other_position.y +
-                                  normal[2] * other_position.z);
+                const float other_normal = math::dot(n, other_position);
+                rhs_target -= n * (normal_k * other_normal) +
+                              other_position * tangent_k;
             }
 
             #pragma unroll
             for (int a = 0; a < 4; ++a) {
-                const float scale = own_w[a] * rhs_scale;
-                b[3 * a + 0] += normal[0] * scale;
-                b[3 * a + 1] += normal[1] * scale;
-                b[3 * a + 2] += normal[2] * scale;
+                const float scale = own_w[a];
+                b[3 * a + 0] += rhs_target.x * scale;
+                b[3 * a + 1] += rhs_target.y * scale;
+                b[3 * a + 2] += rhs_target.z * scale;
             }
         }
     }
@@ -716,6 +727,59 @@ __device__ void merge_wide_coeff(int dof,
     }
 }
 
+__device__ math::Vec4f compute_wide_contact_friction(
+    const int* dofs,
+    const float* coeffs,
+    int coeff_count,
+    math::Vec3f normal,
+    float depth,
+    float normal_stiffness,
+    float friction_mu,
+    float friction_epsilon,
+    const math::Vec3f* current_controls,
+    const math::Vec3f* old_controls) {
+    math::Vec3f old_relative(0.0f, 0.0f, 0.0f);
+    math::Vec3f current_relative(0.0f, 0.0f, 0.0f);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        if (i >= coeff_count) break;
+        old_relative += old_controls[dofs[i]] * coeffs[i];
+        current_relative += current_controls[dofs[i]] * coeffs[i];
+    }
+
+    float tangent_stiffness = 0.0f;
+    if (friction_mu > 0.0f && depth > 0.0f) {
+        const math::Vec3f delta = current_relative - old_relative;
+        const math::Vec3f slip = delta - normal * math::dot(delta, normal);
+        const float slip_norm = sqrtf(math::dot(slip, slip));
+        const float epsilon = fmaxf(friction_epsilon, 1.0e-8f);
+        const float normal_force = normal_stiffness * depth;
+        tangent_stiffness = friction_mu * normal_force *
+            collision::ipc_f1_sf_over_x(slip_norm, epsilon);
+    }
+    return math::Vec4f(old_relative.x, old_relative.y, old_relative.z,
+                       tangent_stiffness);
+}
+
+__device__ math::Vec3f wide_contact_rhs_target(
+    math::Vec3f normal,
+    float normal_target,
+    float normal_stiffness,
+    math::Vec4f friction_target_alpha) {
+    math::Vec3f target = normal * (normal_stiffness * normal_target);
+    const float tangent_stiffness = friction_target_alpha.w;
+    if (tangent_stiffness > 0.0f) {
+        const math::Vec3f lagged_relative(
+            friction_target_alpha.x,
+            friction_target_alpha.y,
+            friction_target_alpha.z);
+        const math::Vec3f tangent_target = lagged_relative -
+            normal * math::dot(lagged_relative, normal);
+        target += tangent_target * tangent_stiffness;
+    }
+    return target;
+}
+
 __device__ void store_wide_contact(collision::WideContact* wide_contacts,
                                    int cid,
                                    const int* dofs,
@@ -723,13 +787,15 @@ __device__ void store_wide_contact(collision::WideContact* wide_contacts,
                                    int coeff_count,
                                    math::Vec3f normal,
                                    float target,
-                                   float stiffness) {
+                                   float stiffness,
+                                   math::Vec4f friction_target_alpha) {
     collision::WideContact out{};
     out.base0 = -1;
     out.base1 = -1;
     out.weights0 = math::Vec4f(0.0f, 0.0f, 0.0f, 0.0f);
     out.weights1 = math::Vec4f(0.0f, 0.0f, 0.0f, 0.0f);
     out.normal_target = math::Vec4f(normal.x, normal.y, normal.z, target);
+    out.friction_target_alpha = friction_target_alpha;
     out.stiffness = stiffness;
     for (int i = 0; i < coeff_count && i < 8; ++i) {
         const int base = (dofs[i] / 4) * 4;
@@ -752,9 +818,13 @@ __global__ void append_interpolated_ground_contacts_kernel(
     math::Vec3f* rhs,
     const PabdSurfaceMapDevice* maps,
     const math::Vec3f* surface_positions,
+    const math::Vec3f* current_controls,
+    const math::Vec3f* old_controls,
     int n_surface,
     float target_y,
     float stiffness,
+    float friction_mu,
+    float friction_epsilon,
     int* ground_count,
     collision::WideContact* wide_contacts,
     int* wide_count,
@@ -775,18 +845,25 @@ __global__ void append_interpolated_ground_contacts_kernel(
         const float wa = map.weight[a];
         if (ia < 0 || wa == 0.0f) continue;
         merge_wide_coeff(ia, wa, dofs, coeffs, &coeff_count);
-        if (rhs != nullptr) {
-            atomic_add_vec(&rhs[ia],
-                           math::Vec3f(0.0f, stiffness * wa * target_y,
-                                       0.0f));
-        }
     }
     if (coeff_count > 0) {
+        const math::Vec3f normal(0.0f, 1.0f, 0.0f);
+        const math::Vec4f friction = compute_wide_contact_friction(
+            dofs, coeffs, coeff_count, normal,
+            target_y - surface_positions[sid].y,
+            stiffness, friction_mu, friction_epsilon,
+            current_controls, old_controls);
+        const math::Vec3f rhs_target = wide_contact_rhs_target(
+            normal, target_y, stiffness, friction);
+        if (rhs != nullptr) {
+            for (int i = 0; i < coeff_count; ++i) {
+                atomic_add_vec(&rhs[dofs[i]], rhs_target * coeffs[i]);
+            }
+        }
         const int cid = atomicAdd(wide_count, 1);
         if (cid < wide_capacity) {
             store_wide_contact(wide_contacts, cid, dofs, coeffs, coeff_count,
-                               math::Vec3f(0.0f, 1.0f, 0.0f),
-                               target_y, stiffness);
+                               normal, target_y, stiffness, friction);
         }
     }
 }
@@ -797,8 +874,12 @@ __global__ void append_interpolated_self_contacts_kernel(
     const int* contact_count,
     int max_contacts,
     const PabdSurfaceMapDevice* maps,
+    const math::Vec3f* current_controls,
+    const math::Vec3f* old_controls,
     float contact_gap,
     float stiffness,
+    float friction_mu,
+    float friction_epsilon,
     int* debug_counts,
     math::Vec3f* normal_sum,
     collision::WideContact* wide_contacts,
@@ -844,20 +925,28 @@ __global__ void append_interpolated_self_contacts_kernel(
             }
         }
 
-        if (rhs != nullptr) {
-            for (int i = 0; i < coeff_count; ++i) {
-                const int di = dofs[i];
-                const float ci = coeffs[i];
-                atomic_add_vec(&rhs[di],
-                               c.normal * (stiffness * ci * contact_gap));
-            }
-        }
         if (coeff_count > 0) {
+            const math::Vec4f friction = compute_wide_contact_friction(
+                dofs, coeffs, coeff_count, c.normal,
+                contact_gap - c.separation,
+                stiffness, friction_mu, friction_epsilon,
+                current_controls, old_controls);
+            if (friction.w > 0.0f) {
+                atomicAdd(&debug_counts[5], 1);
+            }
+            const math::Vec3f rhs_target = wide_contact_rhs_target(
+                c.normal, contact_gap, stiffness, friction);
+            if (rhs != nullptr) {
+                for (int i = 0; i < coeff_count; ++i) {
+                    atomic_add_vec(&rhs[dofs[i]],
+                                   rhs_target * coeffs[i]);
+                }
+            }
             const int out_cid = atomicAdd(wide_count, 1);
             if (out_cid < wide_capacity) {
                 store_wide_contact(wide_contacts, out_cid, dofs, coeffs,
                                    coeff_count, c.normal, contact_gap,
-                                   stiffness);
+                                   stiffness, friction);
             }
         }
     }
@@ -1358,8 +1447,8 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
             static_cast<std::size_t>(num_surface_vertices_));
         interpolated_surface_min_y_dev_.resize(1);
         interpolated_surface_min_y_dev_[0] = 0.0f;
-        interpolated_debug_counts_.resize(5);
-        for (int i = 0; i < 5; ++i) {
+        interpolated_debug_counts_.resize(6);
+        for (int i = 0; i < 6; ++i) {
             interpolated_debug_counts_[i] = 0;
         }
         interpolated_normal_sum_.resize(1);
@@ -1552,6 +1641,7 @@ void PabdCudaSolver::detect_interpolated_contacts_gpu() {
         last_mesh_broadphase_dropped_hits_ = 0;
         last_self_point_face_contacts_ = 0;
         last_self_edge_edge_contacts_ = 0;
+        last_self_friction_contacts_ = 0;
         return;
     }
 
@@ -1636,9 +1726,13 @@ void PabdCudaSolver::assemble_interpolated_system_gpu(float h) {
             contact_rhs,
             surface_maps_dev_.gpu_data(),
             interpolated_surface_positions_dev_.gpu_data(),
+            x_.gpu_data(),
+            old_x_.gpu_data(),
             num_surface_vertices_,
             params_.ground_y + params_.contact_gap,
             params_.ground_stiffness,
+            params_.ground_friction,
+            params_.friction_epsilon,
             ground_contacts_.gpu_data(),
             interpolated_wide_contacts_.gpu_data(),
             interpolated_wide_contact_count_.gpu_data(),
@@ -1659,8 +1753,12 @@ void PabdCudaSolver::assemble_interpolated_system_gpu(float h) {
             mesh_mesh_contact_detector_.count_array().gpu_data(),
             interpolated_contact_capacity_,
             surface_maps_dev_.gpu_data(),
+            x_.gpu_data(),
+            old_x_.gpu_data(),
             params_.contact_gap,
             params_.self_collision_stiffness,
+            params_.self_collision_friction,
+            params_.friction_epsilon,
             interpolated_debug_counts_.gpu_data(),
             interpolated_normal_sum_.gpu_data(),
             interpolated_wide_contacts_.gpu_data(),
@@ -1951,6 +2049,7 @@ void PabdCudaSolver::step_interpolated(float dt) {
     last_self_horizontal_contacts_ = interpolated_debug_counts_.cpu_data()[2];
     last_self_point_face_contacts_ = interpolated_debug_counts_.cpu_data()[3];
     last_self_edge_edge_contacts_ = interpolated_debug_counts_.cpu_data()[4];
+    last_self_friction_contacts_ = interpolated_debug_counts_.cpu_data()[5];
     last_self_normal_sum_ = interpolated_normal_sum_.cpu_data()[0];
     last_self_broadphase_pairs_ =
         mesh_mesh_contact_detector_.valid()

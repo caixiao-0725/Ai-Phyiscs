@@ -41,8 +41,11 @@ struct PabdCudaParams {
     float ground_y = 0.0f;
     float contact_gap = 0.035f;
     float ground_stiffness = 0.0f;
+    float ground_friction = 0.0f;
     float self_collision_thickness = 0.0f;
     float self_collision_stiffness = 0.0f;
+    float self_collision_friction = 0.0f;
+    float friction_epsilon = 1.0e-3f;
     int self_collision_max_contacts = 256;
     int mesh_broadphase_interval = 1;
     float mesh_broadphase_skin = 0.0f;
@@ -137,6 +140,9 @@ public:
     int last_self_contacts() const noexcept { return last_self_contacts_; }
     int last_self_point_face_contacts() const noexcept { return last_self_point_face_contacts_; }
     int last_self_edge_edge_contacts() const noexcept { return last_self_edge_edge_contacts_; }
+    int last_self_friction_contacts() const noexcept {
+        return last_self_friction_contacts_;
+    }
     int last_self_vertical_contacts() const noexcept { return last_self_vertical_contacts_; }
     int last_self_horizontal_contacts() const noexcept { return last_self_horizontal_contacts_; }
     int last_self_broadphase_pairs() const noexcept { return last_self_broadphase_pairs_; }
@@ -268,6 +274,7 @@ private:
     int last_self_contacts_ = 0;
     int last_self_point_face_contacts_ = 0;
     int last_self_edge_edge_contacts_ = 0;
+    int last_self_friction_contacts_ = 0;
     int last_self_vertical_contacts_ = 0;
     int last_self_horizontal_contacts_ = 0;
     int last_self_broadphase_pairs_ = 0;

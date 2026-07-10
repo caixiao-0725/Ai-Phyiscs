@@ -95,11 +95,15 @@ struct alignas(16) WideContact {
     math::Vec4f weights0;       // signed coefficients for base0 + [0..3]
     math::Vec4f weights1;       // signed coefficients for base1 + [0..3]
     math::Vec4f normal_target;  // xyz = normal, w = RHS target offset
+    math::Vec4f friction_target_alpha;  // xyz = lagged relative point, w = tangent stiffness
     int base0 = -1;             // first consecutive 4-control block
     int base1 = -1;             // second consecutive block, -1 when unused
     float stiffness = 0.0f;     // per-contact stiffness
     float pad0 = 0.0f;
 };
+
+static_assert(sizeof(WideContact) == 80,
+              "WideContact must keep its compact 80-byte layout");
 
 struct WideContactSpMVOp {
     const WideContact* contacts = nullptr;

@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "collision/contact_spmv.h"
 #include "collision/mesh_mesh_contact.h"
+#include "memory/cuda_array.h"
 
 namespace {
 
@@ -19,8 +22,12 @@ using chysx::collision::MeshCollisionCategory;
 using chysx::collision::MeshCollisionMask;
 using chysx::collision::kMeshCollisionInterObject;
 using chysx::collision::kMeshCollisionSelf;
+using chysx::collision::WideContact;
+using chysx::collision::WideContactSpMVOp;
+using chysx::math::Mat3f;
 using chysx::math::Vec3f;
 using chysx::math::Vec3i;
+using chysx::math::Vec4f;
 
 struct TestMesh {
     std::vector<Vec3f> positions;
@@ -56,6 +63,15 @@ void require(bool cond, const std::string& message) {
     if (!cond) {
         throw std::runtime_error(message);
     }
+}
+
+void require_near(float actual,
+                  float expected,
+                  float tolerance,
+                  const std::string& message) {
+    require(std::abs(actual - expected) <= tolerance,
+            message + ": expected " + std::to_string(expected) +
+                ", got " + std::to_string(actual));
 }
 
 int count_type(const std::vector<MeshMeshContact>& contacts,
@@ -491,6 +507,71 @@ void run_oriented_edge_edge_crossing(BroadphaseBackend backend) {
             "crossed EE contact must report negative signed separation");
 }
 
+void run_wide_contact_friction_spmv() {
+    std::cout << "[contact_spmv] wide-contact tangent block\n";
+    chysx::CudaArray<WideContact> contacts(1);
+    chysx::CudaArray<int> count(1);
+    chysx::CudaArray<Mat3f> diag(8);
+    chysx::CudaArray<Vec3f> x(8);
+    chysx::CudaArray<Vec3f> y(8);
+
+    WideContact contact{};
+    contact.weights0 = Vec4f(1.0f, 0.0f, 0.0f, 0.0f);
+    contact.weights1 = Vec4f(-1.0f, 0.0f, 0.0f, 0.0f);
+    contact.normal_target = Vec4f(0.0f, 1.0f, 0.0f, 0.01f);
+    contact.friction_target_alpha = Vec4f(0.0f, 0.0f, 0.0f, 3.0f);
+    contact.base0 = 0;
+    contact.base1 = 4;
+    contact.stiffness = 10.0f;
+    contacts.cpu_data()[0] = contact;
+    count.cpu_data()[0] = 1;
+    for (int i = 0; i < 8; ++i) {
+        diag.cpu_data()[i] = Mat3f{};
+        x.cpu_data()[i] = Vec3f(0.0f, 0.0f, 0.0f);
+        y.cpu_data()[i] = Vec3f(0.0f, 0.0f, 0.0f);
+    }
+    x.cpu_data()[0] = Vec3f(1.0f, 2.0f, 3.0f);
+    x.cpu_data()[4] = Vec3f(4.0f, 6.0f, 8.0f);
+    contacts.copy_to_device();
+    count.copy_to_device();
+    diag.copy_to_device();
+    x.copy_to_device();
+    y.copy_to_device();
+
+    const WideContactSpMVOp op{
+        contacts.gpu_data(), count.gpu_data(), 1, 1.0f};
+    chysx::collision::bake_wide_contact_diag(
+        diag.gpu_data(), 8, op, 1.0f, 0);
+    chysx::collision::apply_wide_contact_spmv(
+        op, x.gpu_data(), y.gpu_data(), 8, 1.0f, 0);
+    diag.copy_to_host();
+    y.copy_to_host();
+
+    for (int id : {0, 4}) {
+        const Mat3f& h = diag.cpu_data()[id];
+        require_near(h.data[0], 3.0f, 1.0e-5f,
+                     "wide-contact tangent xx diagonal");
+        require_near(h.data[4], 10.0f, 1.0e-5f,
+                     "wide-contact normal yy diagonal");
+        require_near(h.data[8], 3.0f, 1.0e-5f,
+                     "wide-contact tangent zz diagonal");
+        require_near(h.data[1], 0.0f, 1.0e-5f,
+                     "wide-contact xy coupling");
+    }
+    require_near(y.cpu_data()[0].x, -12.0f, 1.0e-5f,
+                 "wide-contact offdiag y0.x");
+    require_near(y.cpu_data()[0].y, -60.0f, 1.0e-5f,
+                 "wide-contact offdiag y0.y");
+    require_near(y.cpu_data()[0].z, -24.0f, 1.0e-5f,
+                 "wide-contact offdiag y0.z");
+    require_near(y.cpu_data()[4].x, -3.0f, 1.0e-5f,
+                 "wide-contact offdiag y4.x");
+    require_near(y.cpu_data()[4].y, -20.0f, 1.0e-5f,
+                 "wide-contact offdiag y4.y");
+    require_near(y.cpu_data()[4].z, -9.0f, 1.0e-5f,
+                 "wide-contact offdiag y4.z");
+}
+
 }  // namespace
 
 int main() {
@@ -505,6 +586,7 @@ int main() {
         run_parallel_edge_edge_discarded();
         run_oriented_point_face_crossing(BroadphaseBackend::QuantBvh);
         run_oriented_edge_edge_crossing(BroadphaseBackend::QuantBvh);
+        run_wide_contact_friction_spmv();
 #ifdef CHYSX_HAS_OPTIX
         run_optix_collision_categories();
         run_fat_broadphase_cache(BroadphaseBackend::OptiX);

@@ -253,7 +253,9 @@ __global__ void bake_wide_contact_diag_kernel(
          c < n; c += stride) {
         const WideContact wc = contacts[c];
         const float k = k_alpha * wc.stiffness;
-        if (k == 0.0f) continue;
+        const float tangent_k =
+            k_alpha * wc.friction_target_alpha.w;
+        if (k == 0.0f && tangent_k == 0.0f) continue;
         const int ids[8] = {
             wc.base0 >= 0 ? wc.base0 + 0 : -1,
             wc.base0 >= 0 ? wc.base0 + 1 : -1,
@@ -271,12 +273,13 @@ __global__ void bake_wide_contact_diag_kernel(
         const float nx = wc.normal_target.x;
         const float ny = wc.normal_target.y;
         const float nz = wc.normal_target.z;
-        const float h00 = k * nx * nx;
-        const float h01 = k * nx * ny;
-        const float h02 = k * nx * nz;
-        const float h11 = k * ny * ny;
-        const float h12 = k * ny * nz;
-        const float h22 = k * nz * nz;
+        const float normal_k = k - tangent_k;
+        const float h00 = normal_k * nx * nx + tangent_k;
+        const float h01 = normal_k * nx * ny;
+        const float h02 = normal_k * nx * nz;
+        const float h11 = normal_k * ny * ny + tangent_k;
+        const float h12 = normal_k * ny * nz;
+        const float h22 = normal_k * nz * nz + tangent_k;
 
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
@@ -326,6 +329,7 @@ __global__ void apply_wide_contact_spmv_kernel(
         float ny = 0.0f;
         float nz = 0.0f;
         float k = 0.0f;
+        float tangent_k = 0.0f;
         if (lane == 0) {
             base0 = wc.base0;
             base1 = wc.base1;
@@ -333,6 +337,7 @@ __global__ void apply_wide_contact_spmv_kernel(
             ny = wc.normal_target.y;
             nz = wc.normal_target.z;
             k = k_alpha * wc.stiffness;
+            tangent_k = k_alpha * wc.friction_target_alpha.w;
         }
         base0 = __shfl_sync(group_mask, base0, 0, kWideContactGroupSize);
         base1 = __shfl_sync(group_mask, base1, 0, kWideContactGroupSize);
@@ -340,7 +345,9 @@ __global__ void apply_wide_contact_spmv_kernel(
         ny = __shfl_sync(group_mask, ny, 0, kWideContactGroupSize);
         nz = __shfl_sync(group_mask, nz, 0, kWideContactGroupSize);
         k = __shfl_sync(group_mask, k, 0, kWideContactGroupSize);
-        if (k == 0.0f) continue;
+        tangent_k = __shfl_sync(
+            group_mask, tangent_k, 0, kWideContactGroupSize);
+        if (k == 0.0f && tangent_k == 0.0f) continue;
 
         const bool first_side = lane < 4;
         const int local = first_side ? lane : lane - 4;
@@ -350,30 +357,64 @@ __global__ void apply_wide_contact_spmv_kernel(
         const math::Vec3f xi = id >= 0
             ? x[id]
             : math::Vec3f(0.0f, 0.0f, 0.0f);
-        const float projection = nx * xi.x + ny * xi.y + nz * xi.z;
-        float weighted_projection = wi * projection;
-
-        #pragma unroll
-        for (int offset = kWideContactGroupSize / 2;
-             offset > 0; offset >>= 1) {
-            weighted_projection += __shfl_down_sync(
-                group_mask, weighted_projection, offset,
-                kWideContactGroupSize);
-        }
-        const float normal_weighted_x = __shfl_sync(
-            group_mask, weighted_projection, 0, kWideContactGroupSize);
         float cx = 0.0f;
         float cy = 0.0f;
         float cz = 0.0f;
-        if (id >= 0 && wi != 0.0f) {
-            // The diagonal wi^2 block is already in A.diag.  Subtract it
-            // from the rank-one contact action to retain only off-diagonals.
-            const float offdiag_projection =
-                normal_weighted_x - wi * projection;
-            const float scale = wi * k * offdiag_projection;
-            cx = scale * nx;
-            cy = scale * ny;
-            cz = scale * nz;
+        if (tangent_k == 0.0f) {
+            const float projection = nx * xi.x + ny * xi.y + nz * xi.z;
+            float weighted_projection = wi * projection;
+            #pragma unroll
+            for (int offset = kWideContactGroupSize / 2;
+                 offset > 0; offset >>= 1) {
+                weighted_projection += __shfl_down_sync(
+                    group_mask, weighted_projection, offset,
+                    kWideContactGroupSize);
+            }
+            const float normal_weighted_x = __shfl_sync(
+                group_mask, weighted_projection, 0,
+                kWideContactGroupSize);
+            if (id >= 0 && wi != 0.0f) {
+                const float offdiag_projection =
+                    normal_weighted_x - wi * projection;
+                const float scale = wi * k * offdiag_projection;
+                cx = scale * nx;
+                cy = scale * ny;
+                cz = scale * nz;
+            }
+        } else {
+            float weighted_x = wi * xi.x;
+            float weighted_y = wi * xi.y;
+            float weighted_z = wi * xi.z;
+            #pragma unroll
+            for (int offset = kWideContactGroupSize / 2;
+                 offset > 0; offset >>= 1) {
+                weighted_x += __shfl_down_sync(
+                    group_mask, weighted_x, offset,
+                    kWideContactGroupSize);
+                weighted_y += __shfl_down_sync(
+                    group_mask, weighted_y, offset,
+                    kWideContactGroupSize);
+                weighted_z += __shfl_down_sync(
+                    group_mask, weighted_z, offset,
+                    kWideContactGroupSize);
+            }
+            const float off_x = __shfl_sync(
+                group_mask, weighted_x, 0,
+                kWideContactGroupSize) - wi * xi.x;
+            const float off_y = __shfl_sync(
+                group_mask, weighted_y, 0,
+                kWideContactGroupSize) - wi * xi.y;
+            const float off_z = __shfl_sync(
+                group_mask, weighted_z, 0,
+                kWideContactGroupSize) - wi * xi.z;
+            if (id >= 0 && wi != 0.0f) {
+                const float dn = nx * off_x + ny * off_y + nz * off_z;
+                const float normal_scale = wi * (k - tangent_k) * dn;
+                const float tangent_scale = wi * tangent_k;
+                cx = normal_scale * nx + tangent_scale * off_x;
+                cy = normal_scale * ny + tangent_scale * off_y;
+                cz = normal_scale * nz + tangent_scale * off_z;
+            }
         }
 
 #if CHYSX_USE_FLOAT4_ATOMIC_ADD

@@ -724,12 +724,21 @@ public:
             changed |= ImGui::SliderFloat("ground stiffness",
                                           &params_.ground_stiffness,
                                           0.0f, 1.0e5f, "%.1e");
+            changed |= ImGui::SliderFloat("ground friction",
+                                          &params_.ground_friction,
+                                          0.0f, 2.0f, "%.2f");
             changed |= ImGui::SliderFloat("self collision thickness",
                                           &params_.self_collision_thickness,
                                           0.0f, 0.2f, "%.3f");
             changed |= ImGui::SliderFloat("self collision stiffness",
                                           &params_.self_collision_stiffness,
                                           0.0f, 1.0e5f, "%.1e");
+            changed |= ImGui::SliderFloat("self collision friction",
+                                          &params_.self_collision_friction,
+                                          0.0f, 2.0f, "%.2f");
+            changed |= ImGui::SliderFloat(
+                "friction epsilon", &params_.friction_epsilon,
+                1.0e-5f, 2.0e-2f, "%.1e", ImGuiSliderFlags_Logarithmic);
             changed |= ImGui::SliderInt("mesh broadphase interval",
                                         &params_.mesh_broadphase_interval,
                                         1, 16);
@@ -753,6 +762,8 @@ public:
         ImGui::Separator();
         ImGui::Text("ground contacts: %d", solver_->last_ground_contacts());
         ImGui::Text("self contacts: %d", solver_->last_self_contacts());
+        ImGui::Text("friction contacts: %d",
+                    solver_->last_self_friction_contacts());
         ImGui::Text("min y: %.5f", solver_->min_y());
         ImGui::Text("PCG iters (last): %d", solver_->last_pcg_iterations());
         ImGui::Text("PCG recursive <r,M^-1 r>: %.3e",
@@ -845,7 +856,7 @@ private:
             }
             std::printf(
                 "[PABD_DBG setup] bodies=%d solver=%s dt=%.6f substeps=%d iterations=%d "
-                "pcg=%d omega=%.2f damping=%.3f stiffness=%.1f groundK=%.1f selfK=%.1f gap=%.4f thickness=%.4f maxContacts=%d bpN=%d bpSkin=%.4f\n",
+                "pcg=%d omega=%.2f damping=%.3f stiffness=%.1f groundK=%.1f groundMu=%.2f selfK=%.1f selfMu=%.2f fricEps=%.1e gap=%.4f thickness=%.4f maxContacts=%d bpN=%d bpSkin=%.4f\n",
                 body_count,
                 params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
                     ? "BlockJacobi12"
@@ -855,7 +866,10 @@ private:
                 params_.block_jacobi_omega,
                 params_.damping,
                 params_.stiffness, params_.ground_stiffness,
-                params_.self_collision_stiffness, params_.contact_gap,
+                params_.ground_friction,
+                params_.self_collision_stiffness,
+                params_.self_collision_friction,
+                params_.friction_epsilon, params_.contact_gap,
                 params_.self_collision_thickness,
                 params_.self_collision_max_contacts,
                 params_.mesh_broadphase_interval,
@@ -865,7 +879,7 @@ private:
 
     void print_pd_abd_stats() const {
         const auto ns = solver_->last_self_normal_sum();
-        std::printf("[PABD_DBG frame=%d] solver=%s pcgIters=%d pcgPrec=%s ground=%d self=%d raw=%d cap=%d overflow=%d pf=%d ee=%d bpairs=%d bcap=%d boverflow=%d bpRefresh=%d bpAge=%d bpRefreshes=%d bpDisp=%.5f bpDropped=%d vertical=%d horizontal=%d nsum=(%.3f,%.3f,%.3f) minY=%.5f pcgRho=%.3e pcgTrueRel=%.3e pcgPrecFail=%d bjFail=%d ellWidth=%d ellOverflow=%d\n",
+        std::printf("[PABD_DBG frame=%d] solver=%s pcgIters=%d pcgPrec=%s ground=%d self=%d raw=%d cap=%d overflow=%d pf=%d ee=%d friction=%d bpairs=%d bcap=%d boverflow=%d bpRefresh=%d bpAge=%d bpRefreshes=%d bpDisp=%.5f bpDropped=%d vertical=%d horizontal=%d nsum=(%.3f,%.3f,%.3f) minY=%.5f pcgRho=%.3e pcgTrueRel=%.3e pcgPrecFail=%d bjFail=%d ellWidth=%d ellOverflow=%d\n",
                     frame_index_,
                     params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
                         ? "BlockJacobi12"
@@ -881,6 +895,7 @@ private:
                     solver_->last_self_contact_overflow() ? 1 : 0,
                     solver_->last_self_point_face_contacts(),
                     solver_->last_self_edge_edge_contacts(),
+                    solver_->last_self_friction_contacts(),
                     solver_->last_self_broadphase_pairs(),
                     solver_->last_self_broadphase_capacity(),
                     solver_->last_self_broadphase_overflow() ? 1 : 0,
@@ -1098,6 +1113,8 @@ private:
             params_.ground_stiffness = 1e4f;
             params_.self_collision_thickness = 0.03f;
             params_.self_collision_stiffness = 1e4f;
+            params_.ground_friction = 0.4f;
+            params_.self_collision_friction = 0.3f;
             params_.self_collision_max_contacts =
                 std::max(512, stack_count_ * 96);
             color_[0] = 0.18f;
@@ -1118,6 +1135,7 @@ private:
             params_.ground_stiffness = 0.0f;
             params_.self_collision_thickness = 0.08f;
             params_.self_collision_stiffness = 2.0e4f;
+            params_.self_collision_friction = 0.2f;
             params_.self_collision_max_contacts = 128;
             color_[0] = 0.92f;
             color_[1] = 0.52f;
@@ -1142,6 +1160,7 @@ private:
                 is_tuned_rigid_ipc_chain_net(kind_) ? 0.015f : 0.01f;
             params_.self_collision_stiffness =
                 is_tuned_rigid_ipc_chain_net(kind_) ? 1.0e4f : 5.0e2f;
+            params_.self_collision_friction = 0.2f;
             params_.self_collision_max_contacts =
                 kind_ == PabdSceneKind::RigidIpcChainNet32x32
                     ? 262144
@@ -1172,6 +1191,7 @@ private:
             params_.ground_stiffness = 0.0f;
             params_.self_collision_thickness = 0.015f;
             params_.self_collision_stiffness = 1.0e4f;
+            params_.self_collision_friction = 0.2f;
             params_.self_collision_max_contacts =
                 std::max(4096, stack_count_ * 512);
             color_[0] = 0.74f;
@@ -1202,6 +1222,18 @@ private:
         }
         if (const char* value = std::getenv("CHYSX_PABD_PCG_TRUE_RESIDUAL")) {
             params_.pcg_true_residual_diagnostics = std::atoi(value) != 0;
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_GROUND_FRICTION")) {
+            params_.ground_friction =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_SELF_FRICTION")) {
+            params_.self_collision_friction =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_FRICTION_EPSILON")) {
+            params_.friction_epsilon =
+                std::max(1.0e-8f, std::strtof(value, nullptr));
         }
         if (const char* value = std::getenv("CHYSX_PABD_SOLVER")) {
             const std::string solver(value);
