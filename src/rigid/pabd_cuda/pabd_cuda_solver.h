@@ -38,12 +38,16 @@ struct PabdCudaParams {
     float density = 1.0f;
     float damping = 1.0f;
     float fixed_weight = 1.0e7f;
+    float hinge_stiffness = 0.0f;
+    float motor_torque = 0.0f;
+    float motor_damping = 0.0f;
     float ground_y = 0.0f;
     float contact_gap = 0.035f;
     float ground_stiffness = 0.0f;
     float ground_friction = 0.0f;
     float self_collision_thickness = 0.0f;
     float self_collision_stiffness = 0.0f;
+    float self_collision_normal_damping = 0.0f;
     float self_collision_friction = 0.0f;
     float friction_epsilon = 1.0e-3f;
     int self_collision_max_contacts = 256;
@@ -66,6 +70,21 @@ struct PabdSurfaceMap {
     int ground_collide = 1;
 };
 
+struct alignas(16) PabdEndpointHinge {
+    int body = -1;
+    int motor = 0;
+    int pad0 = 0;
+    int pad1 = 0;
+    math::Vec4f weights0 = math::Vec4f(0.0f);
+    math::Vec4f weights1 = math::Vec4f(0.0f);
+    math::Vec4f endpoint0 = math::Vec4f(0.0f);
+    math::Vec4f endpoint1 = math::Vec4f(0.0f);
+    math::Vec4f axis = math::Vec4f(0.0f);
+};
+
+static_assert(sizeof(PabdEndpointHinge) == 96,
+              "PabdEndpointHinge must keep its 96-byte GPU layout");
+
 struct PabdCudaMesh {
     std::vector<math::Vec3f> rest_positions;
     std::vector<math::Vec3f> initial_velocities;
@@ -76,6 +95,7 @@ struct PabdCudaMesh {
     std::vector<std::array<int, 2>> surface_edges;
     std::vector<float> tet_volume_overrides;
     std::vector<std::array<float, 16>> tet_mass_blocks;
+    std::vector<PabdEndpointHinge> endpoint_hinges;
 };
 
 struct PabdSurfaceMapDevice {
@@ -191,6 +211,18 @@ public:
         return params_.pcg_body_preconditioner &&
                pcg_body_preconditioner_valid_;
     }
+    float last_motor_axis_angular_velocity() const noexcept {
+        return last_motor_axis_angular_velocity_;
+    }
+    float last_hinge_endpoint_error() const noexcept {
+        return last_hinge_endpoint_error_;
+    }
+    const std::vector<float>& hinge_axis_angular_velocities() const noexcept {
+        return hinge_axis_angular_velocities_;
+    }
+    const std::vector<float>& hinge_endpoint_errors() const noexcept {
+        return hinge_endpoint_errors_;
+    }
     float min_y() const noexcept { return min_y_; }
 
 private:
@@ -222,6 +254,7 @@ private:
     std::vector<PabdSurfaceMap> surface_maps_;
     std::vector<TetData> host_tets_;
     std::vector<std::array<float, 16>> host_mass_blocks_;
+    std::vector<PabdEndpointHinge> host_endpoint_hinges_;
     std::vector<math::Vec3f> host_surface_positions_;
     int interpolated_body_count_ = 0;
     int interpolated_contact_capacity_ = 0;
@@ -254,6 +287,8 @@ private:
     CudaArray<collision::WideContact> interpolated_wide_contacts_;
     CudaArray<int> interpolated_wide_contact_count_;
     CudaArray<float> tet_mass_blocks_dev_;
+    CudaArray<PabdEndpointHinge> endpoint_hinges_dev_;
+    CudaArray<math::Vec3f> endpoint_hinge_diagnostics_dev_;
     CudaArray<float> block_jacobi_base_k_;
     CudaArray<math::Vec3f> block_jacobi_x_lagged_;
     CudaArray<int> block_jacobi_failure_count_;
@@ -296,9 +331,14 @@ private:
     float block_jacobi_base_inv_h2_ = -1.0f;
     float block_jacobi_base_stiffness_ = -1.0f;
     float block_jacobi_base_fixed_weight_ = -1.0f;
+    float block_jacobi_base_hinge_stiffness_ = -1.0f;
     bool block_jacobi_base_k_valid_ = false;
     float last_residual_ = 0.0f;
     float last_true_relative_residual_ = -1.0f;
+    float last_motor_axis_angular_velocity_ = 0.0f;
+    float last_hinge_endpoint_error_ = 0.0f;
+    std::vector<float> hinge_axis_angular_velocities_;
+    std::vector<float> hinge_endpoint_errors_;
     float min_y_ = 0.0f;
 };
 

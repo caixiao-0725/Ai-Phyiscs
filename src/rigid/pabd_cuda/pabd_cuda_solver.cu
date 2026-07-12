@@ -152,6 +152,124 @@ __device__ __forceinline__ int sym4_index(int r, int c) {
     return r * (r + 1) / 2 + c;
 }
 
+__device__ __forceinline__ math::Vec3f hinge_vec3(math::Vec4f v) {
+    return math::Vec3f(v.x, v.y, v.z);
+}
+
+__device__ __forceinline__ math::Vec3f safe_hinge_axis(math::Vec4f axis4) {
+    math::Vec3f axis = hinge_vec3(axis4);
+    const float len2 = math::dot(axis, axis);
+    if (len2 <= 1.0e-12f) return math::Vec3f(0.0f, 1.0f, 0.0f);
+    return axis * rsqrtf(len2);
+}
+
+__device__ float endpoint_hinge_axis_omega(
+    const math::Vec3f* velocity,
+    const math::Vec3f* x,
+    const PabdCudaSolver::TetData& tet,
+    const float* mass,
+    const PabdEndpointHinge& hinge,
+    math::Vec3f* tangent_out = nullptr,
+    float* inertia_out = nullptr) {
+    const math::Vec3f axis = safe_hinge_axis(hinge.axis);
+    const math::Vec3f center =
+        (hinge_vec3(hinge.endpoint0) + hinge_vec3(hinge.endpoint1)) * 0.5f;
+
+    float control_mass[4];
+    float total_mass = 0.0f;
+    math::Vec3f average_velocity(0.0f, 0.0f, 0.0f);
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        float m = 0.0f;
+        #pragma unroll
+        for (int col = 0; col < 4; ++col) {
+            m += mass[a * 4 + col];
+        }
+        m = fmaxf(m, 1.0e-8f);
+        control_mass[a] = m;
+        total_mass += m;
+        average_velocity += velocity[tet.v[a]] * m;
+    }
+    if (total_mass > 1.0e-8f) average_velocity /= total_mass;
+
+    float inertia = 0.0f;
+    float angular_momentum = 0.0f;
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const math::Vec3f tangent =
+            math::cross(axis, x[tet.v[a]] - center);
+        if (tangent_out != nullptr) tangent_out[a] = tangent;
+        inertia += control_mass[a] * math::dot(tangent, tangent);
+        angular_momentum += control_mass[a] *
+            math::dot(tangent, velocity[tet.v[a]] - average_velocity);
+    }
+    if (inertia_out != nullptr) *inertia_out = inertia;
+    return inertia > 1.0e-8f ? angular_momentum / inertia : 0.0f;
+}
+
+__global__ void apply_endpoint_hinge_motor_kernel(
+    math::Vec3f* velocity,
+    const math::Vec3f* x,
+    const PabdCudaSolver::TetData* tets,
+    const float* mass_blocks,
+    const PabdEndpointHinge* hinges,
+    int n_tets,
+    float torque,
+    float damping,
+    float h) {
+    const int body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= n_tets) return;
+    const PabdEndpointHinge hinge = hinges[body];
+    if (hinge.body != body || hinge.motor == 0) return;
+
+    const PabdCudaSolver::TetData tet = tets[body];
+    const float* mass = mass_blocks + body * 16;
+    math::Vec3f tangent[4];
+    float inertia = 0.0f;
+    const float omega = endpoint_hinge_axis_omega(
+        velocity, x, tet, mass, hinge, tangent, &inertia);
+    if (inertia <= 1.0e-8f) return;
+
+    const float delta_omega =
+        h * (torque - damping * omega) / inertia;
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        velocity[tet.v[a]] += tangent[a] * delta_omega;
+    }
+}
+
+__global__ void compute_endpoint_hinge_diagnostics_kernel(
+    const math::Vec3f* velocity,
+    const math::Vec3f* x,
+    const PabdCudaSolver::TetData* tets,
+    const float* mass_blocks,
+    const PabdEndpointHinge* hinges,
+    int n_tets,
+    math::Vec3f* diagnostics) {
+    const int body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= n_tets) return;
+    const PabdEndpointHinge hinge = hinges[body];
+    if (hinge.body != body) {
+        diagnostics[body] = math::Vec3f(0.0f, 0.0f, 0.0f);
+        return;
+    }
+
+    const PabdCudaSolver::TetData tet = tets[body];
+    math::Vec3f y0(0.0f, 0.0f, 0.0f);
+    math::Vec3f y1(0.0f, 0.0f, 0.0f);
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        y0 += x[tet.v[a]] * hinge.weights0[a];
+        y1 += x[tet.v[a]] * hinge.weights1[a];
+    }
+    const float error0 = math::length(y0 - hinge_vec3(hinge.endpoint0));
+    const float error1 = math::length(y1 - hinge_vec3(hinge.endpoint1));
+    const float omega = endpoint_hinge_axis_omega(
+        velocity, x, tet, mass_blocks + body * 16, hinge);
+    diagnostics[body] = math::Vec3f(omega, fmaxf(error0, error1),
+                                    0.5f * (error0 + error1));
+}
+
 __global__ void prepare_step_kernel(const math::Vec3f* rest,
                                     math::Vec3f* x,
                                     math::Vec3f* old_x,
@@ -231,11 +349,13 @@ __global__ void update_interpolated_surface_positions_kernel(
 __global__ void rebuild_block_jacobi_base_k_kernel(
     const PabdCudaSolver::TetData* __restrict__ tets,
     const float* __restrict__ mass_blocks,
+    const PabdEndpointHinge* __restrict__ hinges,
     const unsigned char* __restrict__ fixed,
     int n_tets,
     float inv_h2,
     float stiffness,
     float fixed_weight,
+    float hinge_stiffness,
     float* __restrict__ base_k) {
     const int body = blockIdx.x * blockDim.x + threadIdx.x;
     if (body >= n_tets) return;
@@ -244,6 +364,9 @@ __global__ void rebuild_block_jacobi_base_k_kernel(
     const float* mass = mass_blocks + body * 16;
     float* K = base_k + body * kBlockJacobiBaseKSize;
     const float w_elastic = stiffness * tet.volume;
+    PabdEndpointHinge hinge{};
+    const bool has_hinge = hinges != nullptr && hinge_stiffness > 0.0f &&
+        ((hinge = hinges[body]).body == body);
 
     #pragma unroll
     for (int a = 0; a < 4; ++a) {
@@ -254,6 +377,12 @@ __global__ void rebuild_block_jacobi_base_k_kernel(
             const float elastic_value = __fmul_rn(
                 w_elastic, math::dot(tet.grad[a], tet.grad[b]));
             float value = __fadd_rn(mass_value, elastic_value);
+            if (has_hinge) {
+                const float hinge_value = hinge_stiffness *
+                    (hinge.weights0[a] * hinge.weights0[b] +
+                     hinge.weights1[a] * hinge.weights1[b]);
+                value = __fadd_rn(value, hinge_value);
+            }
             if (a == b && fixed[tet.v[a]]) {
                 value = __fadd_rn(value, fixed_weight);
             }
@@ -506,6 +635,7 @@ __global__ void solve_interpolated_block_jacobi_kernel(
     int n_tets,
     const float* __restrict__ base_k,
     const float* __restrict__ mass_blocks,
+    const PabdEndpointHinge* __restrict__ hinges,
     const math::Vec3f* __restrict__ predicted,
     const math::Vec3f* __restrict__ rest,
     const collision::WideContact* __restrict__ contacts,
@@ -518,6 +648,7 @@ __global__ void solve_interpolated_block_jacobi_kernel(
     float inv_h2,
     float stiffness,
     float fixed_weight,
+    float hinge_stiffness,
     math::Vec3f* __restrict__ x,
     float omega,
     int* __restrict__ failure_count) {
@@ -529,6 +660,9 @@ __global__ void solve_interpolated_block_jacobi_kernel(
     const PabdCudaSolver::TetData tet = tets[body];
     const float* K = base_k + body * kBlockJacobiBaseKSize;
     const float* mass = mass_blocks + body * 16;
+    PabdEndpointHinge hinge{};
+    const bool has_hinge = hinges != nullptr && hinge_stiffness > 0.0f &&
+        ((hinge = hinges[body]).body == body);
 
     const math::Mat3f Ds = make_columns(
         x_lagged[tet.v[1]] - x_lagged[tet.v[0]],
@@ -558,6 +692,17 @@ __global__ void solve_interpolated_block_jacobi_kernel(
             bi.x = __fadd_rn(bi.x, __fmul_rn(target.x, fixed_weight));
             bi.y = __fadd_rn(bi.y, __fmul_rn(target.y, fixed_weight));
             bi.z = __fadd_rn(bi.z, __fmul_rn(target.z, fixed_weight));
+        }
+        if (has_hinge) {
+            const math::Vec3f target =
+                hinge_vec3(hinge.endpoint0) * hinge.weights0[a] +
+                hinge_vec3(hinge.endpoint1) * hinge.weights1[a];
+            bi.x = __fadd_rn(bi.x,
+                             __fmul_rn(target.x, hinge_stiffness));
+            bi.y = __fadd_rn(bi.y,
+                             __fmul_rn(target.y, hinge_stiffness));
+            bi.z = __fadd_rn(bi.z,
+                             __fmul_rn(target.z, hinge_stiffness));
         }
         b[3 * a + 0] = bi.x;
         b[3 * a + 1] = bi.y;
@@ -689,6 +834,40 @@ __global__ void assemble_interpolated_mass_elastic_kernel(
             add_scalar_identity_by_slot_device(diag, values, slot, k);
         }
         atomic_add_vec(&rhs[row_id], (R * tet.grad[row]) * w_elastic);
+    }
+}
+
+__global__ void assemble_interpolated_endpoint_hinge_kernel(
+    math::Mat3f* diag,
+    math::Mat3f* values,
+    math::Vec3f* rhs,
+    const PabdCudaSolver::TetData* tets,
+    const PabdEndpointHinge* hinges,
+    int n_tets,
+    float stiffness) {
+    const int body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= n_tets || stiffness <= 0.0f) return;
+
+    const PabdEndpointHinge hinge = hinges[body];
+    if (hinge.body != body) return;
+    const PabdCudaSolver::TetData tet = tets[body];
+    const math::Vec3f p0 = hinge_vec3(hinge.endpoint0);
+    const math::Vec3f p1 = hinge_vec3(hinge.endpoint1);
+
+    #pragma unroll
+    for (int row = 0; row < 4; ++row) {
+        const float w0_row = hinge.weights0[row];
+        const float w1_row = hinge.weights1[row];
+        atomic_add_vec(&rhs[tet.v[row]],
+                       (p0 * w0_row + p1 * w1_row) * stiffness);
+        #pragma unroll
+        for (int col = 0; col < 4; ++col) {
+            const float value = stiffness *
+                (w0_row * hinge.weights0[col] +
+                 w1_row * hinge.weights1[col]);
+            add_scalar_identity_by_slot_device(
+                diag, values, tet.hessian_slot[row * 4 + col], value);
+        }
     }
 }
 
@@ -878,6 +1057,7 @@ __global__ void append_interpolated_self_contacts_kernel(
     const math::Vec3f* old_controls,
     float contact_gap,
     float stiffness,
+    float normal_damping,
     float friction_mu,
     float friction_epsilon,
     int* debug_counts,
@@ -931,11 +1111,27 @@ __global__ void append_interpolated_self_contacts_kernel(
                 contact_gap - c.separation,
                 stiffness, friction_mu, friction_epsilon,
                 current_controls, old_controls);
+            // Implicit normal dashpot: beta*k*(C(x)-C(x_old))^2 / 2.
+            const float damping_ratio = fmaxf(normal_damping, 0.0f);
+            const float damping_stiffness = stiffness * damping_ratio;
+            const float effective_stiffness =
+                stiffness + damping_stiffness;
+            float effective_target = contact_gap;
+            if (damping_stiffness > 0.0f) {
+                const math::Vec3f old_relative(
+                    friction.x, friction.y, friction.z);
+                const float old_separation =
+                    math::dot(old_relative, c.normal);
+                effective_target =
+                    (stiffness * contact_gap +
+                     damping_stiffness * old_separation) /
+                    effective_stiffness;
+            }
             if (friction.w > 0.0f) {
                 atomicAdd(&debug_counts[5], 1);
             }
             const math::Vec3f rhs_target = wide_contact_rhs_target(
-                c.normal, contact_gap, stiffness, friction);
+                c.normal, effective_target, effective_stiffness, friction);
             if (rhs != nullptr) {
                 for (int i = 0; i < coeff_count; ++i) {
                     atomic_add_vec(&rhs[dofs[i]],
@@ -945,8 +1141,8 @@ __global__ void append_interpolated_self_contacts_kernel(
             const int out_cid = atomicAdd(wide_count, 1);
             if (out_cid < wide_capacity) {
                 store_wide_contact(wide_contacts, out_cid, dofs, coeffs,
-                                   coeff_count, c.normal, contact_gap,
-                                   stiffness, friction);
+                                   coeff_count, c.normal, effective_target,
+                                   effective_stiffness, friction);
             }
         }
     }
@@ -1217,6 +1413,9 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
         : num_vertices_;
     host_tets_.clear();
     host_mass_blocks_.clear();
+    host_endpoint_hinges_.clear();
+    hinge_axis_angular_velocities_.clear();
+    hinge_endpoint_errors_.clear();
     host_surface_positions_.assign(
         static_cast<std::size_t>(std::max(0, num_surface_vertices_)),
         math::Vec3f());
@@ -1371,6 +1570,67 @@ void PabdCudaSolver::build_host_data(const PabdCudaMesh& mesh) {
     for (std::size_t i = 0; i < host_tets.size(); ++i) {
         tets_[i] = host_tets[i];
         rotations_[i] = math::Mat3f::identity();
+    }
+
+    host_endpoint_hinges_.assign(host_tets.size(), PabdEndpointHinge{});
+    if (!mesh.endpoint_hinges.empty()) {
+        hinge_axis_angular_velocities_.assign(host_tets.size(), 0.0f);
+        hinge_endpoint_errors_.assign(host_tets.size(), 0.0f);
+    }
+    for (const PabdEndpointHinge& input : mesh.endpoint_hinges) {
+        if (input.body < 0 ||
+            input.body >= static_cast<int>(host_tets.size())) {
+            throw std::out_of_range(
+                "PabdCudaSolver::setup: endpoint hinge body out of range");
+        }
+        if (host_endpoint_hinges_[input.body].body >= 0) {
+            throw std::invalid_argument(
+                "PabdCudaSolver::setup: duplicate endpoint hinge body");
+        }
+
+        PabdEndpointHinge hinge = input;
+        hinge.weights0 = math::Vec4f(0.0f);
+        hinge.weights1 = math::Vec4f(0.0f);
+        const auto& original_tet = mesh.tets[input.body];
+        const TetData& oriented_tet = host_tets[input.body];
+        for (int oriented = 0; oriented < 4; ++oriented) {
+            int original = -1;
+            for (int candidate = 0; candidate < 4; ++candidate) {
+                if (original_tet[candidate] == oriented_tet.v[oriented]) {
+                    original = candidate;
+                    break;
+                }
+            }
+            if (original < 0) {
+                throw std::invalid_argument(
+                    "PabdCudaSolver::setup: hinge controls do not match tet");
+            }
+            hinge.weights0[oriented] = input.weights0[original];
+            hinge.weights1[oriented] = input.weights1[original];
+        }
+
+        math::Vec3f axis(hinge.axis.x, hinge.axis.y, hinge.axis.z);
+        const float axis_length = math::length(axis);
+        if (axis_length <= 1.0e-8f) {
+            throw std::invalid_argument(
+                "PabdCudaSolver::setup: endpoint hinge has zero axis");
+        }
+        axis /= axis_length;
+        hinge.axis = math::Vec4f(axis.x, axis.y, axis.z, 0.0f);
+        host_endpoint_hinges_[input.body] = hinge;
+    }
+    if (interpolated_surface_ && !mesh.endpoint_hinges.empty()) {
+        endpoint_hinges_dev_.resize(host_endpoint_hinges_.size());
+        endpoint_hinge_diagnostics_dev_.resize(host_endpoint_hinges_.size());
+        for (std::size_t body = 0;
+             body < host_endpoint_hinges_.size(); ++body) {
+            endpoint_hinges_dev_[body] = host_endpoint_hinges_[body];
+            endpoint_hinge_diagnostics_dev_[body] =
+                math::Vec3f(0.0f, 0.0f, 0.0f);
+        }
+    } else {
+        endpoint_hinges_dev_.clear();
+        endpoint_hinge_diagnostics_dev_.clear();
     }
     block_jacobi_base_k_.allocate_device(
         host_tets.size() * kBlockJacobiBaseKSize);
@@ -1576,6 +1836,10 @@ void PabdCudaSolver::upload_static_data() {
             pcg_body_preconditioner_failure_count_.copy_to_device(s);
         }
         tet_mass_blocks_dev_.copy_to_device(s);
+        if (endpoint_hinges_dev_.gpu_size() > 0) {
+            endpoint_hinges_dev_.copy_to_device(s);
+            endpoint_hinge_diagnostics_dev_.copy_to_device(s);
+        }
         interpolated_debug_counts_.copy_to_device(s);
         interpolated_normal_sum_.copy_to_device(s);
     }
@@ -1707,6 +1971,23 @@ void PabdCudaSolver::assemble_interpolated_system_gpu(float h) {
                 params_.stiffness);
             check_cuda(cudaGetLastError(),
                        "assemble_interpolated_mass_elastic_kernel");
+            const float hinge_stiffness =
+                params_.hinge_stiffness * inv_h2;
+            if (hinge_stiffness > 0.0f &&
+                endpoint_hinges_dev_.gpu_size() > 0) {
+                assemble_interpolated_endpoint_hinge_kernel
+                    <<<grid, block, 0, stream>>>(
+                        H_.diag.gpu_data(),
+                        H_.values.gpu_data(),
+                        rhs_.gpu_data(),
+                        tets_.gpu_data(),
+                        endpoint_hinges_dev_.gpu_data(),
+                        n_tets,
+                        hinge_stiffness);
+                check_cuda(
+                    cudaGetLastError(),
+                    "assemble_interpolated_endpoint_hinge_kernel");
+            }
         }
 
         const int vertex_grid = (num_vertices_ + block - 1) / block;
@@ -1757,6 +2038,7 @@ void PabdCudaSolver::assemble_interpolated_system_gpu(float h) {
             old_x_.gpu_data(),
             params_.contact_gap,
             params_.self_collision_stiffness,
+            params_.self_collision_normal_damping,
             params_.self_collision_friction,
             params_.friction_epsilon,
             interpolated_debug_counts_.gpu_data(),
@@ -1788,7 +2070,8 @@ void PabdCudaSolver::update_block_jacobi_base_k_gpu(float h) {
     if (block_jacobi_base_k_valid_ &&
         block_jacobi_base_inv_h2_ == inv_h2 &&
         block_jacobi_base_stiffness_ == params_.stiffness &&
-        block_jacobi_base_fixed_weight_ == params_.fixed_weight) {
+        block_jacobi_base_fixed_weight_ == params_.fixed_weight &&
+        block_jacobi_base_hinge_stiffness_ == params_.hinge_stiffness) {
         return;
     }
 
@@ -1798,16 +2081,19 @@ void PabdCudaSolver::update_block_jacobi_base_k_gpu(float h) {
     rebuild_block_jacobi_base_k_kernel<<<grid, block, 0, stream>>>(
         tets_.gpu_data(),
         tet_mass_blocks_dev_.gpu_data(),
+        endpoint_hinges_dev_.gpu_data(),
         fixed_.gpu_data(),
         n_tets,
         inv_h2,
         params_.stiffness,
         params_.fixed_weight,
+        params_.hinge_stiffness * inv_h2,
         block_jacobi_base_k_.gpu_data());
     check_cuda(cudaGetLastError(), "rebuild_block_jacobi_base_k_kernel");
     block_jacobi_base_inv_h2_ = inv_h2;
     block_jacobi_base_stiffness_ = params_.stiffness;
     block_jacobi_base_fixed_weight_ = params_.fixed_weight;
+    block_jacobi_base_hinge_stiffness_ = params_.hinge_stiffness;
     block_jacobi_base_k_valid_ = true;
 }
 
@@ -1898,6 +2184,7 @@ void PabdCudaSolver::solve_interpolated_block_jacobi_gpu(float h,
         n_tets,
         block_jacobi_base_k_.gpu_data(),
         tet_mass_blocks_dev_.gpu_data(),
+        endpoint_hinges_dev_.gpu_data(),
         y_.gpu_data(),
         rest_.gpu_data(),
         interpolated_wide_contacts_.gpu_data(),
@@ -1910,6 +2197,8 @@ void PabdCudaSolver::solve_interpolated_block_jacobi_gpu(float h,
         1.0f / std::max(h * h, 1.0e-8f),
         params_.stiffness,
         params_.fixed_weight,
+        params_.hinge_stiffness /
+            std::max(h * h, 1.0e-8f),
         x_.gpu_data(),
         omega,
         block_jacobi_failure_count_.gpu_data());
@@ -1926,9 +2215,29 @@ void PabdCudaSolver::step_interpolated(float dt) {
     auto* stream = reinterpret_cast<cudaStream_t>(stream_);
     constexpr int block = 128;
     const int vertex_grid = (num_vertices_ + block - 1) / block;
+    const int n_tets = static_cast<int>(tets_.gpu_size());
+    const int body_grid = (n_tets + block - 1) / block;
     for (int sub = 0; sub < substeps; ++sub) {
         const float h = sub_dt;
         const float inv_h = 1.0f / std::max(h, 1.0e-8f);
+
+        if (n_tets > 0 && endpoint_hinges_dev_.gpu_size() > 0 &&
+            (params_.motor_torque != 0.0f ||
+             params_.motor_damping != 0.0f)) {
+            apply_endpoint_hinge_motor_kernel
+                <<<body_grid, block, 0, stream>>>(
+                    velocity_.gpu_data(),
+                    x_.gpu_data(),
+                    tets_.gpu_data(),
+                    tet_mass_blocks_dev_.gpu_data(),
+                    endpoint_hinges_dev_.gpu_data(),
+                    n_tets,
+                    params_.motor_torque,
+                    params_.motor_damping,
+                    h);
+            check_cuda(cudaGetLastError(),
+                       "apply_endpoint_hinge_motor_kernel");
+        }
 
         prepare_interpolated_step_kernel<<<vertex_grid, block, 0, stream>>>(
             rest_.gpu_data(), x_.gpu_data(), old_x_.gpu_data(),
@@ -1984,6 +2293,20 @@ void PabdCudaSolver::step_interpolated(float dt) {
         check_cuda(cudaGetLastError(), "interpolated update_velocity_kernel");
     }
 
+    if (n_tets > 0 && endpoint_hinges_dev_.gpu_size() > 0) {
+        compute_endpoint_hinge_diagnostics_kernel
+            <<<body_grid, block, 0, stream>>>(
+                velocity_.gpu_data(),
+                x_.gpu_data(),
+                tets_.gpu_data(),
+                tet_mass_blocks_dev_.gpu_data(),
+                endpoint_hinges_dev_.gpu_data(),
+                n_tets,
+                endpoint_hinge_diagnostics_dev_.gpu_data());
+        check_cuda(cudaGetLastError(),
+                   "compute_endpoint_hinge_diagnostics_kernel");
+    }
+
     update_interpolated_surface_positions_gpu(x_.gpu_data(), true);
 
     if (params_.global_solver != PabdGlobalSolverMode::BlockJacobi12) {
@@ -2001,6 +2324,10 @@ void PabdCudaSolver::step_interpolated(float dt) {
     interpolated_debug_counts_.copy_to_host(stream_handle(stream_));
     interpolated_normal_sum_.copy_to_host(stream_handle(stream_));
     interpolated_surface_min_y_dev_.copy_to_host(stream_handle(stream_));
+    if (endpoint_hinge_diagnostics_dev_.gpu_size() > 0) {
+        endpoint_hinge_diagnostics_dev_.copy_to_host(
+            stream_handle(stream_));
+    }
     if (mesh_mesh_contact_detector_.valid() && interpolated_contact_capacity_ > 0) {
         mesh_mesh_contact_detector_.count_array().copy_to_host(
             stream_handle(stream_));
@@ -2018,6 +2345,27 @@ void PabdCudaSolver::step_interpolated(float dt) {
         params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
             ? -1.0f
             : pcg_.host_last_true_relative_residual();
+    last_motor_axis_angular_velocity_ = 0.0f;
+    last_hinge_endpoint_error_ = 0.0f;
+    std::fill(hinge_axis_angular_velocities_.begin(),
+              hinge_axis_angular_velocities_.end(), 0.0f);
+    std::fill(hinge_endpoint_errors_.begin(),
+              hinge_endpoint_errors_.end(), 0.0f);
+    for (std::size_t body = 0; body < host_endpoint_hinges_.size(); ++body) {
+        if (host_endpoint_hinges_[body].body < 0 ||
+            body >= endpoint_hinge_diagnostics_dev_.cpu_size()) {
+            continue;
+        }
+        const math::Vec3f diagnostic =
+            endpoint_hinge_diagnostics_dev_.cpu_data()[body];
+        hinge_axis_angular_velocities_[body] = diagnostic.x;
+        hinge_endpoint_errors_[body] = diagnostic.y;
+        last_hinge_endpoint_error_ =
+            std::max(last_hinge_endpoint_error_, diagnostic.y);
+        if (host_endpoint_hinges_[body].motor != 0) {
+            last_motor_axis_angular_velocity_ = diagnostic.x;
+        }
+    }
     min_y_ = interpolated_surface_min_y_dev_.cpu_data()[0];
     last_ground_contacts_ = ground_contacts_.cpu_data()[0];
     last_block_jacobi_failures_ =

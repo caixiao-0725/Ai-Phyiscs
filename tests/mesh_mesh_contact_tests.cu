@@ -11,6 +11,7 @@
 #include "collision/contact_spmv.h"
 #include "collision/mesh_mesh_contact.h"
 #include "memory/cuda_array.h"
+#include "rigid/pabd_cuda/pabd_cuda_solver.h"
 
 namespace {
 
@@ -572,6 +573,86 @@ void run_wide_contact_friction_spmv() {
                  "wide-contact offdiag y4.z");
 }
 
+void run_endpoint_hinge_motor(
+    chysx::rigid::pabd_cuda::PabdGlobalSolverMode solver_mode) {
+    using namespace chysx::rigid::pabd_cuda;
+    std::cout << "[pabd_hinge] endpoint motor "
+              << (solver_mode == PabdGlobalSolverMode::PCG
+                      ? "PCG"
+                      : "BlockJacobi12")
+              << "\n";
+
+    PabdCudaMesh mesh;
+    mesh.rest_positions = {
+        Vec3f(-1.0f, -1.0f, -1.0f),
+        Vec3f(3.0f, -1.0f, -1.0f),
+        Vec3f(-1.0f, 3.0f, -1.0f),
+        Vec3f(-1.0f, -1.0f, 3.0f),
+    };
+    mesh.initial_velocities.assign(4, Vec3f(0.0f));
+    mesh.fixed.assign(4, 0);
+    mesh.tets.push_back({0, 1, 2, 3});
+    mesh.tet_volume_overrides.push_back(1.0f);
+    std::array<float, 16> mass{};
+    for (int i = 0; i < 4; ++i) mass[i * 4 + i] = 1.0f;
+    mesh.tet_mass_blocks.push_back(mass);
+
+    for (int vertex = 0; vertex < 4; ++vertex) {
+        PabdSurfaceMap map;
+        map.index = {0, 1, 2, 3};
+        map.weight = {0.0f, 0.0f, 0.0f, 0.0f};
+        map.weight[vertex] = 1.0f;
+        map.body = 0;
+        map.ground_collide = 0;
+        mesh.surface_maps.push_back(map);
+    }
+    mesh.surface_triangles = {
+        {0, 2, 1}, {0, 1, 3}, {1, 2, 3}, {2, 0, 3}};
+    mesh.surface_edges = {
+        {0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+
+    PabdEndpointHinge hinge;
+    hinge.body = 0;
+    hinge.motor = 1;
+    hinge.weights0 = Vec4f(0.375f, 0.25f, 0.25f, 0.125f);
+    hinge.weights1 = Vec4f(0.125f, 0.25f, 0.25f, 0.375f);
+    hinge.endpoint0 = Vec4f(0.0f, 0.0f, -0.5f, 0.0f);
+    hinge.endpoint1 = Vec4f(0.0f, 0.0f, 0.5f, 0.0f);
+    hinge.axis = Vec4f(0.0f, 0.0f, 1.0f, 0.0f);
+    mesh.endpoint_hinges.push_back(hinge);
+
+    PabdCudaParams params;
+    params.dt = 0.0033f;
+    params.iterations = 1;
+    params.gravity = 0.0f;
+    params.stiffness = 1.5e4f;
+    params.density = 1.0f;
+    params.damping = 1.0f;
+    params.hinge_stiffness = 3.0e3f;
+    params.motor_torque = -1.0e3f;
+    params.motor_damping = 1.0f;
+    params.ground_stiffness = 0.0f;
+    params.self_collision_thickness = 0.0f;
+    params.self_collision_stiffness = 0.0f;
+    params.self_collision_max_contacts = 8;
+    params.pcg_iterations = 50;
+    params.global_solver = solver_mode;
+
+    PabdCudaSolver solver;
+    solver.set_auto_download_positions(false);
+    solver.setup(mesh, params);
+    for (int frame = 0; frame < 120; ++frame) solver.step(params.dt);
+
+    require(solver.last_motor_axis_angular_velocity() < -0.05f,
+            "endpoint hinge motor must rotate in negative axis direction");
+    require(solver.last_hinge_endpoint_error() < 1.0e-3f,
+            "endpoint hinge endpoints must stay on the fixed world axis");
+    require(solver.last_pcg_body_preconditioner_failures() == 0,
+            "endpoint hinge PCG body factorization must not fail");
+    require(solver.last_block_jacobi_failures() == 0,
+            "endpoint hinge Block-Jacobi factorization must not fail");
+}
+
 }  // namespace
 
 int main() {
@@ -587,6 +668,10 @@ int main() {
         run_oriented_point_face_crossing(BroadphaseBackend::QuantBvh);
         run_oriented_edge_edge_crossing(BroadphaseBackend::QuantBvh);
         run_wide_contact_friction_spmv();
+        run_endpoint_hinge_motor(
+            chysx::rigid::pabd_cuda::PabdGlobalSolverMode::PCG);
+        run_endpoint_hinge_motor(
+            chysx::rigid::pabd_cuda::PabdGlobalSolverMode::BlockJacobi12);
 #ifdef CHYSX_HAS_OPTIX
         run_optix_collision_categories();
         run_fat_broadphase_cache(BroadphaseBackend::OptiX);

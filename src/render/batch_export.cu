@@ -31,11 +31,14 @@ int main(int argc, char* argv[]) {
 
     std::string target_scene;
     int N_FRAMES = DEFAULT_FRAMES;
+    bool export_geometry = true;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--scene" && i + 1 < argc)
             target_scene = argv[++i];
         else if (std::string(argv[i]) == "--frames" && i + 1 < argc)
             N_FRAMES = std::atoi(argv[++i]);
+        else if (std::string(argv[i]) == "--no-export")
+            export_geometry = false;
     }
 
     chysx::render::Scene* scene = nullptr;
@@ -58,6 +61,8 @@ int main(int argc, char* argv[]) {
     std::cout << "=== ChysX Batch Export ===" << std::endl;
     std::cout << "Scene: " << scene->name() << std::endl;
     std::cout << "Frames: " << N_FRAMES << "  dt=" << DT << std::endl;
+    std::cout << "Geometry export: "
+              << (export_geometry ? "enabled" : "disabled") << std::endl;
 
     bool has_metrics = false;
     chysx::render::SceneMetrics final_metrics;
@@ -94,29 +99,30 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        std::vector<chysx::render::DrawMesh> meshes;
-        scene->draw_meshes(meshes);
+        if (export_geometry) {
+            std::vector<chysx::render::DrawMesh> meshes;
+            scene->draw_meshes(meshes);
 
-        // Build BgeoMeshPiece from DrawMesh
-        std::vector<chysx::io::BgeoMeshPiece> pieces;
-        for (const auto& m : meshes) {
-            pieces.push_back({m.positions, m.n_points,
-                              m.triangles, m.n_tris,
-                              m.color_r, m.color_g, m.color_b});
-        }
+            std::vector<chysx::io::BgeoMeshPiece> pieces;
+            for (const auto& m : meshes) {
+                pieces.push_back({m.positions, m.n_points,
+                                  m.triangles, m.n_tris,
+                                  m.color_r, m.color_g, m.color_b});
+            }
 
-        char filename[256];
-        std::snprintf(filename, sizeof(filename),
-                      "%sframe_%04d.bgeo", out_dir.c_str(), frame);
-        chysx::io::BgeoWriter::write_multi(filename, pieces);
-
-        // Per-piece OBJ
-        for (int p = 0; p < static_cast<int>(meshes.size()); ++p) {
-            const auto& m = meshes[p];
+            char filename[256];
             std::snprintf(filename, sizeof(filename),
-                          "%spiece%d_%04d.obj", out_dir.c_str(), p, frame);
-            chysx::io::save_obj(filename, m.positions, m.n_points,
-                                m.triangles, m.n_tris);
+                          "%sframe_%04d.bgeo", out_dir.c_str(), frame);
+            chysx::io::BgeoWriter::write_multi(filename, pieces);
+
+            for (int p = 0; p < static_cast<int>(meshes.size()); ++p) {
+                const auto& m = meshes[p];
+                std::snprintf(filename, sizeof(filename),
+                              "%spiece%d_%04d.obj", out_dir.c_str(), p,
+                              frame);
+                chysx::io::save_obj(filename, m.positions, m.n_points,
+                                    m.triangles, m.n_tris);
+            }
         }
 
         if ((frame + 1) % 10 == 0 || frame == 0) {

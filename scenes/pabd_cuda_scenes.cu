@@ -29,6 +29,7 @@ using chysx::rigid::pabd_cuda::PabdCudaMesh;
 using chysx::rigid::pabd_cuda::PabdCudaParams;
 using chysx::rigid::pabd_cuda::PabdCudaSolver;
 using chysx::rigid::pabd_cuda::PabdCudaSurfaceRenderer;
+using chysx::rigid::pabd_cuda::PabdEndpointHinge;
 using chysx::rigid::pabd_cuda::PabdGlobalSolverMode;
 using chysx::rigid::pabd_cuda::PabdSurfaceMap;
 using chysx::rigid::pabd_cuda::kDefaultStackCount;
@@ -43,14 +44,19 @@ enum class PabdSceneKind {
     StackedBlocks,
     PdAbdBoxes,
     TetraEECross,
+    SingleTorqueGear,
+    TorqueGearLine2,
+    TorqueGearLine6,
     RigidIpcChainNet4x4,
     RigidIpcChainNet8x8,
+    RigidIpcChainNet16x16Ball,
     RigidIpcChainNet32x32,
     RigidIpcVerticalChain,
 };
 
 constexpr int kRigidIpcChainNet4x4Bodies = 24;
 constexpr int kRigidIpcChainNet8x8Bodies = 144;
+constexpr int kRigidIpcChainNet16x16BallBodies = 673;
 constexpr int kRigidIpcChainNet32x32Bodies = 2880;
 constexpr int kRigidIpcVerticalChainDefaultBodies = 2;
 
@@ -105,6 +111,20 @@ std::string resolve_rigid_ipc_mesh_path(const std::string& mesh_name) {
     return std::string("D:/github/rigid-ipc/meshes/") + mesh_name;
 }
 
+std::string pabd_torque_fixture_path() {
+    return "D:/github/pabd/fixtures/3D/mechanisms/gears/"
+           "single-torque-driver.json";
+}
+
+std::string pabd_gear_line_fixture_path() {
+    return "D:/github/pabd/fixtures/3D/mechanisms/gears/"
+           "line-6-kinematic.json";
+}
+
+std::string resolve_pabd_mesh_path(const std::string& mesh_name) {
+    return std::string("D:/github/pabd/meshes/") + mesh_name;
+}
+
 float bbox_volume(const chysx::math::Vec3f& min_p,
                   const chysx::math::Vec3f& max_p) {
     const chysx::math::Vec3f e = max_p - min_p;
@@ -131,8 +151,302 @@ std::vector<std::array<int, 2>> make_obj_edges(
     return edges;
 }
 
-PabdCudaMesh make_rigid_ipc_chain_net_mesh(const char* filename,
+PabdCudaMesh make_torque_gear_fixture_mesh(const std::string& json_path,
+                                           int max_gears,
+                                           float density_scale,
                                            const char* label) {
+    std::ifstream file(json_path, std::ifstream::binary);
+    if (!file.is_open()) {
+        throw std::runtime_error(std::string(label) + ": cannot open " +
+                                 json_path);
+    }
+
+    Json::CharReaderBuilder reader;
+    reader["allowComments"] = true;
+    reader["allowTrailingCommas"] = true;
+    std::string errors;
+    Json::Value root;
+    if (!Json::parseFromStream(reader, file, &root, &errors)) {
+        throw std::runtime_error(std::string(label) +
+                                 ": JSON parse error: " + errors);
+    }
+
+    const Json::Value& bodies =
+        root["rigid_body_problem"]["rigid_bodies"];
+    if (!bodies.isArray() || bodies.empty()) {
+        throw std::runtime_error(std::string(label) +
+                                 ": fixture has no rigid bodies");
+    }
+    max_gears = std::max(1, max_gears);
+
+    auto read_vec3 = [](const Json::Value& value,
+                        chysx::math::Vec3f fallback) {
+        if (!value.isArray() || value.size() < 3) return fallback;
+        return chysx::math::Vec3f(value[0].asFloat(), value[1].asFloat(),
+                                  value[2].asFloat());
+    };
+
+    PabdCudaMesh mesh;
+    std::map<std::string, chysx::io::ObjMesh> obj_cache;
+    int motor_count = 0;
+    for (const Json::Value& gear_body : bodies) {
+        if (static_cast<int>(mesh.tets.size()) >= max_gears) break;
+        if (!gear_body.get("enabled", true).asBool()) continue;
+        const std::string mesh_name = gear_body["mesh"].asString();
+        if (mesh_name.empty()) continue;
+
+        const std::string obj_path = resolve_pabd_mesh_path(mesh_name);
+        auto obj_it = obj_cache.find(obj_path);
+        if (obj_it == obj_cache.end()) {
+            chysx::io::ObjMesh obj;
+            if (!chysx::io::load_obj(obj_path, obj)) {
+                throw std::runtime_error(std::string(label) +
+                                         ": failed to load " + obj_path);
+            }
+            obj_it = obj_cache.emplace(obj_path, std::move(obj)).first;
+        }
+        const chysx::io::ObjMesh& obj = obj_it->second;
+        if (obj.positions.size() % 3 != 0 ||
+            obj.triangles.size() % 3 != 0 || obj.positions.empty() ||
+            obj.triangles.empty()) {
+            throw std::runtime_error(std::string(label) +
+                                     ": invalid OBJ " + obj_path);
+        }
+
+        const chysx::math::Vec3f translation = read_vec3(
+            gear_body["position"], chysx::math::Vec3f(0.0f));
+        const chysx::math::Vec3f rotation = read_vec3(
+            gear_body["rotation"], chysx::math::Vec3f(0.0f));
+        const chysx::math::Vec3f angular_velocity = read_vec3(
+            gear_body["angular_velocity"], chysx::math::Vec3f(0.0f));
+        const float fixture_density = std::max(
+            1.0e-6f, gear_body.get("density", 1.0f).asFloat() *
+                         density_scale);
+        chysx::math::Vec3f scale(1.0f);
+        const Json::Value& scale_json = gear_body["scale"];
+        if (scale_json.isArray() && scale_json.size() >= 3) {
+            scale = read_vec3(scale_json, scale);
+        } else if (!scale_json.isNull()) {
+            scale = chysx::math::Vec3f(scale_json.asFloat());
+        }
+
+        chysx::math::Vec3f axis(0.0f, 1.0f, 0.0f);
+        const Json::Value& fixed_flags = gear_body["is_dof_fixed"];
+        if (fixed_flags.isArray() && fixed_flags.size() >= 6) {
+            int free_rotation = -1;
+            for (int dof = 3; dof < 6; ++dof) {
+                if (!fixed_flags[dof].asBool()) {
+                    if (free_rotation >= 0) {
+                        throw std::runtime_error(
+                            std::string(label) +
+                            ": hinge needs exactly one free rotation");
+                    }
+                    free_rotation = dof - 3;
+                }
+            }
+            if (free_rotation < 0) {
+                throw std::runtime_error(std::string(label) +
+                                         ": hinge has no free rotation");
+            }
+            axis = chysx::math::Vec3f(0.0f);
+            axis[free_rotation] = 1.0f;
+        }
+
+        std::vector<chysx::math::Vec3f> surface;
+        surface.reserve(obj.positions.size() / 3);
+        chysx::math::Vec3f bbox_min(std::numeric_limits<float>::max());
+        chysx::math::Vec3f bbox_max(-std::numeric_limits<float>::max());
+        for (std::size_t i = 0; i < obj.positions.size(); i += 3) {
+            chysx::math::Vec3f p(obj.positions[i + 0] * scale.x,
+                                  obj.positions[i + 1] * scale.y,
+                                  obj.positions[i + 2] * scale.z);
+            p = rotate_xyz_degrees(p, rotation) + translation;
+            surface.push_back(p);
+            bbox_min = chysx::math::min(bbox_min, p);
+            bbox_max = chysx::math::max(bbox_max, p);
+        }
+
+        std::vector<std::array<int, 3>> local_tris;
+        local_tris.reserve(obj.triangles.size() / 3);
+        for (std::size_t i = 0; i < obj.triangles.size(); i += 3) {
+            const int a = obj.triangles[i + 0];
+            const int b = obj.triangles[i + 1];
+            const int c = obj.triangles[i + 2];
+            if (a < 0 || b < 0 || c < 0 ||
+                a >= static_cast<int>(surface.size()) ||
+                b >= static_cast<int>(surface.size()) ||
+                c >= static_cast<int>(surface.size())) {
+                throw std::runtime_error(std::string(label) +
+                                         ": OBJ index out of range");
+            }
+            local_tris.push_back({a, b, c});
+        }
+        const std::vector<std::array<int, 2>> local_edges =
+            make_obj_edges(local_tris);
+
+        const chysx::math::Vec3f extents = bbox_max - bbox_min;
+        const float r = std::max(
+            1.0e-6f, 2.0f * chysx::math::length(extents));
+        const std::array<chysx::math::Vec3f, 4> controls = {{
+            bbox_min,
+            chysx::math::Vec3f(bbox_min.x + r, bbox_min.y, bbox_min.z),
+            chysx::math::Vec3f(bbox_min.x, bbox_min.y + r, bbox_min.z),
+            chysx::math::Vec3f(bbox_min.x, bbox_min.y, bbox_min.z + r),
+        }};
+        const int body = static_cast<int>(mesh.tets.size());
+        const int dof_start = static_cast<int>(mesh.rest_positions.size());
+        const int surface_start =
+            static_cast<int>(mesh.surface_maps.size());
+        mesh.rest_positions.insert(mesh.rest_positions.end(),
+                                   controls.begin(), controls.end());
+        mesh.initial_velocities.insert(
+            mesh.initial_velocities.end(), 4,
+            chysx::math::Vec3f(0.0f));
+        mesh.fixed.insert(mesh.fixed.end(), 4, 0);
+        mesh.tets.push_back({dof_start + 0, dof_start + 1,
+                             dof_start + 2, dof_start + 3});
+        const float volume = bbox_volume(bbox_min, bbox_max);
+        mesh.tet_volume_overrides.push_back(volume);
+
+        for (const chysx::math::Vec3f& p : surface) {
+            const float w1 = (p.x - bbox_min.x) / r;
+            const float w2 = (p.y - bbox_min.y) / r;
+            const float w3 = (p.z - bbox_min.z) / r;
+            PabdSurfaceMap map;
+            map.index = {dof_start + 0, dof_start + 1,
+                         dof_start + 2, dof_start + 3};
+            map.weight = {1.0f - w1 - w2 - w3, w1, w2, w3};
+            map.body = body;
+            map.collide = 1;
+            map.self_collide = 1;
+            map.ground_collide = 0;
+            mesh.surface_maps.push_back(map);
+        }
+        for (const auto& tri : local_tris) {
+            mesh.surface_triangles.push_back({
+                surface_start + tri[0], surface_start + tri[1],
+                surface_start + tri[2]});
+        }
+        for (const auto& edge : local_edges) {
+            mesh.surface_edges.push_back({surface_start + edge[0],
+                                          surface_start + edge[1]});
+        }
+
+        std::array<float, 16> mass_block{};
+        mass_block.fill(0.0f);
+        constexpr float kInvSqrt3 = 0.5773502691896258f;
+        const chysx::math::Vec3f center = (bbox_min + bbox_max) * 0.5f;
+        const float sample_mass = volume * fixture_density / 8.0f;
+        for (float sx : {-1.0f, 1.0f}) {
+            for (float sy : {-1.0f, 1.0f}) {
+                for (float sz : {-1.0f, 1.0f}) {
+                    const chysx::math::Vec3f sample(
+                        center.x + sx * extents.x * 0.5f * kInvSqrt3,
+                        center.y + sy * extents.y * 0.5f * kInvSqrt3,
+                        center.z + sz * extents.z * 0.5f * kInvSqrt3);
+                    const float w1 = (sample.x - bbox_min.x) / r;
+                    const float w2 = (sample.y - bbox_min.y) / r;
+                    const float w3 = (sample.z - bbox_min.z) / r;
+                    const float weights[4] = {
+                        1.0f - w1 - w2 - w3, w1, w2, w3};
+                    for (int row = 0; row < 4; ++row) {
+                        for (int col = 0; col < 4; ++col) {
+                            mass_block[row * 4 + col] +=
+                                sample_mass * weights[row] * weights[col];
+                        }
+                    }
+                }
+            }
+        }
+        mesh.tet_mass_blocks.push_back(mass_block);
+
+        float min_projection = std::numeric_limits<float>::max();
+        float max_projection = -std::numeric_limits<float>::max();
+        float max_radius = 0.0f;
+        for (const chysx::math::Vec3f& p : surface) {
+            const chysx::math::Vec3f d = p - translation;
+            const float projection = chysx::math::dot(d, axis);
+            min_projection = std::min(min_projection, projection);
+            max_projection = std::max(max_projection, projection);
+            max_radius = std::max(
+                max_radius,
+                chysx::math::length(d - axis * projection));
+        }
+        if (max_projection - min_projection < 1.0e-5f) {
+            const float half_length =
+                std::max(0.05f, 0.25f * max_radius);
+            min_projection = -half_length;
+            max_projection = half_length;
+        }
+
+        const chysx::math::Vec3f endpoint0 =
+            translation + axis * min_projection;
+        const chysx::math::Vec3f endpoint1 =
+            translation + axis * max_projection;
+        auto endpoint_weights = [&](chysx::math::Vec3f p) {
+            const float w1 = (p.x - bbox_min.x) / r;
+            const float w2 = (p.y - bbox_min.y) / r;
+            const float w3 = (p.z - bbox_min.z) / r;
+            return chysx::math::Vec4f(1.0f - w1 - w2 - w3,
+                                      w1, w2, w3);
+        };
+
+        const bool motor =
+            gear_body.get("type", "").asString() == "kinematic" &&
+            chysx::math::length(angular_velocity) > 1.0e-6f;
+        PabdEndpointHinge hinge;
+        hinge.body = body;
+        hinge.motor = motor ? 1 : 0;
+        hinge.weights0 = endpoint_weights(endpoint0);
+        hinge.weights1 = endpoint_weights(endpoint1);
+        hinge.endpoint0 = chysx::math::Vec4f(
+            endpoint0.x, endpoint0.y, endpoint0.z, 0.0f);
+        hinge.endpoint1 = chysx::math::Vec4f(
+            endpoint1.x, endpoint1.y, endpoint1.z, 0.0f);
+        hinge.axis = chysx::math::Vec4f(axis.x, axis.y, axis.z, 0.0f);
+        mesh.endpoint_hinges.push_back(hinge);
+        motor_count += motor ? 1 : 0;
+
+        std::printf(
+            "[PABD Gear] body=%d motor=%d center=(%.3f,%.3f,%.3f) "
+            "axis=(%.1f,%.1f,%.1f) endpoints=(%.4f,%.4f)\n",
+            body, motor ? 1 : 0, translation.x, translation.y,
+            translation.z, axis.x, axis.y, axis.z,
+            min_projection, max_projection);
+    }
+
+    if (static_cast<int>(mesh.tets.size()) != max_gears) {
+        throw std::runtime_error(
+            std::string(label) + ": requested " +
+            std::to_string(max_gears) + " gears, loaded " +
+            std::to_string(mesh.tets.size()));
+    }
+    if (motor_count != 1) {
+        throw std::runtime_error(std::string(label) +
+                                 ": expected exactly one torque motor");
+    }
+    std::printf(
+        "[PABD Gear] %s loaded %zu bodies, %zu vertices, %zu triangles "
+        "from %s\n",
+        label, mesh.tets.size(), mesh.surface_maps.size(),
+        mesh.surface_triangles.size(), json_path.c_str());
+    return mesh;
+}
+
+PabdCudaMesh make_single_torque_driver_mesh() {
+    return make_torque_gear_fixture_mesh(
+        pabd_torque_fixture_path(), 1, 1.0f, "Single Torque Gear");
+}
+
+PabdCudaMesh make_torque_gear_line_mesh(int gear_count) {
+    return make_torque_gear_fixture_mesh(
+        pabd_gear_line_fixture_path(), gear_count, 10.0f,
+        gear_count == 2 ? "Torque Gear Line 2" : "Torque Gear Line 6");
+}
+
+PabdCudaMesh make_rigid_ipc_chain_net_mesh(const char* filename,
+                                           const char* label,
+                                           bool center_sphere_on_links = false) {
     const std::string json_path = rigid_ipc_fixture_path(filename);
     std::ifstream file(json_path, std::ifstream::binary);
     if (!file.is_open()) {
@@ -154,6 +468,28 @@ PabdCudaMesh make_rigid_ipc_chain_net_mesh(const char* filename,
         root["rigid_body_problem"]["rigid_bodies"];
     if (!bodies.isArray() || bodies.empty()) {
         throw std::runtime_error(std::string(label) + ": no rigid bodies");
+    }
+
+    chysx::math::Vec3f link_center(0.0f, 0.0f, 0.0f);
+    if (center_sphere_on_links) {
+        chysx::math::Vec3f link_min(std::numeric_limits<float>::max());
+        chysx::math::Vec3f link_max(-std::numeric_limits<float>::max());
+        bool found_link = false;
+        for (const Json::Value& body : bodies) {
+            if (body["mesh"].asString() == "sphere.obj") continue;
+            const Json::Value& position = body["position"];
+            const chysx::math::Vec3f p(position[0].asFloat(),
+                                       position[1].asFloat(),
+                                       position[2].asFloat());
+            link_min = chysx::math::min(link_min, p);
+            link_max = chysx::math::max(link_max, p);
+            found_link = true;
+        }
+        if (!found_link) {
+            throw std::runtime_error(std::string(label) +
+                                     ": cannot center sphere without links");
+        }
+        link_center = (link_min + link_max) * 0.5f;
     }
 
     std::map<std::string, chysx::io::ObjMesh> obj_cache;
@@ -182,14 +518,26 @@ PabdCudaMesh make_rigid_ipc_chain_net_mesh(const char* filename,
                                      obj_path);
         }
 
+        chysx::math::Vec3f scale(1.0f, 1.0f, 1.0f);
+        const Json::Value& scale_json = body["scale"];
+        if (scale_json.isArray() && scale_json.size() >= 3) {
+            scale = chysx::math::Vec3f(scale_json[0].asFloat(),
+                                       scale_json[1].asFloat(),
+                                       scale_json[2].asFloat());
+        } else if (!scale_json.isNull()) {
+            const float uniform_scale = scale_json.asFloat();
+            scale = chysx::math::Vec3f(uniform_scale, uniform_scale,
+                                       uniform_scale);
+        }
+
         std::vector<chysx::math::Vec3f> local_surface;
         local_surface.reserve(obj.positions.size() / 3);
         chysx::math::Vec3f bbox_min(3.402823466e38f);
         chysx::math::Vec3f bbox_max(-3.402823466e38f);
         for (std::size_t i = 0; i < obj.positions.size(); i += 3) {
-            const chysx::math::Vec3f p(obj.positions[i + 0],
-                                       obj.positions[i + 1],
-                                       obj.positions[i + 2]);
+            const chysx::math::Vec3f p(obj.positions[i + 0] * scale.x,
+                                       obj.positions[i + 1] * scale.y,
+                                       obj.positions[i + 2] * scale.z);
             local_surface.push_back(p);
             bbox_min = chysx::math::min(bbox_min, p);
             bbox_max = chysx::math::max(bbox_max, p);
@@ -215,9 +563,16 @@ PabdCudaMesh make_rigid_ipc_chain_net_mesh(const char* filename,
 
         const Json::Value& pos_json = body["position"];
         const Json::Value& rot_json = body["rotation"];
-        const chysx::math::Vec3f translation(pos_json[0].asFloat(),
-                                             pos_json[1].asFloat(),
-                                             pos_json[2].asFloat());
+        chysx::math::Vec3f translation(pos_json[0].asFloat(),
+                                       pos_json[1].asFloat(),
+                                       pos_json[2].asFloat());
+        if (center_sphere_on_links && mesh_name == "sphere.obj") {
+            translation.x = link_center.x;
+            translation.z = link_center.z;
+            std::printf(
+                "[PABD ChainNet] centered sphere at (%.3f, %.3f, %.3f)\n",
+                translation.x, translation.y, translation.z);
+        }
         const chysx::math::Vec3f rotation(rot_json[0].asFloat(),
                                           rot_json[1].asFloat(),
                                           rot_json[2].asFloat());
@@ -298,6 +653,11 @@ PabdCudaMesh make_rigid_ipc_chain_net_4x4_mesh() {
 PabdCudaMesh make_rigid_ipc_chain_net_8x8_mesh() {
     return make_rigid_ipc_chain_net_mesh("chain-net-8x8.json",
                                          "Rigid-IPC Chain Net 8x8");
+}
+
+PabdCudaMesh make_rigid_ipc_chain_net_16x16_ball_mesh() {
+    return make_rigid_ipc_chain_net_mesh(
+        "chain-net-16x16-ball.json", "Rigid-IPC Chain Net 16x16 Ball", true);
 }
 
 PabdCudaMesh make_rigid_ipc_chain_net_32x32_mesh() {
@@ -449,7 +809,20 @@ PabdCudaMesh make_rigid_ipc_vertical_chain_mesh(int count) {
 bool is_rigid_ipc_chain_net(PabdSceneKind kind) {
     return kind == PabdSceneKind::RigidIpcChainNet4x4 ||
            kind == PabdSceneKind::RigidIpcChainNet8x8 ||
+           kind == PabdSceneKind::RigidIpcChainNet16x16Ball ||
            kind == PabdSceneKind::RigidIpcChainNet32x32;
+}
+
+bool is_torque_gear_scene(PabdSceneKind kind) {
+    return kind == PabdSceneKind::SingleTorqueGear ||
+           kind == PabdSceneKind::TorqueGearLine2 ||
+           kind == PabdSceneKind::TorqueGearLine6;
+}
+
+int torque_gear_body_count(PabdSceneKind kind) {
+    if (kind == PabdSceneKind::TorqueGearLine6) return 6;
+    if (kind == PabdSceneKind::TorqueGearLine2) return 2;
+    return 1;
 }
 
 bool is_rigid_ipc_link_scene(PabdSceneKind kind) {
@@ -460,12 +833,16 @@ bool is_rigid_ipc_link_scene(PabdSceneKind kind) {
 bool is_tuned_rigid_ipc_chain_net(PabdSceneKind kind) {
     return kind == PabdSceneKind::RigidIpcChainNet4x4 ||
            kind == PabdSceneKind::RigidIpcChainNet8x8 ||
+           kind == PabdSceneKind::RigidIpcChainNet16x16Ball ||
            kind == PabdSceneKind::RigidIpcChainNet32x32;
 }
 
 int rigid_ipc_chain_net_body_count(PabdSceneKind kind) {
     if (kind == PabdSceneKind::RigidIpcChainNet32x32) {
         return kRigidIpcChainNet32x32Bodies;
+    }
+    if (kind == PabdSceneKind::RigidIpcChainNet16x16Ball) {
+        return kRigidIpcChainNet16x16BallBodies;
     }
     if (kind == PabdSceneKind::RigidIpcChainNet8x8) {
         return kRigidIpcChainNet8x8Bodies;
@@ -509,6 +886,7 @@ public:
             ++frame_index_;
             if ((kind_ == PabdSceneKind::PdAbdBoxes ||
                  kind_ == PabdSceneKind::TetraEECross ||
+                 is_torque_gear_scene(kind_) ||
                  is_rigid_ipc_link_scene(kind_)) &&
                 (frame_index_ == 1 || frame_index_ % 60 == 0)) {
                 print_pd_abd_stats();
@@ -571,7 +949,8 @@ public:
             }
             return;
         }
-        if (is_rigid_ipc_link_scene(kind_)) {
+        if (is_rigid_ipc_link_scene(kind_) ||
+            is_torque_gear_scene(kind_)) {
             out.push_back({
                 solver_->flat_positions().data(),
                 solver_->num_surface_vertices(),
@@ -632,6 +1011,8 @@ public:
             out.bodies = solver_->num_tets();
         } else if (kind_ == PabdSceneKind::TetraEECross) {
             out.bodies = 2;
+        } else if (is_torque_gear_scene(kind_)) {
+            out.bodies = torque_gear_body_count(kind_);
         } else if (is_rigid_ipc_chain_net(kind_)) {
             out.bodies = rigid_ipc_chain_net_body_count(kind_);
         } else if (kind_ == PabdSceneKind::RigidIpcVerticalChain) {
@@ -691,6 +1072,17 @@ public:
             changed |= ImGui::SliderFloat("fixed weight", &params_.fixed_weight,
                                           1.0e3f, 1.0e8f, "%.1e",
                                           ImGuiSliderFlags_Logarithmic);
+            if (is_torque_gear_scene(kind_)) {
+                changed |= ImGui::SliderFloat(
+                    "hinge stiffness", &params_.hinge_stiffness,
+                    1.0f, 1.0e5f, "%.1f", ImGuiSliderFlags_Logarithmic);
+                changed |= ImGui::SliderFloat(
+                    "motor torque", &params_.motor_torque,
+                    -1000.0f, 1000.0f, "%.2f");
+                changed |= ImGui::SliderFloat(
+                    "motor damping", &params_.motor_damping,
+                    0.0f, 100.0f, "%.2f");
+            }
             ImGui::Separator();
             const bool pcg_selected =
                 params_.global_solver == PabdGlobalSolverMode::PCG;
@@ -733,6 +1125,10 @@ public:
             changed |= ImGui::SliderFloat("self collision stiffness",
                                           &params_.self_collision_stiffness,
                                           0.0f, 1.0e5f, "%.1e");
+            changed |= ImGui::SliderFloat(
+                "self collision normal damping",
+                &params_.self_collision_normal_damping,
+                0.0f, 50.0f, "%.2f");
             changed |= ImGui::SliderFloat("self collision friction",
                                           &params_.self_collision_friction,
                                           0.0f, 2.0f, "%.2f");
@@ -764,6 +1160,22 @@ public:
         ImGui::Text("self contacts: %d", solver_->last_self_contacts());
         ImGui::Text("friction contacts: %d",
                     solver_->last_self_friction_contacts());
+        if (is_torque_gear_scene(kind_)) {
+            ImGui::Text("axis angular velocity: %.6f",
+                        solver_->last_motor_axis_angular_velocity());
+            ImGui::Text("hinge endpoint error: %.3e",
+                        solver_->last_hinge_endpoint_error());
+            if (kind_ != PabdSceneKind::SingleTorqueGear) {
+                const auto& axis_w =
+                    solver_->hinge_axis_angular_velocities();
+                for (int body = 0;
+                     body < torque_gear_body_count(kind_) &&
+                     body < static_cast<int>(axis_w.size()); ++body) {
+                    ImGui::Text("gear %d axis w: %.6f", body,
+                                axis_w[body]);
+                }
+            }
+        }
         ImGui::Text("min y: %.5f", solver_->min_y());
         ImGui::Text("PCG iters (last): %d", solver_->last_pcg_iterations());
         ImGui::Text("PCG recursive <r,M^-1 r>: %.3e",
@@ -813,6 +1225,7 @@ private:
         return !headless_ &&
                (kind_ == PabdSceneKind::PdAbdBoxes ||
                 kind_ == PabdSceneKind::TetraEECross ||
+                is_torque_gear_scene(kind_) ||
                 is_rigid_ipc_link_scene(kind_));
     }
 
@@ -836,6 +1249,10 @@ private:
             is_tuned_rigid_ipc_chain_net(kind_)) {
             params_.self_collision_max_contacts =
                 topology_scaled_contact_capacity(mesh, 4096);
+        } else if (kind_ == PabdSceneKind::TorqueGearLine2 ||
+                   kind_ == PabdSceneKind::TorqueGearLine6) {
+            params_.self_collision_max_contacts =
+                topology_scaled_contact_capacity(mesh, 4096);
         }
         solver_->set_auto_download_positions(!gpu_surface_render_enabled());
         solver_->setup(mesh, params_);
@@ -845,10 +1262,13 @@ private:
         frame_index_ = 0;
         if (kind_ == PabdSceneKind::PdAbdBoxes ||
             kind_ == PabdSceneKind::TetraEECross ||
+            is_torque_gear_scene(kind_) ||
             is_rigid_ipc_link_scene(kind_)) {
             int body_count = stack_count_;
             if (kind_ == PabdSceneKind::TetraEECross) {
                 body_count = 2;
+            } else if (is_torque_gear_scene(kind_)) {
+                body_count = torque_gear_body_count(kind_);
             } else if (is_rigid_ipc_chain_net(kind_)) {
                 body_count = rigid_ipc_chain_net_body_count(kind_);
             } else if (kind_ == PabdSceneKind::RigidIpcVerticalChain) {
@@ -856,7 +1276,7 @@ private:
             }
             std::printf(
                 "[PABD_DBG setup] bodies=%d solver=%s dt=%.6f substeps=%d iterations=%d "
-                "pcg=%d omega=%.2f damping=%.3f stiffness=%.1f groundK=%.1f groundMu=%.2f selfK=%.1f selfMu=%.2f fricEps=%.1e gap=%.4f thickness=%.4f maxContacts=%d bpN=%d bpSkin=%.4f\n",
+                "pcg=%d omega=%.2f damping=%.3f stiffness=%.1f hingeK=%.1f motorTau=%.2f motorDamp=%.2f groundK=%.1f groundMu=%.2f selfK=%.1f selfNormalDamp=%.2f selfMu=%.2f fricEps=%.1e gap=%.4f thickness=%.4f maxContacts=%d bpN=%d bpSkin=%.4f\n",
                 body_count,
                 params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
                     ? "BlockJacobi12"
@@ -865,9 +1285,14 @@ private:
                 params_.iterations, params_.pcg_iterations,
                 params_.block_jacobi_omega,
                 params_.damping,
-                params_.stiffness, params_.ground_stiffness,
+                params_.stiffness,
+                params_.hinge_stiffness,
+                params_.motor_torque,
+                params_.motor_damping,
+                params_.ground_stiffness,
                 params_.ground_friction,
                 params_.self_collision_stiffness,
+                params_.self_collision_normal_damping,
                 params_.self_collision_friction,
                 params_.friction_epsilon, params_.contact_gap,
                 params_.self_collision_thickness,
@@ -913,6 +1338,36 @@ private:
                     solver_->last_block_jacobi_failures(),
                     solver_->block_jacobi_contact_ell_width(),
                     solver_->last_block_jacobi_contact_ell_overflow());
+        if (is_torque_gear_scene(kind_)) {
+            const auto& axis_w =
+                solver_->hinge_axis_angular_velocities();
+            const auto& endpoint_errors =
+                solver_->hinge_endpoint_errors();
+            std::printf("[PABD_GEARS frame=%d] axisW=[", frame_index_);
+            for (int body = 0; body < torque_gear_body_count(kind_);
+                 ++body) {
+                if (body > 0) std::printf(",");
+                const float value =
+                    body < static_cast<int>(axis_w.size())
+                        ? axis_w[body]
+                        : 0.0f;
+                std::printf("%.7f", value);
+            }
+            std::printf("] endpointError=[");
+            for (int body = 0; body < torque_gear_body_count(kind_);
+                 ++body) {
+                if (body > 0) std::printf(",");
+                const float value =
+                    body < static_cast<int>(endpoint_errors.size())
+                        ? endpoint_errors[body]
+                        : 0.0f;
+                std::printf("%.3e", value);
+            }
+            std::printf("] torque=%.3f damping=%.3f\n",
+                        params_.motor_torque,
+                        params_.motor_damping);
+            return;
+        }
         if (gpu_surface_render_enabled()) {
             std::printf("[PABD_DBG frame=%d summary] gpuSurfaceMinY=%.5f surfaceVerts=%d surfaceTris=%d\n",
                         frame_index_, solver_->min_y(),
@@ -1016,11 +1471,23 @@ private:
         if (kind_ == PabdSceneKind::TetraEECross) {
             return chysx::rigid::pabd_cuda::make_pd_abd_tetra_edge_edge_mesh();
         }
+        if (kind_ == PabdSceneKind::SingleTorqueGear) {
+            return make_single_torque_driver_mesh();
+        }
+        if (kind_ == PabdSceneKind::TorqueGearLine2) {
+            return make_torque_gear_line_mesh(2);
+        }
+        if (kind_ == PabdSceneKind::TorqueGearLine6) {
+            return make_torque_gear_line_mesh(6);
+        }
         if (kind_ == PabdSceneKind::RigidIpcChainNet4x4) {
             return make_rigid_ipc_chain_net_4x4_mesh();
         }
         if (kind_ == PabdSceneKind::RigidIpcChainNet8x8) {
             return make_rigid_ipc_chain_net_8x8_mesh();
+        }
+        if (kind_ == PabdSceneKind::RigidIpcChainNet16x16Ball) {
+            return make_rigid_ipc_chain_net_16x16_ball_mesh();
         }
         if (kind_ == PabdSceneKind::RigidIpcChainNet32x32) {
             return make_rigid_ipc_chain_net_32x32_mesh();
@@ -1050,12 +1517,16 @@ private:
         params_.density = 1.0f;
         params_.damping = 1.0f;
         params_.fixed_weight = 1.0e6f;
+        params_.hinge_stiffness = 0.0f;
+        params_.motor_torque = 0.0f;
+        params_.motor_damping = 0.0f;
         params_.pcg_iterations = 50;
         params_.ground_y = 0.0f;
         params_.contact_gap = 0.035f;
         params_.ground_stiffness = 0.0f;
         params_.self_collision_thickness = 0.0f;
         params_.self_collision_stiffness = 0.0f;
+        params_.self_collision_normal_damping = 0.0f;
         params_.self_collision_max_contacts = 256;
         params_.mesh_broadphase_interval = 1;
         params_.mesh_broadphase_skin = 0.0f;
@@ -1140,17 +1611,47 @@ private:
             color_[0] = 0.92f;
             color_[1] = 0.52f;
             color_[2] = 0.28f;
+        } else if (is_torque_gear_scene(kind_)) {
+            params_.dt = 0.0033f;
+            params_.substeps = 1;
+            params_.iterations = 1;
+            params_.gravity = 0.0f;
+            params_.stiffness = 1.5e4f;
+            params_.density = 10.0f;
+            params_.damping = 1.0f;
+            params_.fixed_weight = 1.0e6f;
+            params_.hinge_stiffness = 3.0e3f;
+            params_.motor_torque =
+                kind_ == PabdSceneKind::SingleTorqueGear ? -100.0f
+                                                         : -10.0f;
+            params_.motor_damping = 1.0f;
+            params_.pcg_iterations = 50;
+            params_.ground_y = -10.0f;
+            params_.contact_gap =
+                kind_ == PabdSceneKind::SingleTorqueGear ? 0.001f : 0.035f;
+            params_.ground_stiffness = 0.0f;
+            params_.self_collision_thickness =
+                kind_ == PabdSceneKind::SingleTorqueGear ? 0.0f : 0.075f;
+            params_.self_collision_stiffness =
+                kind_ == PabdSceneKind::SingleTorqueGear ? 0.0f : 8.0e3f;
+            params_.self_collision_normal_damping =
+                kind_ == PabdSceneKind::SingleTorqueGear ? 0.0f : 10.0f;
+            params_.self_collision_friction = 0.0f;
+            params_.self_collision_max_contacts =
+                kind_ == PabdSceneKind::SingleTorqueGear ? 64 : 4096;
+            params_.global_solver = PabdGlobalSolverMode::PCG;
+            color_[0] = 0.88f;
+            color_[1] = 0.58f;
+            color_[2] = 0.16f;
         } else if (is_rigid_ipc_chain_net(kind_)) {
             params_.dt = 0.0033f;
             params_.substeps = 1;
             params_.iterations = 1;
             params_.gravity = -9.8f;
-            params_.stiffness = 10000.0f;
+            params_.stiffness = 40000.0f;
             params_.density = 1.0f;
-            params_.damping =
-                is_tuned_rigid_ipc_chain_net(kind_) ? 0.99f : 1.0f;
             params_.fixed_weight = 1.0e6f;
-            params_.pcg_iterations = 50;
+            params_.pcg_iterations = 30;
             params_.ground_y =
                 is_tuned_rigid_ipc_chain_net(kind_) ? -50.0f : -10.0f;
             params_.contact_gap =
@@ -1159,17 +1660,19 @@ private:
             params_.self_collision_thickness =
                 is_tuned_rigid_ipc_chain_net(kind_) ? 0.015f : 0.01f;
             params_.self_collision_stiffness =
-                is_tuned_rigid_ipc_chain_net(kind_) ? 1.0e4f : 5.0e2f;
+                is_tuned_rigid_ipc_chain_net(kind_) ? 3.0e4f : 5.0e2f;
             params_.self_collision_friction = 0.2f;
             params_.self_collision_max_contacts =
                 kind_ == PabdSceneKind::RigidIpcChainNet32x32
                     ? 262144
-                    : (kind_ == PabdSceneKind::RigidIpcChainNet8x8
-                           ? 65536
-                           : 16384);
+                    : (kind_ == PabdSceneKind::RigidIpcChainNet16x16Ball
+                           ? 131072
+                           : (kind_ == PabdSceneKind::RigidIpcChainNet8x8
+                                  ? 65536
+                                  : 16384));
             if (kind_ == PabdSceneKind::RigidIpcChainNet32x32) {
                 params_.mesh_broadphase_interval = 3;
-                params_.mesh_broadphase_skin = 0.030f;
+                params_.mesh_broadphase_skin = 0.010f;
             }
             color_[0] = 0.58f;
             color_[1] = 0.74f;
@@ -1183,7 +1686,7 @@ private:
             params_.gravity = -9.8f;
             params_.stiffness = 10000.0f;
             params_.density = 1.0f;
-            params_.damping = 0.99f;
+            params_.damping = 1.0f;
             params_.fixed_weight = 1.0e6f;
             params_.pcg_iterations = 50;
             params_.ground_y = -50.0f;
@@ -1210,6 +1713,18 @@ private:
         if (const char* value = std::getenv("CHYSX_PABD_DAMPING")) {
             params_.damping = std::max(0.0f, std::strtof(value, nullptr));
         }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_HINGE_STIFFNESS")) {
+            params_.hinge_stiffness =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_MOTOR_TORQUE")) {
+            params_.motor_torque = std::strtof(value, nullptr);
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_MOTOR_DAMPING")) {
+            params_.motor_damping =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
         if (const char* value = std::getenv("CHYSX_PABD_BJ_OMEGA")) {
             params_.block_jacobi_omega =
                 std::max(0.0f, std::strtof(value, nullptr));
@@ -1229,6 +1744,11 @@ private:
         }
         if (const char* value = std::getenv("CHYSX_PABD_SELF_FRICTION")) {
             params_.self_collision_friction =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_SELF_NORMAL_DAMPING")) {
+            params_.self_collision_normal_damping =
                 std::max(0.0f, std::strtof(value, nullptr));
         }
         if (const char* value = std::getenv("CHYSX_PABD_FRICTION_EPSILON")) {
@@ -1299,6 +1819,27 @@ extern "C" void chysx_register_pabd_cuda_scenes() {
                                      PabdSceneKind::TetraEECross);
         });
     chysx::render::register_scene(
+        "CUDA PABD: Single Torque Gear",
+        []() -> chysx::render::Scene* {
+            return new CudaPabdScene(
+                "CUDA PABD: Single Torque Gear",
+                PabdSceneKind::SingleTorqueGear);
+        });
+    chysx::render::register_scene(
+        "CUDA PABD: Torque Gear Line 2",
+        []() -> chysx::render::Scene* {
+            return new CudaPabdScene(
+                "CUDA PABD: Torque Gear Line 2",
+                PabdSceneKind::TorqueGearLine2);
+        });
+    chysx::render::register_scene(
+        "CUDA PABD: Torque Gear Line 6",
+        []() -> chysx::render::Scene* {
+            return new CudaPabdScene(
+                "CUDA PABD: Torque Gear Line 6",
+                PabdSceneKind::TorqueGearLine6);
+        });
+    chysx::render::register_scene(
         "CUDA PABD: Rigid-IPC Chain Net 4x4",
         []() -> chysx::render::Scene* {
             return new CudaPabdScene("CUDA PABD: Rigid-IPC Chain Net 4x4",
@@ -1309,6 +1850,13 @@ extern "C" void chysx_register_pabd_cuda_scenes() {
         []() -> chysx::render::Scene* {
             return new CudaPabdScene("CUDA PABD: Rigid-IPC Chain Net 8x8",
                                      PabdSceneKind::RigidIpcChainNet8x8);
+        });
+    chysx::render::register_scene(
+        "CUDA PABD: Rigid-IPC Chain Net 16x16 Ball",
+        []() -> chysx::render::Scene* {
+            return new CudaPabdScene(
+                "CUDA PABD: Rigid-IPC Chain Net 16x16 Ball",
+                PabdSceneKind::RigidIpcChainNet16x16Ball);
         });
     chysx::render::register_scene(
         "CUDA PABD: Rigid-IPC Chain Net 32x32",
