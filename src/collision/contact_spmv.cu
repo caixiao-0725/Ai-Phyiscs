@@ -89,7 +89,9 @@ __global__ void bake_contact_diag_kernel(
     const math::Vec4f* __restrict__ slips,           // may be nullptr
     const int* __restrict__ count_ptr,
     int max_contacts,
-    float k_alpha,
+    float uniform_stiffness,
+    const float* __restrict__ stiffnesses,
+    float alpha,
     float friction_mu,                                // 0 disables
     float friction_epsilon,
     math::Mat3f* __restrict__ diag_blocks) {
@@ -97,6 +99,12 @@ __global__ void bake_contact_diag_kernel(
     const int n_raw = *count_ptr;
     const int n = (n_raw < max_contacts) ? n_raw : max_contacts;
     if (c >= n) return;
+
+    const float stiffness = stiffnesses != nullptr
+        ? stiffnesses[c]
+        : uniform_stiffness;
+    const float k_alpha = alpha * stiffness;
+    if (!(k_alpha > 0.0f) || !isfinite(k_alpha)) return;
 
     const math::Vec4i ids = pairs[c];
     const ContactWeights w = weights[c];
@@ -178,7 +186,9 @@ __global__ void apply_contact_spmv_kernel(
     const math::Vec4f* __restrict__ slips,         // may be nullptr
     const int* __restrict__ count_ptr,
     int max_contacts,
-    float k_alpha,
+    float uniform_stiffness,
+    const float* __restrict__ stiffnesses,
+    float alpha,
     float friction_mu,                              // 0 disables
     float friction_epsilon,
     const math::Vec3f* __restrict__ x,
@@ -187,6 +197,12 @@ __global__ void apply_contact_spmv_kernel(
     const int n_raw = *count_ptr;
     const int n = (n_raw < max_contacts) ? n_raw : max_contacts;
     if (c >= n) return;
+
+    const float stiffness = stiffnesses != nullptr
+        ? stiffnesses[c]
+        : uniform_stiffness;
+    const float k_alpha = alpha * stiffness;
+    if (!(k_alpha > 0.0f) || !isfinite(k_alpha)) return;
 
     const math::Vec4i ids = pairs[c];
     const ContactWeights w = weights[c];
@@ -487,7 +503,6 @@ void bake_contact_diag(math::Mat3f* diag_blocks,
     const int launch_size = (op.max_contacts > 0) ? op.max_contacts : 1;
     const int* count_ptr  = op.count_dev ? op.count_dev : zero_count_ptr();
 
-    const float k_alpha = alpha * op.stiffness;
     const float fric_mu =
         op.friction_active() ? op.friction_mu : 0.0f;
     const math::Vec4f* slip_ptr =
@@ -498,7 +513,9 @@ void bake_contact_diag(math::Mat3f* diag_blocks,
         slip_ptr,
         count_ptr,
         op.max_contacts,
-        k_alpha,
+        op.stiffness,
+        op.stiffnesses,
+        alpha,
         fric_mu,
         op.friction_epsilon,
         diag_blocks);
@@ -521,7 +538,6 @@ void apply_contact_spmv(const ContactSpMVOp& op,
     const int launch_size = (op.max_contacts > 0) ? op.max_contacts : 1;
     const int* count_ptr  = op.count_dev ? op.count_dev : zero_count_ptr();
 
-    const float k_alpha = alpha * op.stiffness;
     const float fric_mu =
         op.friction_active() ? op.friction_mu : 0.0f;
     const math::Vec4f* slip_ptr =
@@ -532,7 +548,9 @@ void apply_contact_spmv(const ContactSpMVOp& op,
         slip_ptr,
         count_ptr,
         op.max_contacts,
-        k_alpha,
+        op.stiffness,
+        op.stiffnesses,
+        alpha,
         fric_mu,
         op.friction_epsilon,
         x,

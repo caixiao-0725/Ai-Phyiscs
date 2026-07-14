@@ -89,11 +89,35 @@ struct BodyBlock12PreconditionerOp {
     const float* lower_factors = nullptr;
     const math::Vec4i* body_rows = nullptr;
     const unsigned char* fixed_rows = nullptr;
+    // When provided, factors are expressed in each body's co-rotated frame.
+    // Residuals are rotated into that frame before the triangular solve and
+    // solutions are rotated back to world space.
+    const math::Mat3f* body_rotations = nullptr;
     int num_bodies = 0;
 
     bool active() const noexcept {
         return lower_factors != nullptr && body_rows != nullptr &&
                num_bodies > 0;
+    }
+};
+
+// Optional matrix-free co-rotated body elasticity. The constant rest
+// curvature is represented by `body_gradients`; `rotational_curvatures`
+// stores the state-dependent 3x3 Polar-GN correction in the local frame.
+// Each body owns four distinct BlockCSR rows.
+struct BodyElasticSpMVOp {
+    const math::Vec4i* body_rows = nullptr;
+    const math::Vec3f* body_gradients = nullptr;
+    const math::Mat3f* body_rotations = nullptr;
+    const math::Mat3f* rotational_curvatures = nullptr;
+    const float* body_scales = nullptr;
+    int num_bodies = 0;
+
+    bool active() const noexcept {
+        return body_rows != nullptr && body_gradients != nullptr &&
+               body_rotations != nullptr &&
+               rotational_curvatures != nullptr &&
+               body_scales != nullptr && num_bodies > 0;
     }
 };
 
@@ -140,8 +164,10 @@ public:
     //
     // `body_preconditioner` optionally replaces pointwise 3x3 Jacobi with
     // one packed 12x12 triangular solve per four-row rigid-body group.
+    // `body_elastic` adds a co-rotated rest operator plus a state-dependent
+    // rank-3 rotational correction without storing those blocks in CSR.
     //
-    // Returns the number of iterations actually performed.
+    // Returns the number of iterations performed.
     int solve(const sparse::BlockCSR3& A,
               DeviceSpan<math::Vec3f> b,
               DeviceSpan<math::Vec3f> x,
@@ -149,7 +175,8 @@ public:
               std::uintptr_t cuda_stream = 0,
               collision::ContactSpMVOp contact = {},
               collision::WideContactSpMVOp wide_contact = {},
-              BodyBlock12PreconditionerOp body_preconditioner = {});
+              BodyBlock12PreconditionerOp body_preconditioner = {},
+              BodyElasticSpMVOp body_elastic = {});
 
     // Last solve's preconditioner-weighted residual <r, z> from the
     // final iteration, copied to host on demand.  Useful for cheap
@@ -183,7 +210,7 @@ private:
     //   coeff_[3] = beta_k
     CudaArray<float> coeff_;
 
-    // One partial sum per vector block.  The buffer is allocated before
+    // One partial sum per vector block. The buffer is allocated before
     // graph capture and reused by every reduction in every iteration.
     CudaArray<float> reduction_partial_;
     CudaArray<float> true_residual_norms_;
@@ -199,7 +226,14 @@ private:
     const float* graph_body_factors_ = nullptr;
     const math::Vec4i* graph_body_rows_ = nullptr;
     const unsigned char* graph_fixed_rows_ = nullptr;
+    const math::Mat3f* graph_body_preconditioner_rotations_ = nullptr;
     int graph_num_bodies_ = 0;
+    const math::Vec4i* graph_elastic_rows_ = nullptr;
+    const math::Vec3f* graph_elastic_gradients_ = nullptr;
+    const math::Mat3f* graph_elastic_rotations_ = nullptr;
+    const math::Mat3f* graph_elastic_curvatures_ = nullptr;
+    const float* graph_elastic_scales_ = nullptr;
+    int graph_elastic_num_bodies_ = 0;
 };
 
 }  // namespace solver

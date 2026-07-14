@@ -204,6 +204,25 @@ if(CHYSX_BUILD_TESTS)
     endif()
 
     add_test(NAME mesh_mesh_contact_tests COMMAND mesh_mesh_contact_tests)
+
+    add_executable(pabd_curvature_experiment
+        tests/pabd_curvature_experiment.cu
+    )
+    target_link_libraries(pabd_curvature_experiment PRIVATE chysx_core)
+    target_include_directories(pabd_curvature_experiment PRIVATE src)
+    set_target_properties(pabd_curvature_experiment PROPERTIES
+        LINKER_LANGUAGE CUDA
+    )
+
+    if(MSVC)
+        target_compile_options(pabd_curvature_experiment PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/utf-8>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>
+        )
+    endif()
+
+    add_test(NAME pabd_curvature_experiment_smoke
+        COMMAND pabd_curvature_experiment --samples 4096 --repeats 2)
 endif()
 
 add_library(chysx_scenes STATIC

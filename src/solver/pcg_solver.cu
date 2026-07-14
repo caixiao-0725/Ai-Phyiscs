@@ -80,6 +80,76 @@ __global__ void zero_fixed_rows_kernel(
     }
 }
 
+__device__ __forceinline__ math::Mat3f body_elastic_sym(
+    const math::Mat3f& value) {
+    return (value + math::transpose(value)) * 0.5f;
+}
+
+__device__ __forceinline__ math::Vec3f body_elastic_vex_skew(
+    const math::Mat3f& value) {
+    return math::Vec3f(0.5f * (value(2, 1) - value(1, 2)),
+                       0.5f * (value(0, 2) - value(2, 0)),
+                       0.5f * (value(1, 0) - value(0, 1)));
+}
+
+__device__ __forceinline__ math::Mat3f body_elastic_hat(
+    const math::Vec3f& value) {
+    return math::Mat3f(0.0f, -value.z, value.y,
+                       value.z, 0.0f, -value.x,
+                       -value.y, value.x, 0.0f);
+}
+
+__global__ void apply_body_elastic_spmv_kernel(
+    const math::Vec4i* __restrict__ body_rows,
+    const math::Vec3f* __restrict__ body_gradients,
+    const math::Mat3f* __restrict__ body_rotations,
+    const math::Mat3f* __restrict__ rotational_curvatures,
+    const float* __restrict__ body_scales,
+    int num_bodies,
+    const math::Vec3f* __restrict__ x,
+    math::Vec3f* __restrict__ y,
+    float alpha) {
+    const int body = blockIdx.x * blockDim.x + threadIdx.x;
+    if (body >= num_bodies) return;
+
+    const math::Vec4i rows = body_rows[body];
+    const math::Vec3f* gradients = body_gradients + body * 4;
+    math::Mat3f delta_f = math::Mat3f::zero();
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        delta_f += math::outer(x[rows[a]], gradients[a]);
+    }
+
+    const math::Mat3f rotation = body_rotations[body];
+    const math::Mat3f local_delta = math::transpose(rotation) * delta_f;
+    const math::Vec3f skew = body_elastic_vex_skew(local_delta);
+    const math::Mat3f local_response = body_elastic_sym(local_delta) +
+        body_elastic_hat(rotational_curvatures[body] * skew);
+    const math::Mat3f world_response =
+        rotation * local_response * (body_scales[body] * alpha);
+
+    // Matrix-free ABD bodies own disjoint groups of four control rows.
+    #pragma unroll
+    for (int a = 0; a < 4; ++a) {
+        const int row = rows[a];
+        y[row] += world_response * gradients[a];
+    }
+}
+
+void apply_body_elastic_spmv(const BodyElasticSpMVOp& op,
+                             const math::Vec3f* x,
+                             math::Vec3f* y,
+                             float alpha,
+                             std::uintptr_t cuda_stream) {
+    if (!op.active()) return;
+    auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
+    const int grid = grid_for(op.num_bodies);
+    apply_body_elastic_spmv_kernel<<<grid, kBlockDim, 0, stream>>>(
+        op.body_rows, op.body_gradients, op.body_rotations,
+        op.rotational_curvatures, op.body_scales, op.num_bodies,
+        x, y, alpha);
+}
+
 __device__ __forceinline__ int packed_lower_index(int row, int col) {
     return row * (row + 1) / 2 + col;
 }
@@ -114,6 +184,7 @@ __global__ void body_block12_copy_dot_kernel(
     const float* __restrict__ lower_factors,
     const math::Vec4i* __restrict__ body_rows,
     const unsigned char* __restrict__ fixed_rows,
+    const math::Mat3f* __restrict__ body_rotations,
     int num_bodies,
     const math::Vec3f* __restrict__ r,
     math::Vec3f* __restrict__ z,
@@ -123,13 +194,19 @@ __global__ void body_block12_copy_dot_kernel(
     if (body >= num_bodies) return;
 
     const math::Vec4i rows = body_rows[body];
+    const bool co_rotated = body_rotations != nullptr;
+    const math::Mat3f rotation = co_rotated
+        ? body_rotations[body]
+        : math::Mat3f::identity();
+    const math::Mat3f rotation_t = math::transpose(rotation);
     float rhs[kBodyBlock12Dofs];
     #pragma unroll
     for (int a = 0; a < 4; ++a) {
         const int row = rows[a];
-        const math::Vec3f ri = fixed_rows != nullptr && fixed_rows[row]
+        const math::Vec3f ri_world = fixed_rows != nullptr && fixed_rows[row]
             ? math::Vec3f(0.0f, 0.0f, 0.0f)
             : r[row];
+        const math::Vec3f ri = co_rotated ? rotation_t * ri_world : ri_world;
         rhs[3 * a + 0] = ri.x;
         rhs[3 * a + 1] = ri.y;
         rhs[3 * a + 2] = ri.z;
@@ -144,16 +221,17 @@ __global__ void body_block12_copy_dot_kernel(
     #pragma unroll
     for (int a = 0; a < 4; ++a) {
         const int row = rows[a];
+        const math::Vec3f zi_local(solution[3 * a + 0],
+                                   solution[3 * a + 1],
+                                   solution[3 * a + 2]);
         const math::Vec3f zi = fixed_rows != nullptr && fixed_rows[row]
             ? math::Vec3f(0.0f, 0.0f, 0.0f)
-            : math::Vec3f(solution[3 * a + 0],
-                          solution[3 * a + 1],
-                          solution[3 * a + 2]);
+            : (co_rotated ? rotation * zi_local : zi_local);
         z[row] = zi;
         p[row] = zi;
-        local_rho += rhs[3 * a + 0] * zi.x +
-                     rhs[3 * a + 1] * zi.y +
-                     rhs[3 * a + 2] * zi.z;
+        local_rho += rhs[3 * a + 0] * zi_local.x +
+                     rhs[3 * a + 1] * zi_local.y +
+                     rhs[3 * a + 2] * zi_local.z;
     }
     atomicAdd(rho, local_rho);
 }
@@ -164,6 +242,7 @@ __global__ void alpha_body_block12_dot_kernel(
     const float* __restrict__ lower_factors,
     const math::Vec4i* __restrict__ body_rows,
     const unsigned char* __restrict__ fixed_rows,
+    const math::Mat3f* __restrict__ body_rotations,
     int num_bodies,
     const math::Vec3f* __restrict__ p,
     const math::Vec3f* __restrict__ Ap,
@@ -178,6 +257,11 @@ __global__ void alpha_body_block12_dot_kernel(
     const float alpha =
         (sv > 1e-37f || sv < -1e-37f) ? (*rho / sv) : 0.0f;
     const math::Vec4i rows = body_rows[body];
+    const bool co_rotated = body_rotations != nullptr;
+    const math::Mat3f rotation = co_rotated
+        ? body_rotations[body]
+        : math::Mat3f::identity();
+    const math::Mat3f rotation_t = math::transpose(rotation);
     float rhs[kBodyBlock12Dofs];
     #pragma unroll
     for (int a = 0; a < 4; ++a) {
@@ -190,9 +274,10 @@ __global__ void alpha_body_block12_dot_kernel(
         } else {
             r[row] = math::Vec3f(0.0f, 0.0f, 0.0f);
         }
-        rhs[3 * a + 0] = ri.x;
-        rhs[3 * a + 1] = ri.y;
-        rhs[3 * a + 2] = ri.z;
+        const math::Vec3f ri_local = co_rotated ? rotation_t * ri : ri;
+        rhs[3 * a + 0] = ri_local.x;
+        rhs[3 * a + 1] = ri_local.y;
+        rhs[3 * a + 2] = ri_local.z;
     }
 
     float solution[kBodyBlock12Dofs];
@@ -204,15 +289,16 @@ __global__ void alpha_body_block12_dot_kernel(
     #pragma unroll
     for (int a = 0; a < 4; ++a) {
         const int row = rows[a];
+        const math::Vec3f zi_local(solution[3 * a + 0],
+                                   solution[3 * a + 1],
+                                   solution[3 * a + 2]);
         const math::Vec3f zi = fixed_rows != nullptr && fixed_rows[row]
             ? math::Vec3f(0.0f, 0.0f, 0.0f)
-            : math::Vec3f(solution[3 * a + 0],
-                          solution[3 * a + 1],
-                          solution[3 * a + 2]);
+            : (co_rotated ? rotation * zi_local : zi_local);
         z[row] = zi;
-        local_rho += rhs[3 * a + 0] * zi.x +
-                     rhs[3 * a + 1] * zi.y +
-                     rhs[3 * a + 2] * zi.z;
+        local_rho += rhs[3 * a + 0] * zi_local.x +
+                     rhs[3 * a + 1] * zi_local.y +
+                     rhs[3 * a + 2] * zi_local.z;
     }
     atomicAdd(new_rho, local_rho);
 }
@@ -386,6 +472,7 @@ void emit_pcg(const sparse::BlockCSR3& A,
               const collision::ContactSpMVOp& contact,
               const collision::WideContactSpMVOp& wide_contact,
               const BodyBlock12PreconditionerOp& body_preconditioner,
+              const BodyElasticSpMVOp& body_elastic,
               CudaArray<math::Vec3f>& r,
               CudaArray<math::Vec3f>& p,
               CudaArray<math::Vec3f>& z,
@@ -426,6 +513,8 @@ void emit_pcg(const sparse::BlockCSR3& A,
                                   n, -1.0f, cuda_stream);
     collision::apply_wide_contact_spmv(wide_contact, x.data(), r.gpu_data(),
                                        n, -1.0f, cuda_stream);
+    apply_body_elastic_spmv(body_elastic, x.data(), r.gpu_data(),
+                            -1.0f, cuda_stream);
     if (use_body_preconditioner && body_preconditioner.fixed_rows != nullptr) {
         zero_fixed_rows_kernel<<<grid, kBlockDim, 0, stream>>>(
             n, body_preconditioner.fixed_rows, r.gpu_data());
@@ -438,6 +527,7 @@ void emit_pcg(const sparse::BlockCSR3& A,
             body_preconditioner.lower_factors,
             body_preconditioner.body_rows,
             body_preconditioner.fixed_rows,
+            body_preconditioner.body_rotations,
             body_preconditioner.num_bodies,
             r.gpu_data(), z.gpu_data(), p.gpu_data(),
             &coeff.gpu_data()[0]);
@@ -459,6 +549,8 @@ void emit_pcg(const sparse::BlockCSR3& A,
         collision::apply_wide_contact_spmv(wide_contact, p.gpu_data(),
                                            Ap.gpu_data(), n, 1.0f,
                                            cuda_stream);
+        apply_body_elastic_spmv(body_elastic, p.gpu_data(), Ap.gpu_data(),
+                                1.0f, cuda_stream);
 
         dot_partial_kernel<kBlockDim><<<grid, kBlockDim, 0, stream>>>(
             p.gpu_data(), Ap.gpu_data(), reduction_partial.gpu_data(), n);
@@ -473,6 +565,7 @@ void emit_pcg(const sparse::BlockCSR3& A,
                 body_preconditioner.lower_factors,
                 body_preconditioner.body_rows,
                 body_preconditioner.fixed_rows,
+                body_preconditioner.body_rotations,
                 body_preconditioner.num_bodies,
                 p.gpu_data(), Ap.gpu_data(), x.data(), r.gpu_data(),
                 z.gpu_data(), &coeff.gpu_data()[2]);
@@ -506,6 +599,7 @@ void emit_true_residual(const sparse::BlockCSR3& A,
                         const collision::ContactSpMVOp& contact,
                         const collision::WideContactSpMVOp& wide_contact,
                         const BodyBlock12PreconditionerOp& body_preconditioner,
+                        const BodyElasticSpMVOp& body_elastic,
                         CudaArray<math::Vec3f>& r,
                         CudaArray<float>& reduction_partial,
                         CudaArray<float>& true_residual_norms) {
@@ -525,6 +619,8 @@ void emit_true_residual(const sparse::BlockCSR3& A,
         contact, x.data(), r.gpu_data(), n, -1.0f, cuda_stream);
     collision::apply_wide_contact_spmv(
         wide_contact, x.data(), r.gpu_data(), n, -1.0f, cuda_stream);
+    apply_body_elastic_spmv(body_elastic, x.data(), r.gpu_data(),
+                            -1.0f, cuda_stream);
     if (body_preconditioner.fixed_rows != nullptr) {
         zero_fixed_rows_kernel<<<grid, kBlockDim, 0, stream>>>(
             n, body_preconditioner.fixed_rows, r.gpu_data());
@@ -560,7 +656,14 @@ void PCGSolver::destroy_graph() noexcept {
     graph_body_factors_ = nullptr;
     graph_body_rows_ = nullptr;
     graph_fixed_rows_ = nullptr;
+    graph_body_preconditioner_rotations_ = nullptr;
     graph_num_bodies_ = 0;
+    graph_elastic_rows_ = nullptr;
+    graph_elastic_gradients_ = nullptr;
+    graph_elastic_rotations_ = nullptr;
+    graph_elastic_curvatures_ = nullptr;
+    graph_elastic_scales_ = nullptr;
+    graph_elastic_num_bodies_ = 0;
 }
 
 PCGSolver::~PCGSolver() { destroy_graph(); }
@@ -578,14 +681,29 @@ PCGSolver::PCGSolver(PCGSolver&& o) noexcept
       graph_body_factors_(o.graph_body_factors_),
       graph_body_rows_(o.graph_body_rows_),
       graph_fixed_rows_(o.graph_fixed_rows_),
-      graph_num_bodies_(o.graph_num_bodies_) {
+      graph_body_preconditioner_rotations_(
+          o.graph_body_preconditioner_rotations_),
+      graph_num_bodies_(o.graph_num_bodies_),
+      graph_elastic_rows_(o.graph_elastic_rows_),
+      graph_elastic_gradients_(o.graph_elastic_gradients_),
+      graph_elastic_rotations_(o.graph_elastic_rotations_),
+      graph_elastic_curvatures_(o.graph_elastic_curvatures_),
+      graph_elastic_scales_(o.graph_elastic_scales_),
+      graph_elastic_num_bodies_(o.graph_elastic_num_bodies_) {
     o.graph_exec_ = nullptr;
     o.graph_n_ = 0;
     o.graph_max_iter_ = 0;
     o.graph_body_factors_ = nullptr;
     o.graph_body_rows_ = nullptr;
     o.graph_fixed_rows_ = nullptr;
+    o.graph_body_preconditioner_rotations_ = nullptr;
     o.graph_num_bodies_ = 0;
+    o.graph_elastic_rows_ = nullptr;
+    o.graph_elastic_gradients_ = nullptr;
+    o.graph_elastic_rotations_ = nullptr;
+    o.graph_elastic_curvatures_ = nullptr;
+    o.graph_elastic_scales_ = nullptr;
+    o.graph_elastic_num_bodies_ = 0;
 }
 
 PCGSolver& PCGSolver::operator=(PCGSolver&& o) noexcept {
@@ -603,13 +721,28 @@ PCGSolver& PCGSolver::operator=(PCGSolver&& o) noexcept {
         graph_body_factors_ = o.graph_body_factors_;
         graph_body_rows_ = o.graph_body_rows_;
         graph_fixed_rows_ = o.graph_fixed_rows_;
+        graph_body_preconditioner_rotations_ =
+            o.graph_body_preconditioner_rotations_;
         graph_num_bodies_ = o.graph_num_bodies_;
+        graph_elastic_rows_ = o.graph_elastic_rows_;
+        graph_elastic_gradients_ = o.graph_elastic_gradients_;
+        graph_elastic_rotations_ = o.graph_elastic_rotations_;
+        graph_elastic_curvatures_ = o.graph_elastic_curvatures_;
+        graph_elastic_scales_ = o.graph_elastic_scales_;
+        graph_elastic_num_bodies_ = o.graph_elastic_num_bodies_;
         o.graph_exec_ = nullptr;
         o.graph_n_ = 0; o.graph_max_iter_ = 0;
         o.graph_body_factors_ = nullptr;
         o.graph_body_rows_ = nullptr;
         o.graph_fixed_rows_ = nullptr;
+        o.graph_body_preconditioner_rotations_ = nullptr;
         o.graph_num_bodies_ = 0;
+        o.graph_elastic_rows_ = nullptr;
+        o.graph_elastic_gradients_ = nullptr;
+        o.graph_elastic_rotations_ = nullptr;
+        o.graph_elastic_curvatures_ = nullptr;
+        o.graph_elastic_scales_ = nullptr;
+        o.graph_elastic_num_bodies_ = 0;
     }
     return *this;
 }
@@ -640,7 +773,8 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
                      std::uintptr_t cuda_stream,
                      collision::ContactSpMVOp contact,
                      collision::WideContactSpMVOp wide_contact,
-                     BodyBlock12PreconditionerOp body_preconditioner) {
+                     BodyBlock12PreconditionerOp body_preconditioner,
+                     BodyElasticSpMVOp body_elastic) {
     const int n = A.num_block_rows();
     if (n == 0) return 0;
 
@@ -662,6 +796,11 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
             "PCGSolver::solve: body 12x12 preconditioner must cover exactly "
             "four BlockCSR rows per body");
     }
+    if (body_elastic.active() && body_elastic.num_bodies * 4 != n) {
+        throw std::invalid_argument(
+            "PCGSolver::solve: matrix-free body elasticity must cover exactly "
+            "four distinct BlockCSR rows per body");
+    }
 
     CHYSX_NVTX_RANGE_COLOUR("pcg::solve", 0xfff1c40f);
 
@@ -672,13 +811,13 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
     auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
     if (stream == nullptr) {
         emit_pcg(A, b, x, max_iter, cuda_stream, contact,
-                 wide_contact, body_preconditioner,
+                 wide_contact, body_preconditioner, body_elastic,
                  r_, p_, z_, Ap_, M_inv_, coeff_,
                  reduction_partial_);
         if (params.compute_true_residual) {
             emit_true_residual(
                 A, b, x, cuda_stream, contact, wide_contact,
-                body_preconditioner, r_, reduction_partial_,
+                body_preconditioner, body_elastic, r_, reduction_partial_,
                 true_residual_norms_);
         }
         return max_iter;
@@ -688,7 +827,15 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
         graph_body_factors_ != body_preconditioner.lower_factors ||
         graph_body_rows_ != body_preconditioner.body_rows ||
         graph_fixed_rows_ != body_preconditioner.fixed_rows ||
-        graph_num_bodies_ != body_preconditioner.num_bodies) {
+        graph_body_preconditioner_rotations_ !=
+            body_preconditioner.body_rotations ||
+        graph_num_bodies_ != body_preconditioner.num_bodies ||
+        graph_elastic_rows_ != body_elastic.body_rows ||
+        graph_elastic_gradients_ != body_elastic.body_gradients ||
+        graph_elastic_rotations_ != body_elastic.body_rotations ||
+        graph_elastic_curvatures_ != body_elastic.rotational_curvatures ||
+        graph_elastic_scales_ != body_elastic.body_scales ||
+        graph_elastic_num_bodies_ != body_elastic.num_bodies) {
         destroy_graph();
         cudaGraph_t graph = nullptr;
         cudaError_t err = cudaStreamBeginCapture(
@@ -699,7 +846,7 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
                 cudaGetErrorString(err));
         }
         emit_pcg(A, b, x, max_iter, cuda_stream, contact,
-                 wide_contact, body_preconditioner,
+                 wide_contact, body_preconditioner, body_elastic,
                  r_, p_, z_, Ap_, M_inv_, coeff_,
                  reduction_partial_);
         err = cudaStreamEndCapture(stream, &graph);
@@ -721,7 +868,15 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
         graph_body_factors_ = body_preconditioner.lower_factors;
         graph_body_rows_ = body_preconditioner.body_rows;
         graph_fixed_rows_ = body_preconditioner.fixed_rows;
+        graph_body_preconditioner_rotations_ =
+            body_preconditioner.body_rotations;
         graph_num_bodies_ = body_preconditioner.num_bodies;
+        graph_elastic_rows_ = body_elastic.body_rows;
+        graph_elastic_gradients_ = body_elastic.body_gradients;
+        graph_elastic_rotations_ = body_elastic.body_rotations;
+        graph_elastic_curvatures_ = body_elastic.rotational_curvatures;
+        graph_elastic_scales_ = body_elastic.body_scales;
+        graph_elastic_num_bodies_ = body_elastic.num_bodies;
     }
 
     cudaError_t err = cudaGraphLaunch(graph_exec_, stream);
@@ -733,7 +888,7 @@ int PCGSolver::solve(const sparse::BlockCSR3& A,
     if (params.compute_true_residual) {
         emit_true_residual(
             A, b, x, cuda_stream, contact, wide_contact,
-            body_preconditioner, r_, reduction_partial_,
+            body_preconditioner, body_elastic, r_, reduction_partial_,
             true_residual_norms_);
     }
     return max_iter;

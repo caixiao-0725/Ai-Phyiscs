@@ -11,6 +11,7 @@
 #include "collision/contact_spmv.h"
 #include "collision/mesh_mesh_contact.h"
 #include "memory/cuda_array.h"
+#include "rigid/pabd_cuda/pabd_contact_measure.cuh"
 #include "rigid/pabd_cuda/pabd_cuda_solver.h"
 
 namespace {
@@ -23,12 +24,15 @@ using chysx::collision::MeshCollisionCategory;
 using chysx::collision::MeshCollisionMask;
 using chysx::collision::kMeshCollisionInterObject;
 using chysx::collision::kMeshCollisionSelf;
+using chysx::collision::ContactSpMVOp;
+using chysx::collision::ContactWeights;
 using chysx::collision::WideContact;
 using chysx::collision::WideContactSpMVOp;
 using chysx::math::Mat3f;
 using chysx::math::Vec3f;
 using chysx::math::Vec3i;
 using chysx::math::Vec4f;
+using chysx::math::Vec4i;
 
 struct TestMesh {
     std::vector<Vec3f> positions;
@@ -573,6 +577,247 @@ void run_wide_contact_friction_spmv() {
                  "wide-contact offdiag y4.z");
 }
 
+void run_per_contact_stiffness_spmv() {
+    std::cout << "[contact_spmv] per-contact stiffness\n";
+    chysx::CudaArray<Vec4i> pairs(1);
+    chysx::CudaArray<ContactWeights> weights(1);
+    chysx::CudaArray<float> stiffnesses(1);
+    chysx::CudaArray<int> count(1);
+    chysx::CudaArray<Mat3f> diag(4);
+    chysx::CudaArray<Vec3f> x(4);
+    chysx::CudaArray<Vec3f> y(4);
+
+    pairs.cpu_data()[0] = Vec4i(0, 1, 2, 3);
+    ContactWeights contact{};
+    contact.w0 = 1.0f;
+    contact.w1 = -1.0f;
+    contact.ny = 1.0f;
+    weights.cpu_data()[0] = contact;
+    stiffnesses.cpu_data()[0] = 7.0f;
+    count.cpu_data()[0] = 1;
+    for (int i = 0; i < 4; ++i) {
+        diag.cpu_data()[i] = Mat3f{};
+        x.cpu_data()[i] = Vec3f(0.0f);
+        y.cpu_data()[i] = Vec3f(0.0f);
+    }
+    x.cpu_data()[0].y = 1.0f;
+    x.cpu_data()[1].y = 3.0f;
+
+    pairs.copy_to_device();
+    weights.copy_to_device();
+    stiffnesses.copy_to_device();
+    count.copy_to_device();
+    diag.copy_to_device();
+    x.copy_to_device();
+    y.copy_to_device();
+
+    ContactSpMVOp op;
+    op.pairs = pairs.gpu_data();
+    op.weights = weights.gpu_data();
+    op.count_dev = count.gpu_data();
+    op.max_contacts = 1;
+    op.stiffness = 100.0f;
+    op.stiffnesses = stiffnesses.gpu_data();
+    chysx::collision::bake_contact_diag(
+        diag.gpu_data(), 4, op, 1.0f, 0);
+    chysx::collision::apply_contact_spmv(
+        op, x.gpu_data(), y.gpu_data(), 4, 1.0f, 0);
+    diag.copy_to_host();
+    y.copy_to_host();
+
+    require_near(diag.cpu_data()[0].data[4], 7.0f, 1.0e-5f,
+                 "per-contact diagonal stiffness");
+    require_near(diag.cpu_data()[1].data[4], 7.0f, 1.0e-5f,
+                 "per-contact second diagonal stiffness");
+    require_near(y.cpu_data()[0].y, -21.0f, 1.0e-5f,
+                 "per-contact offdiag row zero");
+    require_near(y.cpu_data()[1].y, -7.0f, 1.0e-5f,
+                 "per-contact offdiag row one");
+}
+
+void run_contact_tetrahedron_volume_measure() {
+    using chysx::rigid::pabd_cuda::
+        contact_tetrahedron_volume_at_activation;
+    std::cout << "[pabd_contact_beta] PF/EE activation tetra volume\n";
+
+    const float pf = contact_tetrahedron_volume_at_activation(
+        Vec3f(0.25f, 0.25f, 0.2f),
+        Vec3f(0.0f, 0.0f, 0.0f),
+        Vec3f(2.0f, 0.0f, 0.0f),
+        Vec3f(0.0f, 3.0f, 0.0f),
+        0.2f, 0.1f);
+    require_near(pf, 0.1f, 1.0e-6f,
+                 "PF activation tetra volume");
+
+    const float pf_near = contact_tetrahedron_volume_at_activation(
+        Vec3f(0.25f, 0.25f, 0.02f),
+        Vec3f(0.0f, 0.0f, 0.0f),
+        Vec3f(2.0f, 0.0f, 0.0f),
+        Vec3f(0.0f, 3.0f, 0.0f),
+        0.02f, 0.1f);
+    require_near(pf_near, pf, 1.0e-6f,
+                 "PF measure must not vanish as contact closes");
+
+    const float ee = contact_tetrahedron_volume_at_activation(
+        Vec3f(0.0f, 0.0f, 0.0f),
+        Vec3f(2.0f, 0.0f, 0.0f),
+        Vec3f(0.5f, -1.0f, 0.2f),
+        Vec3f(0.5f, 2.0f, 0.2f),
+        0.2f, 0.1f);
+    require_near(ee, 0.1f, 1.0e-6f,
+                 "EE activation tetra volume");
+
+    const float parallel_ee = contact_tetrahedron_volume_at_activation(
+        Vec3f(0.0f, 0.0f, 0.0f),
+        Vec3f(2.0f, 0.0f, 0.0f),
+        Vec3f(0.0f, 0.2f, 0.1f),
+        Vec3f(2.0f, 0.2f, 0.1f),
+        0.1f, 0.1f);
+    require_near(parallel_ee, 0.0f, 1.0e-7f,
+                 "parallel EE tetra volume");
+
+    const float large_pf = contact_tetrahedron_volume_at_activation(
+        Vec3f(0.5f, 0.5f, 0.2f),
+        Vec3f(0.0f, 0.0f, 0.0f),
+        Vec3f(4.0f, 0.0f, 0.0f),
+        Vec3f(0.0f, 6.0f, 0.0f),
+        0.2f, 0.1f);
+    require_near(large_pf, 4.0f * pf, 1.0e-6f,
+                 "contact measure must scale with stencil volume");
+
+    const float scaled_pf = contact_tetrahedron_volume_at_activation(
+        Vec3f(0.5f, 0.5f, 0.4f),
+        Vec3f(0.0f, 0.0f, 0.0f),
+        Vec3f(4.0f, 0.0f, 0.0f),
+        Vec3f(0.0f, 6.0f, 0.0f),
+        0.4f, 0.2f);
+    require_near(scaled_pf, 8.0f * pf, 1.0e-5f,
+                 "uniformly scaled contact measure must scale cubically");
+}
+
+void run_stacked_blocks_uses_pd_abd_box_path() {
+    using namespace chysx::rigid::pabd_cuda;
+    std::cout << "[pabd_stack] shared OBJ + ABD contact path\n";
+
+    const PabdCudaMesh stacked =
+        make_stacked_blocks_mesh(3, 0.42f, 0.0f, 0.02f);
+    const PabdCudaMesh boxes =
+        make_pd_abd_boxes_mesh(3, 0.0f, 0.02f, 0.42f, 0.0f);
+    require(stacked.rest_positions.size() == 12,
+            "stacked blocks must have four controls per body");
+    require(stacked.tets.size() == 3,
+            "stacked blocks must have one ABD control tet per body");
+    require(stacked.surface_maps.size() == 24,
+            "stacked blocks must use the eight-vertex OBJ surface per body");
+    require(stacked.surface_triangles.size() == 36,
+            "stacked blocks must use the OBJ triangle topology");
+    require(stacked.surface_edges.size() == boxes.surface_edges.size(),
+            "stacked blocks and PD+ABD boxes must share edge topology");
+    require(stacked.rest_positions.size() == boxes.rest_positions.size() &&
+                stacked.surface_maps.size() == boxes.surface_maps.size() &&
+                stacked.surface_triangles.size() ==
+                    boxes.surface_triangles.size(),
+            "stacked blocks and PD+ABD boxes must share mesh layout");
+    for (std::size_t i = 0; i < stacked.rest_positions.size(); ++i) {
+        require_near(stacked.rest_positions[i].x, boxes.rest_positions[i].x,
+                     1.0e-7f, "shared stack control x");
+        require_near(stacked.rest_positions[i].y, boxes.rest_positions[i].y,
+                     1.0e-7f, "shared stack control y");
+        require_near(stacked.rest_positions[i].z, boxes.rest_positions[i].z,
+                     1.0e-7f, "shared stack control z");
+    }
+}
+
+void run_ground_contact_beta_mass_time_normalization(
+    chysx::rigid::pabd_cuda::PabdGlobalSolverMode solver_mode) {
+    using namespace chysx::rigid::pabd_cuda;
+    std::cout << "[pabd_ground_beta] mass/time normalization "
+              << (solver_mode == PabdGlobalSolverMode::PCG
+                      ? "PCG"
+                      : "BlockJacobi12")
+              << "\n";
+
+    const auto normalized_ground_velocity =
+        [&](float density, float body_mass_scale, float dt) {
+            PabdCudaMesh mesh;
+            mesh.rest_positions = {
+                Vec3f(0.0f, 0.0f, 0.0f),
+                Vec3f(1.0f, 0.0f, 0.0f),
+                Vec3f(0.0f, 1.0f, 0.0f),
+                Vec3f(0.0f, 0.0f, 1.0f),
+            };
+            mesh.initial_velocities = {
+                Vec3f(0.0f, -1.0f, 0.0f),
+                Vec3f(0.0f), Vec3f(0.0f), Vec3f(0.0f),
+            };
+            mesh.fixed.assign(4, 0);
+            mesh.tets.push_back({0, 1, 2, 3});
+            mesh.tet_volume_overrides.push_back(body_mass_scale);
+            std::array<float, 16> mass{};
+            for (int i = 0; i < 4; ++i) {
+                mass[i * 4 + i] = body_mass_scale * 0.25f;
+            }
+            mesh.tet_mass_blocks.push_back(mass);
+            for (int vertex = 0; vertex < 4; ++vertex) {
+                PabdSurfaceMap map;
+                map.index = {0, 1, 2, 3};
+                map.weight = {0.0f, 0.0f, 0.0f, 0.0f};
+                map.weight[vertex] = 1.0f;
+                map.body = 0;
+                map.self_collide = 0;
+                map.ground_collide = vertex == 0 ? 1 : 0;
+                mesh.surface_maps.push_back(map);
+            }
+            mesh.surface_triangles = {
+                {0, 2, 1}, {0, 1, 3}, {1, 2, 3}, {2, 0, 3}};
+            mesh.surface_edges = {
+                {0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+
+            PabdCudaParams params;
+            params.dt = dt;
+            params.iterations = 1;
+            params.gravity = 0.0f;
+            params.stiffness = 0.0f;
+            params.use_arap_beta = true;
+            params.arap_beta = 0.0f;
+            params.density = density;
+            params.damping = 1.0f;
+            params.ground_y = 0.0f;
+            params.contact_gap = 0.0f;
+            params.use_contact_beta = true;
+            params.ground_contact_beta = 4.0f;
+            params.ground_stiffness = 0.0f;
+            params.self_collision_beta = 0.0f;
+            params.self_collision_stiffness = 0.0f;
+            params.self_collision_thickness = 0.0f;
+            params.self_collision_max_contacts = 8;
+            params.pcg_iterations = 50;
+            params.global_solver = solver_mode;
+
+            PabdCudaSolver solver;
+            solver.setup(mesh, params);
+            solver.step(dt);
+            return solver.flat_positions()[2] / dt;
+        };
+
+    const float baseline =
+        normalized_ground_velocity(1.0f, 1.0f, 0.0033f);
+    const float heavy =
+        normalized_ground_velocity(100.0f, 1.0f, 0.0033f);
+    const float large_mass =
+        normalized_ground_velocity(1.0f, 10.0f, 0.0033f);
+    const float double_dt =
+        normalized_ground_velocity(1.0f, 1.0f, 0.0066f);
+    require_near(baseline, -0.2f, 2.0e-3f,
+                 "contact beta isolated contraction");
+    require_near(heavy, baseline, 2.0e-3f,
+                 "contact beta response must be density invariant");
+    require_near(large_mass, baseline, 2.0e-3f,
+                 "ground beta response must be body-mass invariant");
+    require_near(double_dt, baseline, 2.0e-3f,
+                 "contact beta response must be timestep invariant");
+}
+
 void run_endpoint_hinge_motor(
     chysx::rigid::pabd_cuda::PabdGlobalSolverMode solver_mode) {
     using namespace chysx::rigid::pabd_cuda;
@@ -628,7 +873,7 @@ void run_endpoint_hinge_motor(
     params.stiffness = 1.5e4f;
     params.density = 1.0f;
     params.damping = 1.0f;
-    params.hinge_stiffness = 3.0e3f;
+    params.hinge_beta = 64.0f;
     params.motor_torque = -1.0e3f;
     params.motor_damping = 1.0f;
     params.ground_stiffness = 0.0f;
@@ -651,6 +896,159 @@ void run_endpoint_hinge_motor(
             "endpoint hinge PCG body factorization must not fail");
     require(solver.last_block_jacobi_failures() == 0,
             "endpoint hinge Block-Jacobi factorization must not fail");
+
+    if (solver_mode == PabdGlobalSolverMode::PCG) {
+        const Vec3f offset(2.05f, 0.37f, -0.22f);
+        for (Vec3f& position : mesh.rest_positions) position += offset;
+        PabdEndpointHinge& shifted_hinge = mesh.endpoint_hinges.front();
+        shifted_hinge.endpoint0.x += offset.x;
+        shifted_hinge.endpoint0.y += offset.y;
+        shifted_hinge.endpoint0.z += offset.z;
+        shifted_hinge.endpoint1.x += offset.x;
+        shifted_hinge.endpoint1.y += offset.y;
+        shifted_hinge.endpoint1.z += offset.z;
+
+        params.motor_torque = 0.0f;
+        PabdCudaSolver rest_solver;
+        rest_solver.set_auto_download_positions(false);
+        rest_solver.setup(mesh, params);
+        for (int frame = 0; frame < 600; ++frame) {
+            rest_solver.step(params.dt);
+        }
+        require(
+            std::abs(rest_solver.last_motor_axis_angular_velocity()) < 1.0e-4f,
+            "endpoint hinge at rest must not acquire angular velocity");
+        require(rest_solver.last_hinge_endpoint_error() < 1.0e-5f,
+                "endpoint hinge at rest must not drift from its world axis");
+
+        const auto one_step_positions = [&](float density) {
+            PabdCudaMesh moving_mesh = mesh;
+            moving_mesh.initial_velocities.assign(
+                4, Vec3f(1.0f, -0.25f, 0.5f));
+            PabdCudaParams moving_params = params;
+            moving_params.density = density;
+            moving_params.stiffness = 0.0f;
+
+            PabdCudaSolver moving_solver;
+            moving_solver.setup(moving_mesh, moving_params);
+            moving_solver.step(moving_params.dt);
+            return moving_solver.flat_positions();
+        };
+        const std::vector<float> unit_mass_positions =
+            one_step_positions(1.0f);
+        const std::vector<float> heavy_mass_positions =
+            one_step_positions(100.0f);
+        require(unit_mass_positions.size() == heavy_mass_positions.size(),
+                "mass-normalized hinge position vector size");
+        for (std::size_t i = 0; i < unit_mass_positions.size(); ++i) {
+            require_near(
+                unit_mass_positions[i], heavy_mass_positions[i], 2.0e-5f,
+                "mass-normalized hinge response must be density invariant");
+        }
+    }
+}
+
+void run_arap_beta_mass_time_normalization(
+    chysx::rigid::pabd_cuda::PabdGlobalSolverMode solver_mode) {
+    using namespace chysx::rigid::pabd_cuda;
+    std::cout << "[pabd_arap_beta] mass/time normalization "
+              << (solver_mode == PabdGlobalSolverMode::PCG
+                      ? "PCG"
+                      : "BlockJacobi12")
+              << "\n";
+
+    const std::array<Vec3f, 4> rest = {
+        Vec3f(-1.0f, -1.0f, -1.0f),
+        Vec3f(3.0f, -1.0f, -1.0f),
+        Vec3f(-1.0f, 3.0f, -1.0f),
+        Vec3f(-1.0f, -1.0f, 3.0f),
+    };
+    const auto normalized_step = [&](float density, float dt, float beta) {
+        PabdCudaMesh mesh;
+        mesh.rest_positions.assign(rest.begin(), rest.end());
+        mesh.initial_velocities = {
+            Vec3f(0.0f, 0.0f, 0.0f),
+            Vec3f(1.0f, 0.2f, -0.1f),
+            Vec3f(-0.3f, 0.8f, 0.4f),
+            Vec3f(0.1f, -0.2f, 0.9f),
+        };
+        mesh.fixed.assign(4, 0);
+        mesh.tets.push_back({0, 1, 2, 3});
+        mesh.tet_volume_overrides.push_back(1.0f);
+        std::array<float, 16> mass{};
+        for (int i = 0; i < 4; ++i) mass[i * 4 + i] = 1.0f;
+        mesh.tet_mass_blocks.push_back(mass);
+        for (int vertex = 0; vertex < 4; ++vertex) {
+            PabdSurfaceMap map;
+            map.index = {0, 1, 2, 3};
+            map.weight = {0.0f, 0.0f, 0.0f, 0.0f};
+            map.weight[vertex] = 1.0f;
+            map.body = 0;
+            map.ground_collide = 0;
+            mesh.surface_maps.push_back(map);
+        }
+        mesh.surface_triangles = {
+            {0, 2, 1}, {0, 1, 3}, {1, 2, 3}, {2, 0, 3}};
+        mesh.surface_edges = {
+            {0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+
+        PabdCudaParams params;
+        params.dt = dt;
+        params.iterations = 1;
+        params.gravity = 0.0f;
+        params.stiffness = 0.0f;
+        params.use_arap_beta = true;
+        params.arap_beta = beta;
+        params.density = density;
+        params.damping = 1.0f;
+        params.ground_stiffness = 0.0f;
+        params.self_collision_stiffness = 0.0f;
+        params.self_collision_thickness = 0.0f;
+        params.self_collision_max_contacts = 8;
+        params.pcg_iterations = 50;
+        params.global_solver = solver_mode;
+
+        PabdCudaSolver solver;
+        solver.setup(mesh, params);
+        solver.step(dt);
+        const std::vector<float>& positions = solver.flat_positions();
+        std::vector<float> normalized(positions.size(), 0.0f);
+        for (int vertex = 0; vertex < 4; ++vertex) {
+            const float rest_flat[3] = {
+                rest[vertex].x, rest[vertex].z, rest[vertex].y};
+            for (int axis = 0; axis < 3; ++axis) {
+                normalized[3 * vertex + axis] =
+                    (positions[3 * vertex + axis] - rest_flat[axis]) / dt;
+            }
+        }
+        return normalized;
+    };
+
+    const std::vector<float> baseline = normalized_step(1.0f, 0.0033f, 2.0f);
+    const std::vector<float> heavy = normalized_step(100.0f, 0.0033f, 2.0f);
+    const std::vector<float> double_dt = normalized_step(1.0f, 0.0066f, 2.0f);
+    require(baseline.size() == heavy.size() &&
+                baseline.size() == double_dt.size(),
+            "ARAP beta normalized response vector size");
+    for (std::size_t i = 0; i < baseline.size(); ++i) {
+        require_near(baseline[i], heavy[i], 2.0e-3f,
+                     "ARAP beta response must be density invariant");
+        require_near(baseline[i], double_dt[i], 2.0e-3f,
+                     "ARAP beta response must be timestep invariant");
+    }
+
+    const std::vector<float> zero_beta =
+        normalized_step(1.0f, 0.0033f, 0.0f);
+    const std::vector<float> stiff_beta =
+        normalized_step(1.0f, 0.0033f, 8.0f);
+    float max_beta_response_delta = 0.0f;
+    for (std::size_t i = 0; i < zero_beta.size(); ++i) {
+        max_beta_response_delta = std::max(
+            max_beta_response_delta,
+            std::abs(zero_beta[i] - stiff_beta[i]));
+    }
+    require(max_beta_response_delta > 1.0e-2f,
+            "ARAP beta must change a non-rigid prediction");
 }
 
 }  // namespace
@@ -668,6 +1066,17 @@ int main() {
         run_oriented_point_face_crossing(BroadphaseBackend::QuantBvh);
         run_oriented_edge_edge_crossing(BroadphaseBackend::QuantBvh);
         run_wide_contact_friction_spmv();
+        run_per_contact_stiffness_spmv();
+        run_contact_tetrahedron_volume_measure();
+        run_stacked_blocks_uses_pd_abd_box_path();
+        run_ground_contact_beta_mass_time_normalization(
+            chysx::rigid::pabd_cuda::PabdGlobalSolverMode::PCG);
+        run_ground_contact_beta_mass_time_normalization(
+            chysx::rigid::pabd_cuda::PabdGlobalSolverMode::BlockJacobi12);
+        run_arap_beta_mass_time_normalization(
+            chysx::rigid::pabd_cuda::PabdGlobalSolverMode::PCG);
+        run_arap_beta_mass_time_normalization(
+            chysx::rigid::pabd_cuda::PabdGlobalSolverMode::BlockJacobi12);
         run_endpoint_hinge_motor(
             chysx::rigid::pabd_cuda::PabdGlobalSolverMode::PCG);
         run_endpoint_hinge_motor(

@@ -64,6 +64,9 @@ struct ContactSpMVOp {
     const int*               count_dev    = nullptr;  // single-int counter
     int                      max_contacts = 0;
     float                    stiffness    = 0.0f;
+    // Optional absolute per-contact stiffness. When present it overrides the
+    // uniform value above and is still multiplied by the caller's alpha.
+    const float*             stiffnesses  = nullptr;
 
     // IPC-style Lagged-Newton Coulomb friction.  When `friction_mu > 0`
     // and `slips != nullptr`, the per-pair tangent block
@@ -83,7 +86,9 @@ struct ContactSpMVOp {
     float                    friction_epsilon = 1.0e-4f;
 
     bool active() const noexcept {
-        return max_contacts > 0 && stiffness > 0.0f && pairs != nullptr;
+        return max_contacts > 0 &&
+               (stiffness > 0.0f || stiffnesses != nullptr) &&
+               pairs != nullptr;
     }
 
     bool friction_active() const noexcept {

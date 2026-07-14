@@ -343,6 +343,12 @@ __global__ void cull_ef_to_vfee_kernel(
         const math::Vec3f p1 = pos[ea.y];
         const math::Vec3f q0 = pos[eb.x];
         const math::Vec3f q1 = pos[eb.y];
+        const math::Vec3f da = p1 - p0;
+        const math::Vec3f db = q1 - q0;
+        const math::Vec3f cross_d = math::cross(da, db);
+        const float cross_sq = math::dot(cross_d, cross_d);
+        const float len_scale = math::dot(da, da) * math::dot(db, db);
+        if (cross_sq < 1.0e-3f * len_scale) continue;
         float s, t;
         math::Vec3f cp, cq;
         closest_point_seg_seg(p0, p1, q0, q1, s, t, cp, cq);
@@ -396,6 +402,12 @@ __global__ void cull_ee_adjacent_kernel(
     const math::Vec3f p1 = pos[ids.y];
     const math::Vec3f q0 = pos[ids.z];
     const math::Vec3f q1 = pos[ids.w];
+    const math::Vec3f da = p1 - p0;
+    const math::Vec3f db = q1 - q0;
+    const math::Vec3f cross_d = math::cross(da, db);
+    const float cross_sq = math::dot(cross_d, cross_d);
+    const float len_scale = math::dot(da, da) * math::dot(db, db);
+    if (cross_sq < 1.0e-3f * len_scale) return;
     float s, t;
     math::Vec3f cp, cq;
     closest_point_seg_seg(p0, p1, q0, q1, s, t, cp, cq);

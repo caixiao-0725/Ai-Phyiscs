@@ -19,6 +19,7 @@
 #include "../../memory/cuda_array.h"
 #include "../../solver/pcg_solver.h"
 #include "../../sparse/block_csr.h"
+#include "pabd_elastic_curvature.cuh"
 
 namespace chysx {
 namespace rigid {
@@ -29,23 +30,54 @@ enum class PabdGlobalSolverMode {
     BlockJacobi12 = 1,
 };
 
+enum class PabdSelfContactMeasureMode {
+    EffectiveMass = 0,
+    TetrahedronVolume = 1,
+};
+
 struct PabdCudaParams {
     float dt = 0.0033f;
     int substeps = 1;
     int iterations = 1;       // global PD solve passes per substep
     float gravity = -9.8f;
     float stiffness = 1200.0f;
+    bool use_arap_beta = false;
+    // Dimensionless mean deformation stiffness relative to M / h^2.
+    float arap_beta = 1.0f;
+    PabdElasticCurvatureMode elastic_curvature =
+        PabdElasticCurvatureMode::ProjectiveDynamics;
+    PabdPolarGnBackend polar_gn_backend = PabdPolarGnBackend::Assembled12;
+    bool elastic_curvature_diagnostics = false;
     float density = 1.0f;
     float damping = 1.0f;
     float fixed_weight = 1.0e7f;
-    float hinge_stiffness = 0.0f;
+    // Dimensionless endpoint contraction strength. The hinge energy uses the
+    // endpoint effective mass, so beta has the same meaning across body mass
+    // and control parameterizations.
+    float hinge_beta = 0.0f;
     float motor_torque = 0.0f;
     float motor_damping = 0.0f;
     float ground_y = 0.0f;
     float contact_gap = 0.035f;
+    bool use_contact_beta = false;
+    // Dimensionless contact strengths. Ground contacts use their nodal
+    // effective mass. PF/EE contacts can use either their effective mass or
+    // rho*V_hat, where V_hat is the virtual four-point contact tetrahedron
+    // volume at the activation distance.
+    float ground_contact_beta = 0.0f;
     float ground_stiffness = 0.0f;
     float ground_friction = 0.0f;
     float self_collision_thickness = 0.0f;
+    float self_collision_beta = 0.0f;
+    PabdSelfContactMeasureMode self_contact_measure =
+        PabdSelfContactMeasureMode::EffectiveMass;
+    // Multiplicative PF/VF stiffness relative to EE after the base contact
+    // measure is evaluated. EE always has scale 1.
+    float point_face_stiffness_scale = 1.0f;
+    // MeshMesh research filter. Production scenes keep both enabled; isolated
+    // fixtures can disable one feature without changing narrow-phase output.
+    bool enable_point_face_contacts = true;
+    bool enable_edge_edge_contacts = true;
     float self_collision_stiffness = 0.0f;
     float self_collision_normal_damping = 0.0f;
     float self_collision_friction = 0.0f;
@@ -80,10 +112,12 @@ struct alignas(16) PabdEndpointHinge {
     math::Vec4f endpoint0 = math::Vec4f(0.0f);
     math::Vec4f endpoint1 = math::Vec4f(0.0f);
     math::Vec4f axis = math::Vec4f(0.0f);
+    // Packed symmetric endpoint effective mass: (m00, m01, m11, unused).
+    math::Vec4f effective_mass = math::Vec4f(1.0f, 0.0f, 1.0f, 0.0f);
 };
 
-static_assert(sizeof(PabdEndpointHinge) == 96,
-              "PabdEndpointHinge must keep its 96-byte GPU layout");
+static_assert(sizeof(PabdEndpointHinge) == 112,
+              "PabdEndpointHinge must keep its 112-byte GPU layout");
 
 struct PabdCudaMesh {
     std::vector<math::Vec3f> rest_positions;
@@ -160,6 +194,33 @@ public:
     int last_self_contacts() const noexcept { return last_self_contacts_; }
     int last_self_point_face_contacts() const noexcept { return last_self_point_face_contacts_; }
     int last_self_edge_edge_contacts() const noexcept { return last_self_edge_edge_contacts_; }
+    int last_self_active_point_face_contacts() const noexcept {
+        return last_self_active_point_face_contacts_;
+    }
+    int last_self_active_edge_edge_contacts() const noexcept {
+        return last_self_active_edge_edge_contacts_;
+    }
+    float last_self_max_penetration() const noexcept {
+        return last_self_max_penetration_;
+    }
+    float last_self_rms_penetration() const noexcept {
+        return last_self_rms_penetration_;
+    }
+    float last_self_mean_stiffness() const noexcept {
+        return last_self_mean_stiffness_;
+    }
+    float last_self_point_face_mean_stiffness() const noexcept {
+        return last_self_point_face_mean_stiffness_;
+    }
+    float last_self_edge_edge_mean_stiffness() const noexcept {
+        return last_self_edge_edge_mean_stiffness_;
+    }
+    float last_self_point_face_mean_volume() const noexcept {
+        return last_self_point_face_mean_volume_;
+    }
+    float last_self_edge_edge_mean_volume() const noexcept {
+        return last_self_edge_edge_mean_volume_;
+    }
     int last_self_friction_contacts() const noexcept {
         return last_self_friction_contacts_;
     }
@@ -211,6 +272,7 @@ public:
         return params_.pcg_body_preconditioner &&
                pcg_body_preconditioner_valid_;
     }
+    bool matrix_free_polar_gn_active() const noexcept;
     float last_motor_axis_angular_velocity() const noexcept {
         return last_motor_axis_angular_velocity_;
     }
@@ -223,6 +285,18 @@ public:
     const std::vector<float>& hinge_endpoint_errors() const noexcept {
         return hinge_endpoint_errors_;
     }
+    float last_max_stretch_error() const noexcept {
+        return last_max_stretch_error_;
+    }
+    float last_max_orthogonality_error() const noexcept {
+        return last_max_orthogonality_error_;
+    }
+    float last_max_volume_error() const noexcept {
+        return last_max_volume_error_;
+    }
+    float last_max_rotational_curvature() const noexcept {
+        return last_max_rotational_curvature_;
+    }
     float min_y() const noexcept { return min_y_; }
 
 private:
@@ -232,7 +306,8 @@ private:
     void update_host_positions(bool x_already_on_host = false);
     void step_interpolated(float dt);
     void assemble_interpolated_system_gpu(float h);
-    void update_block_jacobi_base_k_gpu(float h);
+    void update_block_jacobi_base_k_gpu(float h,
+                                        bool local_rest_frame = false);
     void build_body_contact_ell_gpu();
     void build_interpolated_pcg_body_preconditioner_gpu(float h);
     void solve_interpolated_block_jacobi_gpu(float h, float omega);
@@ -274,9 +349,11 @@ private:
     CudaArray<math::Vec3f> y_;
     CudaArray<math::Vec3f> velocity_;
     CudaArray<math::Vec3f> rhs_;
+    CudaArray<math::Vec3f> delta_;
     CudaArray<float> mass_;
     CudaArray<unsigned char> fixed_;
     CudaArray<TetData> tets_;
+    CudaArray<float> tet_arap_effective_inertias_;
     CudaArray<math::Mat3f> rotations_;
     CudaArray<int> ground_contacts_;
     CudaArray<PabdSurfaceMapDevice> surface_maps_dev_;
@@ -287,6 +364,8 @@ private:
     CudaArray<collision::WideContact> interpolated_wide_contacts_;
     CudaArray<int> interpolated_wide_contact_count_;
     CudaArray<float> tet_mass_blocks_dev_;
+    CudaArray<float> tet_contact_inverse_mass_blocks_;
+    CudaArray<float> particle_contact_stiffnesses_;
     CudaArray<PabdEndpointHinge> endpoint_hinges_dev_;
     CudaArray<math::Vec3f> endpoint_hinge_diagnostics_dev_;
     CudaArray<float> block_jacobi_base_k_;
@@ -298,8 +377,14 @@ private:
     CudaArray<float> pcg_body_preconditioner_lower_;
     CudaArray<math::Vec4i> pcg_body_preconditioner_rows_;
     CudaArray<int> pcg_body_preconditioner_failure_count_;
+    CudaArray<math::Vec3f> matrix_free_body_gradients_;
+    CudaArray<math::Mat3f> matrix_free_body_rotations_;
+    CudaArray<math::Mat3f> matrix_free_body_rotational_curvatures_;
+    CudaArray<float> matrix_free_body_scales_;
     CudaArray<int> interpolated_debug_counts_;
+    CudaArray<float> interpolated_contact_metrics_;
     CudaArray<math::Vec3f> interpolated_normal_sum_;
+    CudaArray<float> elastic_curvature_diagnostics_dev_;
 
     std::vector<float> flat_positions_;
     std::vector<int> flat_triangles_;
@@ -309,6 +394,15 @@ private:
     int last_self_contacts_ = 0;
     int last_self_point_face_contacts_ = 0;
     int last_self_edge_edge_contacts_ = 0;
+    int last_self_active_point_face_contacts_ = 0;
+    int last_self_active_edge_edge_contacts_ = 0;
+    float last_self_max_penetration_ = 0.0f;
+    float last_self_rms_penetration_ = 0.0f;
+    float last_self_mean_stiffness_ = 0.0f;
+    float last_self_point_face_mean_stiffness_ = 0.0f;
+    float last_self_edge_edge_mean_stiffness_ = 0.0f;
+    float last_self_point_face_mean_volume_ = 0.0f;
+    float last_self_edge_edge_mean_volume_ = 0.0f;
     int last_self_friction_contacts_ = 0;
     int last_self_vertical_contacts_ = 0;
     int last_self_horizontal_contacts_ = 0;
@@ -328,15 +422,25 @@ private:
     int last_block_jacobi_contact_ell_overflow_ = 0;
     int last_pcg_body_preconditioner_failures_ = 0;
     bool pcg_body_preconditioner_valid_ = false;
+    bool matrix_free_body_elastic_valid_ = false;
     float block_jacobi_base_inv_h2_ = -1.0f;
     float block_jacobi_base_stiffness_ = -1.0f;
+    float block_jacobi_base_arap_beta_ = -1.0f;
+    bool block_jacobi_base_use_arap_beta_ = false;
     float block_jacobi_base_fixed_weight_ = -1.0f;
-    float block_jacobi_base_hinge_stiffness_ = -1.0f;
+    float block_jacobi_base_hinge_beta_ = -1.0f;
+    PabdElasticCurvatureMode block_jacobi_base_curvature_ =
+        PabdElasticCurvatureMode::ProjectiveDynamics;
+    bool block_jacobi_base_local_rest_frame_ = false;
     bool block_jacobi_base_k_valid_ = false;
     float last_residual_ = 0.0f;
     float last_true_relative_residual_ = -1.0f;
     float last_motor_axis_angular_velocity_ = 0.0f;
     float last_hinge_endpoint_error_ = 0.0f;
+    float last_max_stretch_error_ = 0.0f;
+    float last_max_orthogonality_error_ = 0.0f;
+    float last_max_volume_error_ = 0.0f;
+    float last_max_rotational_curvature_ = 0.0f;
     std::vector<float> hinge_axis_angular_velocities_;
     std::vector<float> hinge_endpoint_errors_;
     float min_y_ = 0.0f;
@@ -359,7 +463,6 @@ PabdCudaMesh make_pd_abd_tetra_edge_edge_mesh(float lower_y = 1.10f,
                                               float scale = 0.36f);
 
 constexpr int kTwentyTetsCount = 20;
-constexpr int kHexBlockSurfaceTris = 12;
 constexpr int kDefaultStackCount = 10;
 constexpr int kPdAbdDefaultBoxCount = 2;
 constexpr int kPdAbdBoxSurfaceVertices = 8;

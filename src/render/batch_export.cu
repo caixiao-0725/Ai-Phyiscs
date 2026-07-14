@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <iostream>
 #include <string>
@@ -31,6 +32,7 @@ int main(int argc, char* argv[]) {
 
     std::string target_scene;
     int N_FRAMES = DEFAULT_FRAMES;
+    int timing_warmup = 10;
     bool export_geometry = true;
     for (int i = 1; i < argc; i++) {
         if (std::string(argv[i]) == "--scene" && i + 1 < argc)
@@ -39,6 +41,8 @@ int main(int argc, char* argv[]) {
             N_FRAMES = std::atoi(argv[++i]);
         else if (std::string(argv[i]) == "--no-export")
             export_geometry = false;
+        else if (std::string(argv[i]) == "--timing-warmup" && i + 1 < argc)
+            timing_warmup = std::max(0, std::atoi(argv[++i]));
     }
 
     chysx::render::Scene* scene = nullptr;
@@ -72,9 +76,16 @@ int main(int argc, char* argv[]) {
     float max_pair_pen_all = 0.0f;
     float min_z_all = 0.0f;
     bool has_nan = false;
+    std::vector<double> step_times_ms;
+    step_times_ms.reserve(static_cast<std::size_t>(N_FRAMES));
 
     for (int frame = 0; frame < N_FRAMES; ++frame) {
+        const auto step_begin = std::chrono::steady_clock::now();
         scene->step(DT);
+        const auto step_end = std::chrono::steady_clock::now();
+        step_times_ms.push_back(
+            std::chrono::duration<double, std::milli>(step_end - step_begin)
+                .count());
 
         chysx::render::SceneMetrics metrics;
         if (scene->metrics(metrics)) {
@@ -136,6 +147,26 @@ int main(int argc, char* argv[]) {
                     max_angular_all, min_z_all, max_pair_pen_all,
                     final_metrics.max_speed, final_metrics.min_z,
                     final_metrics.max_pair_penetration, has_nan ? 1 : 0);
+    }
+
+    const int first_timed = std::min(timing_warmup,
+                                     std::max(0, N_FRAMES - 1));
+    if (first_timed < static_cast<int>(step_times_ms.size())) {
+        std::vector<double> timed(step_times_ms.begin() + first_timed,
+                                  step_times_ms.end());
+        std::sort(timed.begin(), timed.end());
+        double sum = 0.0;
+        for (double value : timed) sum += value;
+        const auto percentile = [&](double p) {
+            const std::size_t index = static_cast<std::size_t>(
+                p * static_cast<double>(timed.size() - 1));
+            return timed[index];
+        };
+        std::printf(
+            "[TIMING summary] warmup=%d frames=%zu meanMs=%.6f "
+            "p50Ms=%.6f p95Ms=%.6f minMs=%.6f maxMs=%.6f\n",
+            first_timed, timed.size(), sum / static_cast<double>(timed.size()),
+            percentile(0.50), percentile(0.95), timed.front(), timed.back());
     }
 
     delete scene;

@@ -29,11 +29,15 @@ using chysx::rigid::pabd_cuda::PabdCudaMesh;
 using chysx::rigid::pabd_cuda::PabdCudaParams;
 using chysx::rigid::pabd_cuda::PabdCudaSolver;
 using chysx::rigid::pabd_cuda::PabdCudaSurfaceRenderer;
+using chysx::rigid::pabd_cuda::PabdElasticCurvatureMode;
 using chysx::rigid::pabd_cuda::PabdEndpointHinge;
 using chysx::rigid::pabd_cuda::PabdGlobalSolverMode;
+using chysx::rigid::pabd_cuda::PabdPolarGnBackend;
+using chysx::rigid::pabd_cuda::PabdSelfContactMeasureMode;
 using chysx::rigid::pabd_cuda::PabdSurfaceMap;
+using chysx::rigid::pabd_cuda::elastic_curvature_mode_name;
+using chysx::rigid::pabd_cuda::polar_gn_backend_name;
 using chysx::rigid::pabd_cuda::kDefaultStackCount;
-using chysx::rigid::pabd_cuda::kHexBlockSurfaceTris;
 using chysx::rigid::pabd_cuda::kPdAbdBoxSurfaceTris;
 using chysx::rigid::pabd_cuda::kPdAbdDefaultBoxCount;
 
@@ -59,6 +63,19 @@ constexpr int kRigidIpcChainNet8x8Bodies = 144;
 constexpr int kRigidIpcChainNet16x16BallBodies = 673;
 constexpr int kRigidIpcChainNet32x32Bodies = 2880;
 constexpr int kRigidIpcVerticalChainDefaultBodies = 2;
+
+const char* self_contact_measure_name(PabdSelfContactMeasureMode mode) {
+    return mode == PabdSelfContactMeasureMode::EffectiveMass
+        ? "effective_mass"
+        : "tetra_volume";
+}
+
+const char* self_contact_features_name(bool point_face, bool edge_edge) {
+    if (point_face && edge_edge) return "PF+EE";
+    if (point_face) return "PF";
+    if (edge_edge) return "EE";
+    return "none";
+}
 
 void body_color(int body, int count, float out_rgb[3]) {
     const float hue = static_cast<float>(body) / static_cast<float>(std::max(1, count));
@@ -440,7 +457,7 @@ PabdCudaMesh make_single_torque_driver_mesh() {
 
 PabdCudaMesh make_torque_gear_line_mesh(int gear_count) {
     return make_torque_gear_fixture_mesh(
-        pabd_gear_line_fixture_path(), gear_count, 10.0f,
+        pabd_gear_line_fixture_path(), gear_count, 1.0f,
         gear_count == 2 ? "Torque Gear Line 2" : "Torque Gear Line 6");
 }
 
@@ -884,11 +901,13 @@ public:
         if (solver_) {
             solver_->step(params_.dt);
             ++frame_index_;
-            if ((kind_ == PabdSceneKind::PdAbdBoxes ||
+            if ((kind_ == PabdSceneKind::StackedBlocks ||
+                 kind_ == PabdSceneKind::PdAbdBoxes ||
                  kind_ == PabdSceneKind::TetraEECross ||
                  is_torque_gear_scene(kind_) ||
                  is_rigid_ipc_link_scene(kind_)) &&
-                (frame_index_ == 1 || frame_index_ % 60 == 0)) {
+                (frame_index_ == 1 ||
+                 frame_index_ % std::max(1, debug_interval_) == 0)) {
                 print_pd_abd_stats();
             }
         }
@@ -899,7 +918,8 @@ public:
         if (gpu_surface_render_enabled()) {
             return;
         }
-        if (kind_ == PabdSceneKind::PdAbdBoxes) {
+        if (kind_ == PabdSceneKind::PdAbdBoxes ||
+            kind_ == PabdSceneKind::StackedBlocks) {
             const int num_bodies = stack_count_;
             for (int body = 0; body < num_bodies; ++body) {
                 float rgb[3];
@@ -959,22 +979,6 @@ public:
                 color_[0], color_[1], color_[2],
                 false
             });
-            return;
-        }
-        if (kind_ == PabdSceneKind::StackedBlocks) {
-            const int num_bodies = stack_count_;
-            for (int body = 0; body < num_bodies; ++body) {
-                float rgb[3];
-                body_color(body, num_bodies, rgb);
-                out.push_back({
-                    solver_->flat_positions().data(),
-                    solver_->num_vertices(),
-                    solver_->flat_triangles().data() + body * kHexBlockSurfaceTris * 3,
-                    kHexBlockSurfaceTris,
-                    rgb[0], rgb[1], rgb[2],
-                    false
-                });
-            }
             return;
         }
         out.push_back({
@@ -1061,9 +1065,48 @@ public:
                                         1, 32);
             changed |= ImGui::SliderFloat("gravity", &params_.gravity, -50.0f,
                                           50.0f, "%.2f");
-            changed |= ImGui::SliderFloat("stiffness", &params_.stiffness,
-                                          100.0f, 500000.0f, "%.0f",
-                                          ImGuiSliderFlags_Logarithmic);
+            changed |= ImGui::Checkbox("mass-normalized ARAP",
+                                       &params_.use_arap_beta);
+            if (params_.use_arap_beta) {
+                changed |= ImGui::SliderFloat(
+                    "ARAP beta", &params_.arap_beta,
+                    0.0f, 128.0f, "%.3f");
+            } else {
+                changed |= ImGui::SliderFloat(
+                    "stiffness", &params_.stiffness,
+                    100.0f, 500000.0f, "%.0f",
+                    ImGuiSliderFlags_Logarithmic);
+            }
+            int curvature_mode =
+                static_cast<int>(params_.elastic_curvature);
+            const char* curvature_modes[] = {
+                "PD",
+                "CoRotated Rest",
+                "Polar GN",
+                "Projected Newton 3x3",
+            };
+            if (ImGui::Combo("elastic curvature", &curvature_mode,
+                             curvature_modes,
+                             4)) {
+                params_.elastic_curvature =
+                    static_cast<PabdElasticCurvatureMode>(curvature_mode);
+                changed = true;
+            }
+            int polar_gn_backend =
+                static_cast<int>(params_.polar_gn_backend);
+            const char* polar_gn_backends[] = {
+                "Assembled 12x12",
+                "Matrix-free rank 3",
+            };
+            if (ImGui::Combo("Polar GN backend", &polar_gn_backend,
+                             polar_gn_backends, 2)) {
+                params_.polar_gn_backend =
+                    static_cast<PabdPolarGnBackend>(polar_gn_backend);
+                changed = true;
+            }
+            changed |= ImGui::Checkbox(
+                "elastic curvature diagnostics",
+                &params_.elastic_curvature_diagnostics);
             changed |= ImGui::SliderFloat("density", &params_.density, 0.01f,
                                           100000.0f, "%.3f",
                                           ImGuiSliderFlags_Logarithmic);
@@ -1074,8 +1117,8 @@ public:
                                           ImGuiSliderFlags_Logarithmic);
             if (is_torque_gear_scene(kind_)) {
                 changed |= ImGui::SliderFloat(
-                    "hinge stiffness", &params_.hinge_stiffness,
-                    1.0f, 1.0e5f, "%.1f", ImGuiSliderFlags_Logarithmic);
+                    "hinge beta", &params_.hinge_beta,
+                    0.0f, 1024.0f, "%.1f");
                 changed |= ImGui::SliderFloat(
                     "motor torque", &params_.motor_torque,
                     -1000.0f, 1000.0f, "%.2f");
@@ -1113,18 +1156,53 @@ public:
                                           2.0f, "%.3f");
             changed |= ImGui::SliderFloat("contact gap", &params_.contact_gap,
                                           0.0f, 0.2f, "%.3f");
-            changed |= ImGui::SliderFloat("ground stiffness",
-                                          &params_.ground_stiffness,
-                                          0.0f, 1.0e5f, "%.1e");
+            changed |= ImGui::Checkbox("adaptive contact beta",
+                                       &params_.use_contact_beta);
+            if (params_.use_contact_beta) {
+                changed |= ImGui::SliderFloat(
+                    "ground contact beta", &params_.ground_contact_beta,
+                    0.0f, 128.0f, "%.2f");
+            } else {
+                changed |= ImGui::SliderFloat("ground stiffness",
+                                              &params_.ground_stiffness,
+                                              0.0f, 1.0e5f, "%.1e");
+            }
             changed |= ImGui::SliderFloat("ground friction",
                                           &params_.ground_friction,
                                           0.0f, 2.0f, "%.2f");
             changed |= ImGui::SliderFloat("self collision thickness",
                                           &params_.self_collision_thickness,
                                           0.0f, 0.2f, "%.3f");
-            changed |= ImGui::SliderFloat("self collision stiffness",
-                                          &params_.self_collision_stiffness,
-                                          0.0f, 1.0e5f, "%.1e");
+            if (params_.use_contact_beta) {
+                changed |= ImGui::SliderFloat(
+                    "self collision beta", &params_.self_collision_beta,
+                    0.0f, 128.0f, "%.2f");
+                int contact_measure = static_cast<int>(
+                    params_.self_contact_measure);
+                const char* contact_measure_names[] = {
+                    "effective mass", "contact tetra volume"};
+                if (ImGui::Combo("self contact measure", &contact_measure,
+                                 contact_measure_names,
+                                 IM_ARRAYSIZE(contact_measure_names))) {
+                    params_.self_contact_measure =
+                        static_cast<PabdSelfContactMeasureMode>(
+                            contact_measure);
+                    changed = true;
+                }
+            } else {
+                changed |= ImGui::SliderFloat(
+                    "self collision stiffness",
+                    &params_.self_collision_stiffness,
+                    0.0f, 1.0e5f, "%.1e");
+            }
+            changed |= ImGui::SliderFloat(
+                "PF(VF) stiffness / EE",
+                &params_.point_face_stiffness_scale,
+                0.0f, 10.0f, "%.2f");
+            changed |= ImGui::Checkbox(
+                "enable PF contacts", &params_.enable_point_face_contacts);
+            changed |= ImGui::Checkbox(
+                "enable EE contacts", &params_.enable_edge_edge_contacts);
             changed |= ImGui::SliderFloat(
                 "self collision normal damping",
                 &params_.self_collision_normal_damping,
@@ -1177,6 +1255,17 @@ public:
             }
         }
         ImGui::Text("min y: %.5f", solver_->min_y());
+        ImGui::Text("max stretch error: %.3e",
+                    solver_->last_max_stretch_error());
+        ImGui::Text("max orthogonality error: %.3e",
+                    solver_->last_max_orthogonality_error());
+        ImGui::Text("max volume error: %.3e",
+                    solver_->last_max_volume_error());
+        ImGui::Text("max rotational curvature: %.3e",
+                    solver_->last_max_rotational_curvature());
+        ImGui::Text("matrix-free Polar GN: %s",
+                    solver_->matrix_free_polar_gn_active() ? "active"
+                                                           : "inactive");
         ImGui::Text("PCG iters (last): %d", solver_->last_pcg_iterations());
         ImGui::Text("PCG recursive <r,M^-1 r>: %.3e",
                     solver_->last_residual());
@@ -1212,6 +1301,7 @@ private:
     int initial_box_count_ = kPdAbdDefaultBoxCount;
     float initial_box_lift_ = 0.0f;
     int frame_index_ = 0;
+    int debug_interval_ = 60;
     bool headless_ = false;
 
     void set_headless(bool headless) override {
@@ -1224,16 +1314,15 @@ private:
     bool gpu_surface_render_enabled() const {
         return !headless_ &&
                (kind_ == PabdSceneKind::PdAbdBoxes ||
+                kind_ == PabdSceneKind::StackedBlocks ||
                 kind_ == PabdSceneKind::TetraEECross ||
                 is_torque_gear_scene(kind_) ||
                 is_rigid_ipc_link_scene(kind_));
     }
 
     void rebuild_simulation() {
-        if (kind_ == PabdSceneKind::StackedBlocks) {
-            params_.self_collision_max_contacts =
-                std::max(512, stack_count_ * 64);
-        } else if (kind_ == PabdSceneKind::PdAbdBoxes) {
+        if (kind_ == PabdSceneKind::StackedBlocks ||
+            kind_ == PabdSceneKind::PdAbdBoxes) {
             params_.self_collision_max_contacts =
                 std::max(512, stack_count_ * 96);
         } else if (is_rigid_ipc_chain_net(kind_)) {
@@ -1261,6 +1350,7 @@ private:
         }
         frame_index_ = 0;
         if (kind_ == PabdSceneKind::PdAbdBoxes ||
+            kind_ == PabdSceneKind::StackedBlocks ||
             kind_ == PabdSceneKind::TetraEECross ||
             is_torque_gear_scene(kind_) ||
             is_rigid_ipc_link_scene(kind_)) {
@@ -1276,7 +1366,7 @@ private:
             }
             std::printf(
                 "[PABD_DBG setup] bodies=%d solver=%s dt=%.6f substeps=%d iterations=%d "
-                "pcg=%d omega=%.2f damping=%.3f stiffness=%.1f hingeK=%.1f motorTau=%.2f motorDamp=%.2f groundK=%.1f groundMu=%.2f selfK=%.1f selfNormalDamp=%.2f selfMu=%.2f fricEps=%.1e gap=%.4f thickness=%.4f maxContacts=%d bpN=%d bpSkin=%.4f\n",
+                "pcg=%d omega=%.2f damping=%.3f arap=%s stiffness=%.1f arapBeta=%.3f curvature=%s curvatureBackend=%s mfActive=%d hingeBeta=%.1f motorTau=%.2f motorDamp=%.2f contact=%s groundBeta=%.2f groundK=%.1f groundMu=%.2f selfBeta=%.2f selfMeasure=%s features=%s pfScale=%.2f selfK=%.1f selfNormalDamp=%.2f selfMu=%.2f fricEps=%.1e gap=%.4f thickness=%.4f maxContacts=%d bpN=%d bpSkin=%.4f\n",
                 body_count,
                 params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
                     ? "BlockJacobi12"
@@ -1285,12 +1375,25 @@ private:
                 params_.iterations, params_.pcg_iterations,
                 params_.block_jacobi_omega,
                 params_.damping,
+                params_.use_arap_beta ? "beta" : "physical",
                 params_.stiffness,
-                params_.hinge_stiffness,
+                params_.arap_beta,
+                elastic_curvature_mode_name(params_.elastic_curvature),
+                polar_gn_backend_name(params_.polar_gn_backend),
+                solver_->matrix_free_polar_gn_active() ? 1 : 0,
+                params_.hinge_beta,
                 params_.motor_torque,
                 params_.motor_damping,
+                params_.use_contact_beta ? "beta" : "physical",
+                params_.ground_contact_beta,
                 params_.ground_stiffness,
                 params_.ground_friction,
+                params_.self_collision_beta,
+                self_contact_measure_name(params_.self_contact_measure),
+                self_contact_features_name(
+                    params_.enable_point_face_contacts,
+                    params_.enable_edge_edge_contacts),
+                params_.point_face_stiffness_scale,
                 params_.self_collision_stiffness,
                 params_.self_collision_normal_damping,
                 params_.self_collision_friction,
@@ -1304,7 +1407,7 @@ private:
 
     void print_pd_abd_stats() const {
         const auto ns = solver_->last_self_normal_sum();
-        std::printf("[PABD_DBG frame=%d] solver=%s pcgIters=%d pcgPrec=%s ground=%d self=%d raw=%d cap=%d overflow=%d pf=%d ee=%d friction=%d bpairs=%d bcap=%d boverflow=%d bpRefresh=%d bpAge=%d bpRefreshes=%d bpDisp=%.5f bpDropped=%d vertical=%d horizontal=%d nsum=(%.3f,%.3f,%.3f) minY=%.5f pcgRho=%.3e pcgTrueRel=%.3e pcgPrecFail=%d bjFail=%d ellWidth=%d ellOverflow=%d\n",
+        std::printf("[PABD_DBG frame=%d] solver=%s pcgIters=%d pcgPrec=%s ground=%d self=%d raw=%d cap=%d overflow=%d pf=%d ee=%d activePf=%d activeEe=%d maxPen=%.6g rmsPen=%.6g meanK=%.6g pfK=%.6g eeK=%.6g pfV=%.6g eeV=%.6g friction=%d bpairs=%d bcap=%d boverflow=%d bpRefresh=%d bpAge=%d bpRefreshes=%d bpDisp=%.5f bpDropped=%d vertical=%d horizontal=%d nsum=(%.3f,%.3f,%.3f) minY=%.5f stretchErr=%.3e orthoErr=%.3e volumeErr=%.3e rotCurv=%.3e pcgRho=%.3e pcgTrueRel=%.3e pcgPrecFail=%d bjFail=%d ellWidth=%d ellOverflow=%d\n",
                     frame_index_,
                     params_.global_solver == PabdGlobalSolverMode::BlockJacobi12
                         ? "BlockJacobi12"
@@ -1320,6 +1423,15 @@ private:
                     solver_->last_self_contact_overflow() ? 1 : 0,
                     solver_->last_self_point_face_contacts(),
                     solver_->last_self_edge_edge_contacts(),
+                    solver_->last_self_active_point_face_contacts(),
+                    solver_->last_self_active_edge_edge_contacts(),
+                    solver_->last_self_max_penetration(),
+                    solver_->last_self_rms_penetration(),
+                    solver_->last_self_mean_stiffness(),
+                    solver_->last_self_point_face_mean_stiffness(),
+                    solver_->last_self_edge_edge_mean_stiffness(),
+                    solver_->last_self_point_face_mean_volume(),
+                    solver_->last_self_edge_edge_mean_volume(),
                     solver_->last_self_friction_contacts(),
                     solver_->last_self_broadphase_pairs(),
                     solver_->last_self_broadphase_capacity(),
@@ -1332,6 +1444,10 @@ private:
                     solver_->last_self_vertical_contacts(),
                     solver_->last_self_horizontal_contacts(),
                     ns.x, ns.y, ns.z, solver_->min_y(),
+                    solver_->last_max_stretch_error(),
+                    solver_->last_max_orthogonality_error(),
+                    solver_->last_max_volume_error(),
+                    solver_->last_max_rotational_curvature(),
                     solver_->last_residual(),
                     solver_->last_true_relative_residual(),
                     solver_->last_pcg_body_preconditioner_failures(),
@@ -1500,7 +1616,8 @@ private:
         }
         if (kind_ == PabdSceneKind::StackedBlocks) {
             return chysx::rigid::pabd_cuda::make_stacked_blocks_mesh(
-                stack_count_, 0.42f, params_.ground_y, params_.contact_gap);
+                stack_count_, 0.42f, params_.ground_y,
+                params_.contact_gap);
         }
         if (kind_ == PabdSceneKind::HexDropGround) {
             return chysx::rigid::pabd_cuda::make_hex_drop_mesh();
@@ -1514,17 +1631,22 @@ private:
         params_.iterations = 1;
         params_.gravity = -9.8f;
         params_.stiffness = 10000.0f;
+        params_.use_arap_beta = true;
+        params_.arap_beta = 64.0f;
         params_.density = 1.0f;
         params_.damping = 1.0f;
         params_.fixed_weight = 1.0e6f;
-        params_.hinge_stiffness = 0.0f;
+        params_.hinge_beta = 0.0f;
         params_.motor_torque = 0.0f;
         params_.motor_damping = 0.0f;
         params_.pcg_iterations = 50;
         params_.ground_y = 0.0f;
         params_.contact_gap = 0.035f;
+        params_.use_contact_beta = true;
+        params_.ground_contact_beta = 0.0f;
         params_.ground_stiffness = 0.0f;
         params_.self_collision_thickness = 0.0f;
+        params_.self_collision_beta = 0.0f;
         params_.self_collision_stiffness = 0.0f;
         params_.self_collision_normal_damping = 0.0f;
         params_.self_collision_max_contacts = 256;
@@ -1543,6 +1665,7 @@ private:
                        : kDefaultStackCount);
 
         if (kind_ == PabdSceneKind::HexDropGround) {
+            params_.ground_contact_beta = 16.0f;
             params_.ground_stiffness = 1.0e7f;
             params_.pcg_iterations = 50;
             color_[0] = 0.50f;
@@ -1555,42 +1678,37 @@ private:
             params_.pcg_iterations = 50;
             params_.ground_y = -0.72f;
             params_.contact_gap = 0.0f;
+            params_.ground_contact_beta = 16.0f;
             params_.ground_stiffness = 8.0e7f;
             params_.self_collision_thickness = 0.01f;
+            params_.self_collision_beta = 16.0f;
             params_.self_collision_stiffness = 1e4f;
             color_[0] = 0.78f;
             color_[1] = 0.62f;
             color_[2] = 0.35f;
-        } else if (kind_ == PabdSceneKind::StackedBlocks) {
-
-            params_.iterations = 1;
-            params_.damping = 1.0f;
-            params_.fixed_weight = 1.0e6f;
-            params_.pcg_iterations = 50;
-            params_.ground_y = 0.0f;
-            params_.contact_gap = 0.0f;
-            params_.ground_stiffness = 1.0e5f;
-            params_.self_collision_thickness = 0.01f;
-            params_.self_collision_stiffness = 1e4f;
-            params_.self_collision_max_contacts =
-                std::max(512, stack_count_ * 64);
-            color_[0] = 0.55f;
-            color_[1] = 0.68f;
-            color_[2] = 0.92f;
-        } else if (kind_ == PabdSceneKind::PdAbdBoxes) {
+        } else if (kind_ == PabdSceneKind::StackedBlocks ||
+                   kind_ == PabdSceneKind::PdAbdBoxes) {
             params_.stiffness = 10000.0f;
             params_.ground_y = 0.0f;
             params_.contact_gap = 0.02f;
+            params_.ground_contact_beta = 16.0f;
             params_.ground_stiffness = 1e4f;
             params_.self_collision_thickness = 0.03f;
+            params_.self_collision_beta = 16.0f;
             params_.self_collision_stiffness = 1e4f;
             params_.ground_friction = 0.4f;
             params_.self_collision_friction = 0.3f;
             params_.self_collision_max_contacts =
                 std::max(512, stack_count_ * 96);
-            color_[0] = 0.18f;
-            color_[1] = 0.58f;
-            color_[2] = 0.95f;
+            if (kind_ == PabdSceneKind::StackedBlocks) {
+                color_[0] = 0.55f;
+                color_[1] = 0.68f;
+                color_[2] = 0.92f;
+            } else {
+                color_[0] = 0.18f;
+                color_[1] = 0.58f;
+                color_[2] = 0.95f;
+            }
         } else if (kind_ == PabdSceneKind::TetraEECross) {
             params_.dt = 0.0033f;
             params_.substeps = 1;
@@ -1605,9 +1723,12 @@ private:
             params_.contact_gap = 0.03f;
             params_.ground_stiffness = 0.0f;
             params_.self_collision_thickness = 0.08f;
+            params_.self_collision_beta = 16.0f;
             params_.self_collision_stiffness = 2.0e4f;
             params_.self_collision_friction = 0.2f;
             params_.self_collision_max_contacts = 128;
+            params_.enable_point_face_contacts = false;
+            params_.enable_edge_edge_contacts = true;
             color_[0] = 0.92f;
             color_[1] = 0.52f;
             color_[2] = 0.28f;
@@ -1617,21 +1738,25 @@ private:
             params_.iterations = 1;
             params_.gravity = 0.0f;
             params_.stiffness = 1.5e4f;
+            params_.use_arap_beta = true;
+            params_.arap_beta = 64.0f;
             params_.density = 10.0f;
             params_.damping = 1.0f;
             params_.fixed_weight = 1.0e6f;
-            params_.hinge_stiffness = 3.0e3f;
+            params_.hinge_beta = 64.0f;
             params_.motor_torque =
                 kind_ == PabdSceneKind::SingleTorqueGear ? -100.0f
                                                          : -10.0f;
             params_.motor_damping = 1.0f;
             params_.pcg_iterations = 50;
+            params_.pcg_body_preconditioner = false;
             params_.ground_y = -10.0f;
-            params_.contact_gap =
-                kind_ == PabdSceneKind::SingleTorqueGear ? 0.001f : 0.035f;
+            params_.contact_gap = 0.001f;
             params_.ground_stiffness = 0.0f;
             params_.self_collision_thickness =
-                kind_ == PabdSceneKind::SingleTorqueGear ? 0.0f : 0.075f;
+                kind_ == PabdSceneKind::SingleTorqueGear ? 0.0f : 0.01f;
+            params_.self_collision_beta =
+                kind_ == PabdSceneKind::SingleTorqueGear ? 0.0f : 16.0f;
             params_.self_collision_stiffness =
                 kind_ == PabdSceneKind::SingleTorqueGear ? 0.0f : 8.0e3f;
             params_.self_collision_normal_damping =
@@ -1659,8 +1784,13 @@ private:
             params_.ground_stiffness = 0.0f;
             params_.self_collision_thickness =
                 is_tuned_rigid_ipc_chain_net(kind_) ? 0.015f : 0.01f;
+            params_.self_collision_beta = 16.0f;
             params_.self_collision_stiffness =
                 is_tuned_rigid_ipc_chain_net(kind_) ? 3.0e4f : 5.0e2f;
+            // These fixtures were tuned with fixed ARAP and contact weights.
+            // Keep beta scaling as an explicit UI/environment experiment.
+            params_.use_arap_beta = false;
+            params_.use_contact_beta = false;
             params_.self_collision_friction = 0.2f;
             params_.self_collision_max_contacts =
                 kind_ == PabdSceneKind::RigidIpcChainNet32x32
@@ -1693,6 +1823,7 @@ private:
             params_.contact_gap = 0.01f;
             params_.ground_stiffness = 0.0f;
             params_.self_collision_thickness = 0.015f;
+            params_.self_collision_beta = 16.0f;
             params_.self_collision_stiffness = 1.0e4f;
             params_.self_collision_friction = 0.2f;
             params_.self_collision_max_contacts =
@@ -1706,6 +1837,9 @@ private:
             params_.mesh_broadphase_interval =
                 std::max(1, std::atoi(value));
         }
+        if (const char* value = std::getenv("CHYSX_PABD_DEBUG_INTERVAL")) {
+            debug_interval_ = std::max(1, std::atoi(value));
+        }
         if (const char* value = std::getenv("CHYSX_PABD_BP_SKIN")) {
             params_.mesh_broadphase_skin =
                 std::max(0.0f, std::strtof(value, nullptr));
@@ -1713,9 +1847,142 @@ private:
         if (const char* value = std::getenv("CHYSX_PABD_DAMPING")) {
             params_.damping = std::max(0.0f, std::strtof(value, nullptr));
         }
+        if (const char* value = std::getenv("CHYSX_PABD_STIFFNESS")) {
+            params_.stiffness =
+                std::max(0.0f, std::strtof(value, nullptr));
+            params_.use_arap_beta = false;
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_ARAP_BETA")) {
+            params_.arap_beta =
+                std::max(0.0f, std::strtof(value, nullptr));
+            params_.use_arap_beta = true;
+        }
         if (const char* value =
-                std::getenv("CHYSX_PABD_HINGE_STIFFNESS")) {
-            params_.hinge_stiffness =
+                std::getenv("CHYSX_PABD_ARAP_MASS_NORMALIZED")) {
+            params_.use_arap_beta = std::atoi(value) != 0;
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_CONTACT_GAP")) {
+            params_.contact_gap =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_GROUND_STIFFNESS")) {
+            params_.ground_stiffness =
+                std::max(0.0f, std::strtof(value, nullptr));
+            params_.use_contact_beta = false;
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_SELF_THICKNESS")) {
+            params_.self_collision_thickness =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_SELF_STIFFNESS")) {
+            params_.self_collision_stiffness =
+                std::max(0.0f, std::strtof(value, nullptr));
+            params_.use_contact_beta = false;
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_CONTACT_BETA")) {
+            const float beta =
+                std::max(0.0f, std::strtof(value, nullptr));
+            params_.ground_contact_beta = beta;
+            params_.self_collision_beta = beta;
+            params_.use_contact_beta = true;
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_GROUND_BETA")) {
+            params_.ground_contact_beta =
+                std::max(0.0f, std::strtof(value, nullptr));
+            params_.use_contact_beta = true;
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_SELF_BETA")) {
+            params_.self_collision_beta =
+                std::max(0.0f, std::strtof(value, nullptr));
+            params_.use_contact_beta = true;
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_CONTACT_MASS_NORMALIZED")) {
+            params_.use_contact_beta = std::atoi(value) != 0;
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_SELF_CONTACT_MEASURE")) {
+            const std::string measure(value);
+            if (measure == "effective_mass" || measure == "effective" ||
+                measure == "mass") {
+                params_.self_contact_measure =
+                    PabdSelfContactMeasureMode::EffectiveMass;
+            } else if (measure == "tetra_volume" || measure == "tetra" ||
+                       measure == "volume") {
+                params_.self_contact_measure =
+                    PabdSelfContactMeasureMode::TetrahedronVolume;
+            }
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_PF_STIFFNESS_SCALE")) {
+            params_.point_face_stiffness_scale =
+                std::max(0.0f, std::strtof(value, nullptr));
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_CONTACT_FEATURES")) {
+            const std::string features(value);
+            if (features == "pf" || features == "vf") {
+                params_.enable_point_face_contacts = true;
+                params_.enable_edge_edge_contacts = false;
+            } else if (features == "ee") {
+                params_.enable_point_face_contacts = false;
+                params_.enable_edge_edge_contacts = true;
+            } else if (features == "none") {
+                params_.enable_point_face_contacts = false;
+                params_.enable_edge_edge_contacts = false;
+            } else if (features == "both" || features == "pf+ee" ||
+                       features == "vf+ee") {
+                params_.enable_point_face_contacts = true;
+                params_.enable_edge_edge_contacts = true;
+            }
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_ELASTIC_CURVATURE")) {
+            const std::string curvature(value);
+            if (curvature == "pd") {
+                params_.elastic_curvature =
+                    PabdElasticCurvatureMode::ProjectiveDynamics;
+            } else if (curvature == "rest" ||
+                       curvature == "corotated_rest") {
+                params_.elastic_curvature =
+                    PabdElasticCurvatureMode::CorotatedRest;
+            } else if (curvature == "gn" || curvature == "polar_gn") {
+                params_.elastic_curvature =
+                    PabdElasticCurvatureMode::PolarGaussNewton;
+            } else if (curvature == "projected" ||
+                       curvature == "projected_newton3") {
+                params_.elastic_curvature =
+                    PabdElasticCurvatureMode::ProjectedNewton3;
+            }
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_POLAR_GN_BACKEND")) {
+            const std::string backend(value);
+            if (backend == "assembled" || backend == "assembled12") {
+                params_.polar_gn_backend =
+                    PabdPolarGnBackend::Assembled12;
+            } else if (backend == "matrix_free" ||
+                       backend == "matrix_free_rank3" ||
+                       backend == "rank3") {
+                params_.polar_gn_backend =
+                    PabdPolarGnBackend::MatrixFreeRank3;
+            }
+        }
+        if (const char* value =
+                std::getenv("CHYSX_PABD_CURVATURE_DIAGNOSTICS")) {
+            params_.elastic_curvature_diagnostics = std::atoi(value) != 0;
+        }
+        if (const char* value = std::getenv("CHYSX_PABD_HINGE_BETA")) {
+            params_.hinge_beta =
+                std::max(0.0f, std::strtof(value, nullptr));
+        } else if (const char* value =
+                       std::getenv("CHYSX_PABD_HINGE_STIFFNESS")) {
+            // Legacy scripts can still select the new dimensionless control.
+            params_.hinge_beta =
                 std::max(0.0f, std::strtof(value, nullptr));
         }
         if (const char* value = std::getenv("CHYSX_PABD_MOTOR_TORQUE")) {
